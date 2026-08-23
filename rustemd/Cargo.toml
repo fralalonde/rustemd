@@ -15,6 +15,12 @@ boot = []
 # matching `.service` on the first connection (inetd-style, via LISTEN_FDS).
 socket = []
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# D-Bus (Linux only): pure-Rust, no C dependency. `blocking-api` runs the
+# async machinery on internal threads, so the synchronous poll loop never
+# does async work; `async-io` is the executor backend the blocking API uses.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

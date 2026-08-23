@@ -11,16 +11,20 @@
 //! - `cli` — the `systemctl`-compatible command surface.
 //! - `unit` — unit-file parsing and typed unit configuration.
 //! - `calendar` / `timespan` — systemd calendar expressions and time spans.
+//! - `dbus` (Linux only) — `Type=dbus`/`BusName=` activation and a manager
+//!   control interface, bridged to the poll loop over channels on a thread.
 //!
 //! Platform note: Linux is fully supported (signalfd, subreaper, process
-//! groups). The non-Linux build paths exist but are not yet exercised; the
-//! code keeps Linux-specific bits behind `cfg(target_os = "linux")`.
+//! groups, D-Bus). The non-Linux build paths exist but are not yet exercised;
+//! the code keeps Linux-specific bits behind `cfg(target_os = "linux")`.
 
 pub mod calendar;
 pub mod cli;
 pub mod cli_style;
 pub mod client;
 pub mod control;
+#[cfg(target_os = "linux")]
+pub mod dbus;
 pub mod enable;
 pub mod ipc;
 pub mod log;

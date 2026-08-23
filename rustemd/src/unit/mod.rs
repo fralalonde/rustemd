@@ -68,6 +68,7 @@ pub enum ServiceType {
     Oneshot,
     Forking,
     Notify,
+    Dbus,
     Idle,
 }
 
@@ -270,6 +271,9 @@ pub struct ServiceConfig {
     pub send_sigkill: bool,
     pub success_exit_status: Option<ExitCodeSet>,
     pub pid_file: Option<String>,
+    /// `BusName=` — for `Type=dbus`, the well-known bus name whose ownership
+    /// gates the unit's transition to `active`.
+    pub bus_name: Option<String>,
     pub rlimits: Vec<Rlimit>,
     pub cgroup_limits: CgroupLimits,
     pub std_output: StdioTarget,
@@ -483,9 +487,13 @@ fn build_service(
             "oneshot" => ServiceType::Oneshot,
             "forking" => ServiceType::Forking,
             "notify" => ServiceType::Notify,
+            "dbus" => ServiceType::Dbus,
             "idle" => ServiceType::Idle,
             other => return Err(format!("invalid service Type `{other}`")),
         };
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "BusName") {
+        cfg.bus_name = Some(crate::unit::parse::unquote_scalar(&exp(v))?);
     }
     if let Some(v) = unit_scalar(raw, "Service", "RemainAfterExit") {
         cfg.remain_after_exit = parse_bool(&exp(v))?;
@@ -828,6 +836,28 @@ mod tests {
         let s = f.service.as_ref().unwrap();
         assert_eq!(s.service_type, ServiceType::Oneshot);
         assert!(s.remain_after_exit);
+    }
+
+    #[test]
+    fn dbus_type_and_bus_name() {
+        let f = build_str(
+            "[Service]\nType=dbus\nBusName=com.example.Foo\nExecStart=/bin/foo\n",
+            "dbus.service",
+        )
+        .unwrap();
+        let s = f.service.as_ref().unwrap();
+        assert_eq!(s.service_type, ServiceType::Dbus);
+        assert_eq!(s.bus_name.as_deref(), Some("com.example.Foo"));
+    }
+
+    #[test]
+    fn dbus_type_without_bus_name_still_parses() {
+        // BusName= is optional at parse time; the manager enforces its
+        // presence for Type=dbus at start time.
+        let f = build_str("[Service]\nType=dbus\nExecStart=/bin/foo\n", "dbus.service").unwrap();
+        let s = f.service.as_ref().unwrap();
+        assert_eq!(s.service_type, ServiceType::Dbus);
+        assert!(s.bus_name.is_none());
     }
 
     #[test]

@@ -163,6 +163,12 @@ pub struct Manager {
     pub boot: SystemTime,
     pub boot_instant: Instant,
     pub as_pid1: bool,
+    /// D-Bus bridge (Linux only): control interface + name-ownership events.
+    #[cfg(target_os = "linux")]
+    dbus: Option<crate::dbus::DbusHandle>,
+    /// `Type=dbus` units waiting on their `BusName=` (bus name -> unit name).
+    #[cfg(target_os = "linux")]
+    pending_bus_names: HashMap<String, String>,
 }
 
 impl Manager {
@@ -188,6 +194,10 @@ impl Manager {
             boot: SystemTime::now(),
             boot_instant: Instant::now(),
             as_pid1: nix::unistd::getpid() == Pid::from_raw(1),
+            #[cfg(target_os = "linux")]
+            dbus: None,
+            #[cfg(target_os = "linux")]
+            pending_bus_names: HashMap::new(),
         })
     }
 
@@ -998,8 +1008,9 @@ impl Manager {
                 u.group_pid = Some(pid);
                 u.control_start = Some(Instant::now());
 
-                // Long-running / notify types: the Start command is the main
-                // process, considered active right away.
+                // Long-running / notify / dbus types: the Start command is the
+                // main process. Simple/exec/idle are considered active right
+                // away; notify waits for READY=1, dbus waits for BusName=.
                 if cmd == UnitControlCommand::Start
                     && matches!(
                         sc.service_type,
@@ -1007,17 +1018,24 @@ impl Manager {
                             | ServiceType::Exec
                             | ServiceType::Idle
                             | ServiceType::Notify
+                            | ServiceType::Dbus
                     )
                 {
                     u.control_pid = None;
                     u.control_command = None;
                     u.main_pid = Some(pid);
-                    if sc.service_type != ServiceType::Notify {
+                    if matches!(
+                        sc.service_type,
+                        ServiceType::Simple | ServiceType::Exec | ServiceType::Idle
+                    ) {
                         u.set_active(ActiveState::Active, SubState::Running, UnitResult::Success);
                         self.complete_start_job(name);
                         return;
                     }
-                    // Notify: wait for READY=1 or TimeoutStartSec.
+                    // Notify: wait for READY=1; Dbus: wait for BusName=.
+                    if sc.service_type == ServiceType::Dbus {
+                        self.begin_bus_name_wait(name, sc.bus_name.as_deref());
+                    }
                     self.arm_start_timeout(name);
                     return;
                 }
@@ -1293,6 +1311,10 @@ impl Manager {
         match state {
             ActiveState::Deactivating => self.on_stop_main_exit(name),
             ActiveState::Activating => {
+                // A Type=dbus main process died before acquiring its BusName=;
+                // drop the pending watch so the name can't revive the unit.
+                #[cfg(target_os = "linux")]
+                self.release_bus_name_watch(name);
                 if exit_ok {
                     self.units.get_mut(name).unwrap().set_active(
                         ActiveState::Inactive,
@@ -1624,6 +1646,10 @@ impl Manager {
         for fd in fds {
             self.out_fds.remove(&fd);
         }
+        // A Type=dbus unit that is stopped before acquiring its BusName= must
+        // drop its pending name watch.
+        #[cfg(target_os = "linux")]
+        self.release_bus_name_watch(name);
         let u = self.units.get_mut(name).unwrap();
         u.main_pid = None;
         u.group_pid = None;
@@ -1894,6 +1920,11 @@ impl Manager {
         self.process_jobs();
         loop {
             self.tick(Instant::now());
+            // Drain D-Bus commands/events queued by the dedicated D-Bus
+            // thread(s). The poll timeout below is capped at ~1s, so this
+            // runs at least that often even when no fd is ready.
+            #[cfg(target_os = "linux")]
+            self.drain_dbus();
             if self.shutting_down && self.idle() {
                 break;
             }
@@ -2164,6 +2195,185 @@ impl Manager {
             }
             if let Some(u) = self.units.get_mut(&name) {
                 u.log.push_chunk(&String::from_utf8_lossy(&buf[..n]));
+            }
+        }
+    }
+}
+
+impl Manager {
+    /// Called when a `Type=dbus` main process has been spawned: the unit stays
+    /// `activating` until `BusName=` is acquired (Linux) or, absent D-Bus
+    /// support, until `TimeoutStartSec`.
+    fn begin_bus_name_wait(&mut self, name: &str, bus_name: Option<&str>) {
+        let Some(bn) = bus_name else {
+            // Type=dbus requires BusName=; without it we can never go active.
+            self.mgr(name, "Type=dbus requires BusName=; failing");
+            self.units.get_mut(name).unwrap().result = UnitResult::Protocol;
+            self.fail_unit(name, "Type=dbus without BusName=".to_string());
+            return;
+        };
+        self.units.get_mut(name).unwrap().sub = SubState::WaitingForBus;
+        #[cfg(target_os = "linux")]
+        self.watch_bus_name(name, bn);
+        #[cfg(not(target_os = "linux"))]
+        self.mgr(
+            name,
+            &format!("BusName={bn} ignored: D-Bus support is Linux-only"),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Manager {
+    /// Bring up the D-Bus bridge (control interface + name-ownership
+    /// monitoring) on a dedicated thread. Safe to call even when no bus is
+    /// reachable: the thread logs a warning and exits, and the manager keeps
+    /// running without D-Bus.
+    pub fn start_dbus(&mut self) -> Result<(), String> {
+        if self.dbus.is_some() {
+            return Ok(());
+        }
+        self.dbus = Some(crate::dbus::spawn(self.cfg.user));
+        Ok(())
+    }
+
+    /// Drain queued D-Bus control requests and name-ownership events. Called
+    /// from the event loop; never blocks.
+    fn drain_dbus(&mut self) {
+        // Collect the queued work first, so the immutable borrow of
+        // `self.dbus` ends before the mutable processing below.
+        let (requests, events): (Vec<crate::dbus::DbRequest>, Vec<crate::dbus::DbEvent>) = {
+            let Some(handle) = &self.dbus else {
+                return;
+            };
+            let mut requests = Vec::new();
+            while let Ok(r) = handle.commands.try_recv() {
+                requests.push(r);
+            }
+            let mut events = Vec::new();
+            while let Ok(ev) = handle.events.try_recv() {
+                events.push(ev);
+            }
+            (requests, events)
+        };
+
+        // Control requests from method handlers (ListUnits/GetUnit/…).
+        for req in requests {
+            let reply = self.handle_dbus_op(&req.op);
+            let _ = req.reply.send(reply);
+        }
+        // Name-ownership events from the monitor thread.
+        for ev in events {
+            self.handle_dbus_event(ev);
+        }
+        // Starting/stopping units from D-Bus enqueues jobs; keep them moving.
+        self.process_jobs();
+    }
+
+    fn handle_dbus_op(&mut self, op: &crate::dbus::DbOp) -> crate::dbus::DbReply {
+        use crate::dbus::{DbOp, DbReply};
+        match op {
+            DbOp::ListUnits => {
+                let mut rows = Vec::new();
+                let mut names: Vec<String> = self.units.keys().cloned().collect();
+                names.sort();
+                for n in names {
+                    if let Some(e) = self.dbus_entry(&n) {
+                        rows.push(e);
+                    }
+                }
+                DbReply::UnitList(rows)
+            }
+            DbOp::GetUnit(name) => {
+                DbReply::Unit(self.dbus_entry(&crate::cli::normalize_unit(name)))
+            }
+            DbOp::StartUnit(name) => {
+                let n = crate::cli::normalize_unit(name);
+                match self.start(&n) {
+                    Ok(()) => DbReply::UnitStarted,
+                    Err(e) => DbReply::Error(e),
+                }
+            }
+            DbOp::StopUnit(name) => {
+                let n = crate::cli::normalize_unit(name);
+                match self.stop(&n) {
+                    Ok(()) => DbReply::UnitStopped,
+                    Err(e) => DbReply::Error(e),
+                }
+            }
+        }
+    }
+
+    fn handle_dbus_event(&mut self, ev: crate::dbus::DbEvent) {
+        match ev {
+            crate::dbus::DbEvent::NameAcquired(bus_name) => {
+                let Some(unit) = self.pending_bus_names.remove(&bus_name) else {
+                    return;
+                };
+                // Stop watching now that the unit is active.
+                if let Some(h) = &self.dbus {
+                    let _ = h
+                        .watch_tx
+                        .send(crate::dbus::DbWatch::Remove(bus_name.clone()));
+                }
+                let still_activating = self
+                    .units
+                    .get(&unit)
+                    .map(|u| u.active == ActiveState::Activating)
+                    .unwrap_or(false);
+                if still_activating {
+                    self.units.get_mut(&unit).unwrap().set_active(
+                        ActiveState::Active,
+                        SubState::Running,
+                        UnitResult::Success,
+                    );
+                    self.complete_start_job(&unit);
+                    self.mgr(&unit, &format!("D-Bus name {bus_name} acquired"));
+                }
+            }
+            crate::dbus::DbEvent::NameLost(_) => {}
+        }
+    }
+
+    fn dbus_entry(&self, name: &str) -> Option<crate::dbus::UnitEntry> {
+        let u = self.units.get(name)?;
+        Some(crate::dbus::UnitEntry {
+            name: u.name.clone(),
+            load: crate::manager::ops::load_str(u.load).to_string(),
+            active: crate::manager::ops::active_str(u.active).to_string(),
+            sub: u.sub.as_str().to_string(),
+            description: u
+                .file
+                .as_ref()
+                .map(|f| f.unit.description.clone())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Register `unit` as waiting on `bus_name` and ask the monitor thread to
+    /// watch for it.
+    fn watch_bus_name(&mut self, unit: &str, bus_name: &str) {
+        self.pending_bus_names
+            .insert(bus_name.to_string(), unit.to_string());
+        if let Some(h) = &self.dbus {
+            let _ = h
+                .watch_tx
+                .send(crate::dbus::DbWatch::Add(bus_name.to_string()));
+        }
+    }
+
+    /// Drop any pending `BusName=` watches registered for `unit`.
+    fn release_bus_name_watch(&mut self, unit: &str) {
+        let names: Vec<String> = self
+            .pending_bus_names
+            .iter()
+            .filter(|(_, u)| *u == unit)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in names {
+            self.pending_bus_names.remove(&n);
+            if let Some(h) = &self.dbus {
+                let _ = h.watch_tx.send(crate::dbus::DbWatch::Remove(n));
             }
         }
     }
