@@ -1,0 +1,6 @@
+[Unit]
+Description=Demo service: fired periodically by demo.timer
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "[rustemd demo] tick from demo-tick.service" > /dev/console'

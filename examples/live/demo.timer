@@ -1,0 +1,10 @@
+[Unit]
+Description=Demo timer: activate demo-tick.service on a schedule
+
+[Timer]
+# Fire once shortly after boot (OnBootSec), then re-fire while the target is
+# inactive (OnUnitInactiveSec) — the standard systemd idiom for running a
+# one-shot job periodically.
+OnBootSec=10s
+OnUnitInactiveSec=30s
+Unit=demo-tick.service

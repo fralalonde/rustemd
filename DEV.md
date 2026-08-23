@@ -1,3 +1,9 @@
+## Live environment
+
+To drive rustemd interactively as a real PID-1 daemon in qemu (demo units for
+every unit type, getty shell, etc.), see **[DEMO.md](DEMO.md)** and
+`scripts/live-vm.sh`.
+
 ## Releasing
 
 ```bash

@@ -1,8 +1,9 @@
 /target
 .idea
 
-# Generated boot artifact (see scripts/build-initramfs.sh)
+# Generated boot artifacts (see scripts/build-initramfs.sh)
 /initramfs.cpio.gz
+/initramfs-live.cpio.gz
 
 # Local packaging output (see scripts/package-linux.sh)
 /dist

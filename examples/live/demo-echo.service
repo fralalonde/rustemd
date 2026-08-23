@@ -1,0 +1,8 @@
+[Unit]
+Description=Demo service: socket-activated by demo.socket
+
+[Service]
+# rustemd passes the listening socket via LISTEN_FDS; this stub just proves the
+# activation happened by announcing it, then idles until stopped.
+Type=simple
+ExecStart=/bin/sh -c 'echo "[rustemd demo] demo-echo.service activated via socket" > /dev/console; sleep 60'

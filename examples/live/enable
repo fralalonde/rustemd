@@ -1,0 +1,3 @@
+# Units to symlink into default.target.wants/ when the live initramfs is built.
+# One unit name per line; empty lines and `#` comments are ignored.
+demo.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Demo service: print a greeting to the console
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo "[rustemd demo] hello from demo.service" > /dev/console'

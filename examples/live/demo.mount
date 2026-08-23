@@ -1,0 +1,8 @@
+[Unit]
+Description=Demo mount: tmpfs at /mnt/demo
+
+[Mount]
+What=tmpfs
+Where=/mnt/demo
+Type=tmpfs
+Options=mode=1777,size=16m

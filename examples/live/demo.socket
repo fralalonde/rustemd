@@ -1,0 +1,8 @@
+[Unit]
+Description=Demo socket: activate demo-echo.service on the first connection
+
+[Socket]
+# TCP so busybox `nc` can trigger it from the getty shell (nc has no unix
+# socket support). `printf 'hi\n' | nc 127.0.0.1 8080` activates the service.
+ListenStream=127.0.0.1:8080
+Service=demo-echo.service

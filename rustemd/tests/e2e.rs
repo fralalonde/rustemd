@@ -26,6 +26,10 @@ impl Daemon {
             )
             .unwrap();
             mgr.load_all();
+            // Mirror the real daemon (cli::run_daemon): enumerate kernel
+            // devices into runtime `.device` units before serving requests.
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            mgr.udev_init();
             mgr.bind_ipc().unwrap();
             mgr.bind_notify().ok();
             mgr.setup_signals();
@@ -394,4 +398,251 @@ fn is_mounted(path: &std::path::Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// A `.timer` unit arms a monotonic schedule and fires its target. This uses
+/// the standard systemd idiom for running a one-shot job periodically:
+/// `OnUnitInactiveSec` re-fires the (now-inactive) target, so the target's
+/// side effect is observable on every elapse.
+#[test]
+fn timer_activates_target_on_schedule() {
+    let scratch = Scratch::new();
+    let tick = scratch.dir.path().join("ticks");
+    let tick_s = tick.to_string_lossy().to_string();
+    scratch.write_unit(
+        "tick.service",
+        &format!("[Unit]\nDescription=tick\n[Service]\nType=oneshot\nExecStart=/bin/sh -c 'echo tick >> {tick_s}'\n"),
+    );
+    scratch.write_unit(
+        "tick.timer",
+        "[Unit]\nDescription=tick timer\n[Timer]\nOnBootSec=1s\nUnit=tick.service\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    ctl.start(&["tick.timer"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.is_active(&["tick.timer"])
+            .map(|v| v == vec!["active"])
+            .unwrap_or(false)
+    }));
+
+    // The timer fires tick.service, which appends to the marker file.
+    assert!(
+        wait_for(Duration::from_secs(5), || tick.exists()),
+        "timer should fire tick.service, which writes the marker"
+    );
+
+    // list_timers records the last elapse — direct proof the *timer* fired.
+    let last_set = wait_for(Duration::from_secs(3), || {
+        ctl.list_timers()
+            .map(|v| v.iter().any(|t| t.unit == "tick.timer" && t.last.is_some()))
+            .unwrap_or(false)
+    });
+    assert!(
+        last_set,
+        "list_timers should record the timer's last elapse"
+    );
+}
+
+/// A `.target` is a pure grouping unit: starting it pulls in (and orders) its
+/// `Wants=`, each of which reaches its own active state.
+#[test]
+fn target_start_pulls_in_wants() {
+    let scratch = Scratch::new();
+    scratch.write_unit(
+        "demo.service",
+        "[Unit]\nDescription=demo svc\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
+    );
+    scratch.write_unit(
+        "demo.target",
+        "[Unit]\nDescription=demo target\nWants=demo.service\nAfter=demo.service\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    ctl.start(&["demo.target"]).unwrap();
+
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.is_active(&["demo.target"])
+            .map(|v| v == vec!["active"])
+            .unwrap_or(false)
+    }));
+    assert_eq!(ctl.is_active(&["demo.service"]).unwrap(), vec!["active"]);
+}
+
+/// The `examples/live/` demo units, exercised end to end through the CLI
+/// client: one of every unit type rustemd supports, pulled in together by a
+/// `.target` exactly as the interactive initramfs wires them. Covers .service,
+/// .timer, .socket, .mount, and .target. The .mount portion self-skips when
+/// not run as root (mount(2) needs CAP_SYS_ADMIN) — run under
+/// `unshare -m -U -r --map-root-user` to exercise it, as `mount_unit_lifecycle`
+/// does.
+#[cfg(all(target_os = "linux", feature = "socket"))]
+#[test]
+fn live_demo_units_lifecycle() {
+    use std::os::unix::net::UnixStream;
+
+    let scratch = Scratch::new();
+    let root = scratch.dir.path().to_path_buf();
+    let tick = root.join("demo.ticks");
+    let tick_s = tick.to_string_lossy().to_string();
+    let sock = root.join("demo.sock");
+    let sock_s = sock.to_string_lossy().to_string();
+    let mnt = root.join("mnt-demo");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let mnt_s = mnt.to_string_lossy().to_string();
+
+    scratch.write_unit(
+        "demo.service",
+        "[Unit]\nDescription=Demo service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
+    );
+    scratch.write_unit(
+        "demo-tick.service",
+        &format!("[Unit]\nDescription=Demo tick\n[Service]\nType=oneshot\nExecStart=/bin/sh -c 'echo tick >> {tick_s}'\n"),
+    );
+    scratch.write_unit(
+        "demo.timer",
+        "[Unit]\nDescription=Demo timer\n[Timer]\nOnBootSec=2s\nUnit=demo-tick.service\n",
+    );
+    scratch.write_unit(
+        "demo.socket",
+        &format!("[Unit]\nDescription=Demo socket\n[Socket]\nListenStream={sock_s}\nService=demo-echo.service\n"),
+    );
+    scratch.write_unit(
+        "demo-echo.service",
+        "[Unit]\nDescription=Demo echo service\n[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    scratch.write_unit(
+        "demo.mount",
+        &format!("[Unit]\nDescription=Demo mount\n[Mount]\nWhat=tmpfs\nWhere={mnt_s}\nType=tmpfs\nOptions=mode=1777\n"),
+    );
+    scratch.write_unit(
+        "demo.target",
+        "[Unit]\nDescription=Demo target\nWants=demo.service demo.timer demo.socket demo.mount\nAfter=demo.service demo.timer demo.socket demo.mount\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    // One `start demo.target` pulls in every demo unit via Wants=.
+    ctl.start(&["demo.target"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.is_active(&["demo.target"])
+            .map(|v| v == vec!["active"])
+            .unwrap_or(false)
+    }));
+
+    // .service: oneshot + RemainAfterExit=yes parks in active(exited).
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["demo.service"])
+            .map(|v| {
+                v.first()
+                    .map(|s| s.active == "active" && s.sub == "exited")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }));
+
+    // .timer: armed and active.
+    assert_eq!(ctl.is_active(&["demo.timer"]).unwrap(), vec!["active"]);
+
+    // .socket: active(listening), and its service is NOT yet started.
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["demo.socket"])
+            .map(|v| v.first().map(|s| s.active == "active").unwrap_or(false))
+            .unwrap_or(false)
+    }));
+    assert_eq!(
+        ctl.is_active(&["demo-echo.service"]).unwrap(),
+        vec!["inactive"]
+    );
+
+    // .timer fires demo-tick.service (OnUnitInactiveSec=1s): the tick marker
+    // proves the target actually ran on a timer elapse.
+    assert!(
+        wait_for(Duration::from_secs(5), || tick.exists()),
+        "timer should fire demo-tick.service, which writes the marker"
+    );
+    let last_set = wait_for(Duration::from_secs(3), || {
+        ctl.list_timers()
+            .map(|v| v.iter().any(|t| t.unit == "demo.timer" && t.last.is_some()))
+            .unwrap_or(false)
+    });
+    assert!(
+        last_set,
+        "list_timers should record demo.timer's last elapse"
+    );
+
+    // .socket: a connection activates demo-echo.service on demand.
+    let _conn = UnixStream::connect(&sock).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["demo-echo.service"])
+            .map(|v| v.first().map(|s| s.active == "active").unwrap_or(false))
+            .unwrap_or(false)
+    }));
+
+    // .mount: mount(2) needs CAP_SYS_ADMIN, so self-skip when not root.
+    if euid() != 0 {
+        eprintln!("skipping live_demo_units_lifecycle .mount: mount(2) requires root");
+        return;
+    }
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["demo.mount"])
+            .map(|v| {
+                v.first()
+                    .map(|s| s.active == "active" && s.sub == "mounted")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }));
+    assert!(is_mounted(&mnt), "tmpfs should be mounted at {mnt_s}");
+    ctl.stop(&["demo.mount"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.is_active(&["demo.mount"])
+            .map(|v| v == vec!["inactive"])
+            .unwrap_or(false)
+    }));
+    assert!(!is_mounted(&mnt), "tmpfs should be unmounted after stop");
+}
+
+/// `.device` units are runtime-generated by udev enumeration — there is no
+/// unit file. The test daemon calls `udev_init()` (like the real one), so
+/// `list-units` should surface `.device` entries after enumeration. Skips
+/// quietly in sandboxes without a mounted sysfs.
+#[cfg(all(target_os = "linux", feature = "udev"))]
+#[test]
+fn device_units_appear_after_enumeration() {
+    if !std::path::Path::new("/sys/devices").is_dir() {
+        eprintln!("skipping device_units_appear_after_enumeration: /sys/devices not present");
+        return;
+    }
+    // Scratch sets the RUSTEMD_* env vars (and holds the env lock) that the
+    // daemon thread reads; we don't need to write any unit files.
+    let _scratch = Scratch::new();
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let ctl = daemon.client();
+    let found = wait_for(Duration::from_secs(3), || {
+        ctl.list_units(&[], None)
+            .map(|v| v.iter().any(|u| u.unit.ends_with(".device")))
+            .unwrap_or(false)
+    });
+    assert!(
+        found,
+        "udev enumeration should register .device units in list-units"
+    );
 }

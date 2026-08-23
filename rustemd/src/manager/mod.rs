@@ -486,6 +486,13 @@ impl Manager {
     // ---- public control entry points ----------------------------------------
 
     pub fn start(&mut self, name: &str) -> Result<(), String> {
+        // Once shutdown has begun, refuse new starts: a socket-activation
+        // trigger (or any other edge) that fires mid-shutdown would otherwise
+        // restart units faster than `shutdown()` stops them and prevent the
+        // manager from ever reaching `idle()`.
+        if self.shutting_down {
+            return Ok(());
+        }
         if !self.units.contains_key(name) {
             return Err(format!("Unit {name} not found."));
         }
@@ -634,6 +641,12 @@ impl Manager {
             return;
         }
         self.shutting_down = true;
+        // Drop pending service timers so the manager can reach `idle()` and
+        // exit. A re-arming monotonic/calendar timer would otherwise keep
+        // `has_service_timers()` true forever and block poweroff. Stop
+        // timeouts are re-armed as units stop below and are excluded from
+        // `has_service_timers()` anyway.
+        self.wheel = TimerWheel::default();
         let names: Vec<String> = self
             .units
             .iter()
@@ -790,6 +803,14 @@ impl Manager {
                 }
             }
         }
+
+        // Some dependencies resolve synchronously during the expansion above:
+        // a `.mount` fails on mount(2) EPERM, a `.target` activates the instant
+        // it starts, etc. Their job completes (and runs `on_job_completed`)
+        // while this job's `waiting` list is still uncommitted, so a wait entry
+        // pushed for them would never be removed and would block this job
+        // forever. Drop any entry whose job is no longer pending.
+        waiting.retain(|w| self.unit_job.contains_key(&w.unit));
 
         if let Some(j) = self.jobs.get_mut(&id) {
             j.waiting = waiting;
@@ -2026,6 +2047,12 @@ impl Manager {
         // re-arms (load_all + timer_dep_check on every unit state change)
         // don't accumulate duplicate entries that all fire at once.
         self.wheel.cancel_by_unit(name);
+        // Once we're shutting down, stop arming timers: a re-arming schedule
+        // would keep `has_service_timers()` true and block the manager from
+        // ever reaching `idle()` and exiting (see `shutdown`).
+        if self.shutting_down {
+            return;
+        }
         let tc = match self.units[name].timer_cfg() {
             Some(t) => t.clone(),
             None => return,
