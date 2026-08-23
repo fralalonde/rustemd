@@ -7,13 +7,18 @@ license = "MIT"
 rust-version = "1.85"
 
 [features]
-default = ["socket"]
+default = ["socket", "udev"]
 # Linux PID-1 boot support: mount the API/virtual filesystems, run early-boot
 # configuration, and instantiate template units (getty@tty1 -> getty@.service).
 boot = []
 # Socket activation: `.socket` units that bind listening sockets and activate a
 # matching `.service` on the first connection (inetd-style, via LISTEN_FDS).
 socket = []
+# udev integration: discover kernel devices (sysfs + netlink uevents) and track
+# them as runtime-generated `.device` units. Linux-only; no new dependencies —
+# built on `nix` netlink sockets and the sysfs tree. Disable for headless /
+# non-Linux builds that don't need device ordering.
+udev = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

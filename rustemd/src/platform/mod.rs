@@ -19,3 +19,5 @@ pub mod net;
 pub mod process;
 #[cfg(unix)]
 pub mod signals;
+#[cfg(all(target_os = "linux", feature = "udev"))]
+pub mod udev;
