@@ -25,6 +25,8 @@ pub enum UnitKind {
     Socket,
     #[cfg(all(target_os = "linux", feature = "udev"))]
     Device,
+    #[cfg(target_os = "linux")]
+    Mount,
 }
 
 impl UnitKind {
@@ -37,6 +39,8 @@ impl UnitKind {
             UnitKind::Socket => "socket",
             #[cfg(all(target_os = "linux", feature = "udev"))]
             UnitKind::Device => "device",
+            #[cfg(target_os = "linux")]
+            UnitKind::Mount => "mount",
         }
     }
     pub fn from_suffix(s: &str) -> Option<UnitKind> {
@@ -48,6 +52,8 @@ impl UnitKind {
             "socket" => Some(UnitKind::Socket),
             #[cfg(all(target_os = "linux", feature = "udev"))]
             "device" => Some(UnitKind::Device),
+            #[cfg(target_os = "linux")]
+            "mount" => Some(UnitKind::Mount),
             _ => None,
         }
     }
@@ -359,6 +365,23 @@ pub struct SocketConfig {
     pub service: Option<String>,
 }
 
+/// `[Mount]` section — a filesystem mount unit. `what` is the device (or the
+/// filesystem name for pseudo-filesystems like `tmpfs`); `where_` is the mount
+/// point, defaulting to the unit name with `-` mapped to `/`; `fs_type` is the
+/// filesystem type; `options` are the comma-separated mount options.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+pub struct MountConfig {
+    /// `What=` — the device or pseudo-filesystem to mount.
+    pub what: Option<String>,
+    /// `Where=` — the mount point (derived from the unit name if unset).
+    pub where_: Option<String>,
+    /// `Type=` — the filesystem type (`tmpfs`, `ext4`, ...).
+    pub fs_type: Option<String>,
+    /// `Options=` — comma-separated mount options.
+    pub options: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallConfig {
     pub wanted_by: Vec<String>,
@@ -377,6 +400,8 @@ pub struct UnitFile {
     pub timer: Option<TimerConfig>,
     #[cfg(feature = "socket")]
     pub socket: Option<SocketConfig>,
+    #[cfg(target_os = "linux")]
+    pub mount: Option<MountConfig>,
     pub install: InstallConfig,
 }
 
@@ -390,6 +415,10 @@ impl UnitFile {
             #[cfg(feature = "socket")]
             if self.socket.is_some() {
                 return UnitKind::Socket;
+            }
+            #[cfg(target_os = "linux")]
+            if self.mount.is_some() {
+                return UnitKind::Mount;
             }
             UnitKind::Target
         }
@@ -455,6 +484,12 @@ pub fn build(raw: &parse::RawUnitFile, spec: &SpecifierContext) -> Result<UnitFi
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    let mount = if kind == UnitKind::Mount {
+        Some(build_mount(raw, &exp, spec)?)
+    } else {
+        None
+    };
 
     Ok(UnitFile {
         path: None,
@@ -463,6 +498,8 @@ pub fn build(raw: &parse::RawUnitFile, spec: &SpecifierContext) -> Result<UnitFi
         timer,
         #[cfg(feature = "socket")]
         socket,
+        #[cfg(target_os = "linux")]
+        mount,
         install,
     })
 }
@@ -831,6 +868,60 @@ fn build_timer(
     Ok(cfg)
 }
 
+/// Derive a mount point from a `.mount` unit name: `tmp-demo.mount` →
+/// `/tmp/demo`. The escaping mirrors systemd's path units — `-` maps to `/`,
+/// and `\xHH` escapes decode to the literal byte (so a literal `-` in the path
+/// is written `\x2d` in the unit name).
+#[cfg(target_os = "linux")]
+pub fn mount_path_from_unit_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".mount")?;
+    let b = stem.as_bytes();
+    // systemd's path escape drops the leading `/`; unescaping re-prepends it.
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 1);
+    out.push(b'/');
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'-' {
+            out.push(b'/');
+            i += 1;
+        } else if b[i] == b'\\' && i + 3 < b.len() && b[i + 1] == b'x' {
+            let hex = std::str::from_utf8(&b[i + 2..i + 4]).unwrap_or("");
+            match u8::from_str_radix(hex, 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 4;
+                }
+                Err(_) => {
+                    out.push(b'\\');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn build_mount(
+    raw: &parse::RawUnitFile,
+    exp: &impl Fn(&str) -> String,
+    spec: &SpecifierContext,
+) -> Result<MountConfig, String> {
+    let where_ = match unit_scalar(raw, "Mount", "Where") {
+        Some(v) => Some(crate::unit::parse::unquote_scalar(&exp(v))?),
+        None => mount_path_from_unit_name(&spec.unit_name),
+    };
+    Ok(MountConfig {
+        what: unit_scalar(raw, "Mount", "What").map(&exp),
+        where_,
+        fs_type: unit_scalar(raw, "Mount", "Type").map(&exp),
+        options: unit_scalar(raw, "Mount", "Options").map(&exp),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,5 +1117,60 @@ mod tests {
         let f = build_str(&combined, "o.service").unwrap();
         assert_eq!(f.unit.description, "override");
         assert_eq!(f.service.as_ref().unwrap().exec_start.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_path_derivation() {
+        assert_eq!(
+            mount_path_from_unit_name("tmp-demo.mount").as_deref(),
+            Some("/tmp/demo")
+        );
+        assert_eq!(
+            mount_path_from_unit_name("var-log.mount").as_deref(),
+            Some("/var/log")
+        );
+        // A literal `-` in the path is `\x2d` in the unit name.
+        assert_eq!(
+            mount_path_from_unit_name("tmp-my\\x2ddir.mount").as_deref(),
+            Some("/tmp/my-dir")
+        );
+        // A non-`.mount` suffix yields nothing.
+        assert_eq!(mount_path_from_unit_name("tmp-demo.service"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_parsing_and_name_derivation() {
+        // Explicit Where= wins over the name-derived default.
+        let f = build_str(
+            "[Mount]\nWhat=tmpfs\nWhere=/run/explicit\nType=tmpfs\nOptions=mode=1777,size=64m\n",
+            "tmp-demo.mount",
+        )
+        .unwrap();
+        let m = f.mount.as_ref().unwrap();
+        assert_eq!(m.what.as_deref(), Some("tmpfs"));
+        assert_eq!(m.where_.as_deref(), Some("/run/explicit"));
+        assert_eq!(m.fs_type.as_deref(), Some("tmpfs"));
+        assert_eq!(m.options.as_deref(), Some("mode=1777,size=64m"));
+        assert_eq!(f.kind(), UnitKind::Mount);
+
+        // No Where= → derived from the unit name (`tmp-demo.mount` → /tmp/demo).
+        let f = build_str("[Mount]\nWhat=tmpfs\nType=tmpfs\n", "tmp-demo.mount").unwrap();
+        assert_eq!(
+            f.mount.as_ref().unwrap().where_.as_deref(),
+            Some("/tmp/demo")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit_kind_suffix_mount() {
+        assert_eq!(UnitKind::Mount.suffix(), "mount");
+        assert_eq!(UnitKind::from_suffix("mount"), Some(UnitKind::Mount));
+        assert_eq!(
+            UnitKind::from_unit_name("tmp-demo.mount"),
+            Some(UnitKind::Mount)
+        );
     }
 }

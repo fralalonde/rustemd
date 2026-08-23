@@ -157,3 +157,20 @@ impl UnitType for DeviceUnit {
         mgr.finalize_stop(name);
     }
 }
+
+/// A `.mount` unit: mount a filesystem on start, unmount on stop. There is no
+/// process to supervise — the unit is `active` the instant `mount(2)` succeeds
+/// and `inactive` once `umount2(2)` returns.
+#[cfg(target_os = "linux")]
+pub struct MountUnit;
+
+#[cfg(target_os = "linux")]
+impl UnitType for MountUnit {
+    fn start(&self, mgr: &mut Manager, name: &str) {
+        mgr.start_mount(name);
+    }
+
+    fn stop(&self, mgr: &mut Manager, name: &str) {
+        mgr.stop_mount(name);
+    }
+}

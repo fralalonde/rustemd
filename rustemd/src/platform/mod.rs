@@ -13,6 +13,8 @@
 pub mod boot;
 #[cfg(unix)]
 pub mod cgroup;
+#[cfg(target_os = "linux")]
+pub mod mount;
 #[cfg(unix)]
 pub mod net;
 #[cfg(unix)]
