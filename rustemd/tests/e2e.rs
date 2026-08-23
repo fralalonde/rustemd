@@ -300,3 +300,98 @@ fn socket_activates_service_on_connection() {
         "connecting should activate the service via socket activation"
     );
 }
+
+/// A `.mount` unit mounts a filesystem on start and unmounts on stop, with no
+/// process to supervise. `mount(2)` needs `CAP_SYS_ADMIN`, so this test
+/// self-skips when not run as root (or in an unprivileged user+mount
+/// namespace). The daemon runs as a *thread* in this process, so a `tmpfs`
+/// mounted by the manager is visible to `/proc/self/mountinfo` here.
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_unit_lifecycle() {
+    if euid() != 0 {
+        eprintln!("skipping mount_unit_lifecycle: mount(2) requires root");
+        return;
+    }
+
+    let scratch = Scratch::new();
+    let mountpoint = scratch.dir.path().join("demo");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let where_s = mountpoint.to_string_lossy().to_string();
+    scratch.write_unit(
+        "tmp-demo.mount",
+        &format!("[Mount]\nWhat=tmpfs\nWhere={where_s}\nType=tmpfs\nOptions=mode=1777\n"),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+
+    let mut ctl = daemon.client();
+
+    // Start → mount(2) succeeds → active(mounted).
+    ctl.start(&["tmp-demo.mount"]).unwrap();
+    let mounted = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["tmp-demo.mount"])
+            .map(|v| {
+                v.first()
+                    .map(|s| s.active == "active" && s.sub == "mounted")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    });
+    assert!(mounted, "mount unit should reach active(mounted)");
+    assert!(
+        is_mounted(&mountpoint),
+        "tmpfs should be mounted at {where_s}"
+    );
+
+    // Stop → umount2(2) → inactive, and the filesystem is gone.
+    ctl.stop(&["tmp-demo.mount"]).unwrap();
+    let stopped = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["tmp-demo.mount"])
+            .map(|v| v.first().map(|s| s.active == "inactive").unwrap_or(false))
+            .unwrap_or(false)
+    });
+    assert!(stopped, "mount unit should return to inactive after stop");
+    assert!(
+        !is_mounted(&mountpoint),
+        "tmpfs should be unmounted after stop"
+    );
+}
+
+/// The current effective uid (0 = root), read from `/proc/self/status`.
+#[cfg(target_os = "linux")]
+fn euid() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(u32::MAX)
+}
+
+/// Is `path` a mount point, per `/proc/self/mountinfo`?
+#[cfg(target_os = "linux")]
+fn is_mounted(path: &std::path::Path) -> bool {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|s| {
+            s.lines().any(|l| {
+                // Field 4 (0-indexed) is the mount point; decode the
+                // `\040`/`\011`/`\012`/`\134` escapes the kernel uses.
+                l.split(' ').nth(4).is_some_and(|mp| {
+                    let decoded = mp
+                        .replace("\\040", " ")
+                        .replace("\\011", "\t")
+                        .replace("\\012", "\n")
+                        .replace("\\134", "\\");
+                    std::path::Path::new(&decoded) == canon
+                })
+            })
+        })
+        .unwrap_or(false)
+}

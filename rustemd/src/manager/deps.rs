@@ -139,6 +139,8 @@ mod tests {
             timer: None,
             #[cfg(feature = "socket")]
             socket: None,
+            #[cfg(target_os = "linux")]
+            mount: None,
             install: Default::default(),
         });
         u

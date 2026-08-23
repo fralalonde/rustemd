@@ -35,6 +35,8 @@ use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult
 use self::timer::{TimerKind, TimerWheel};
 #[cfg(all(target_os = "linux", feature = "udev"))]
 use self::unit_type::DeviceUnit;
+#[cfg(target_os = "linux")]
+use self::unit_type::MountUnit;
 #[cfg(feature = "socket")]
 use self::unit_type::SocketUnit;
 use self::unit_type::{ServiceUnit, TargetUnit, TimerUnit, UnitType};
@@ -282,6 +284,10 @@ impl Manager {
                     }
                     #[cfg(feature = "socket")]
                     if fname.ends_with(".socket") {
+                        names.insert(fname.clone());
+                    }
+                    #[cfg(target_os = "linux")]
+                    if fname.ends_with(".mount") {
                         names.insert(fname.clone());
                     }
                 }
@@ -1000,6 +1006,8 @@ impl Manager {
             Some(UnitKind::Socket) => &SocketUnit,
             #[cfg(all(target_os = "linux", feature = "udev"))]
             Some(UnitKind::Device) => &DeviceUnit,
+            #[cfg(target_os = "linux")]
+            Some(UnitKind::Mount) => &MountUnit,
             _ => &ServiceUnit,
         }
     }
@@ -1115,6 +1123,8 @@ impl Manager {
             timer: None,
             #[cfg(feature = "socket")]
             socket: None,
+            #[cfg(target_os = "linux")]
+            mount: None,
             install: Default::default(),
         }
     }
@@ -1808,6 +1818,76 @@ impl Manager {
             self.socket_triggers.remove(&fd);
         }
         self.finalize_stop(name);
+    }
+
+    /// `.mount` start: perform `mount(2)` and go `active(mounted)` on success,
+    /// or `failed` on error. Mounting is synchronous, so there is no
+    /// intermediate `activating` phase to supervise.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_mount(&mut self, name: &str) {
+        let cfg = match self.units[name].mount_cfg().cloned() {
+            Some(c) => c,
+            None => {
+                self.fail_unit(name, "missing [Mount] section".into());
+                return;
+            }
+        };
+        let target = match cfg.where_.as_deref() {
+            Some(w) if !w.is_empty() => w.to_string(),
+            _ => {
+                self.fail_unit(name, "no Where= mount point".into());
+                return;
+            }
+        };
+        let fstype = match cfg.fs_type.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                self.fail_unit(name, "no Type= filesystem type".into());
+                return;
+            }
+        };
+        let (flags, data) = crate::platform::mount::split_options(cfg.options.as_deref());
+        match crate::platform::mount::mount(
+            cfg.what.as_deref(),
+            std::path::Path::new(&target),
+            &fstype,
+            flags,
+            data.as_deref(),
+        ) {
+            Ok(()) => {
+                self.units.get_mut(name).unwrap().set_active(
+                    ActiveState::Active,
+                    SubState::Mounted,
+                    UnitResult::Success,
+                );
+                self.complete_start_job(name);
+            }
+            Err(e) => {
+                self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                self.fail_unit(name, format!("mount {target} failed: {e}"));
+            }
+        }
+    }
+
+    /// `.mount` stop: perform `umount2(2)` and finalize, or `failed` on error.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_mount(&mut self, name: &str) {
+        let cfg = self.units[name].mount_cfg().cloned();
+        let target = match cfg.and_then(|c| c.where_) {
+            Some(w) if !w.is_empty() => w,
+            _ => {
+                // Nothing to unmount: finalize immediately.
+                self.finalize_stop(name);
+                return;
+            }
+        };
+        match crate::platform::mount::unmount(std::path::Path::new(&target), false) {
+            Ok(()) => self.finalize_stop(name),
+            Err(e) => {
+                self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                self.fail_unit(name, format!("unmount {target} failed: {e}"));
+            }
+        }
     }
 
     /// Listening fds to pass to a service being socket-activated.
@@ -2662,6 +2742,8 @@ fn builtin_target(name: &str) -> Unit {
         timer: None,
         #[cfg(feature = "socket")]
         socket: None,
+        #[cfg(target_os = "linux")]
+        mount: None,
         install: Default::default(),
     });
     u

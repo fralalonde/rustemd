@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
 use crate::log::LogRing;
+#[cfg(target_os = "linux")]
+use crate::unit::MountConfig;
 #[cfg(feature = "socket")]
 use crate::unit::SocketConfig;
 use crate::unit::{ServiceConfig, TimerConfig, UnitFile, UnitKind};
@@ -28,6 +30,8 @@ pub enum SubState {
     Start,
     Post,
     Running,
+    /// A `.mount` unit that has completed `mount(2)` (active).
+    Mounted,
     Exited,
     WaitingForBus,
     Stop,
@@ -48,6 +52,7 @@ impl SubState {
             SubState::Start => "start",
             SubState::Post => "post",
             SubState::Running => "running",
+            SubState::Mounted => "mounted",
             SubState::Exited => "exited",
             SubState::WaitingForBus => "waiting-for-bus",
             SubState::Stop => "stop",
@@ -191,6 +196,11 @@ impl Unit {
     #[cfg(feature = "socket")]
     pub fn socket_cfg(&self) -> Option<&SocketConfig> {
         self.file.as_ref().and_then(|f| f.socket.as_ref())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn mount_cfg(&self) -> Option<&MountConfig> {
+        self.file.as_ref().and_then(|f| f.mount.as_ref())
     }
 
     /// The unit that a timer activates (default: same prefix, `.service`).
