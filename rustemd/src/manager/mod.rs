@@ -11,7 +11,7 @@ pub mod timer;
 pub mod unit_type;
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -154,6 +154,10 @@ pub struct Manager {
     pid_unit: HashMap<i32, Name>,
     /// (stdout/stderr raw fd) -> unit name
     pub out_fds: HashMap<RawFd, Name>,
+    /// Owned handles backing `out_fds`: holding these keeps each child's
+    /// stdout/stderr pipe open across reads; dropping one (on EOF/error/stop)
+    /// closes that pipe.
+    pub owned_fds: HashMap<RawFd, OwnedFd>,
     #[cfg(feature = "socket")]
     pub socket_listeners: HashMap<RawFd, SocketListener>,
     #[cfg(feature = "socket")]
@@ -194,6 +198,7 @@ impl Manager {
             wheel: TimerWheel::default(),
             pid_unit: HashMap::new(),
             out_fds: HashMap::new(),
+            owned_fds: HashMap::new(),
             #[cfg(feature = "socket")]
             socket_listeners: HashMap::new(),
             #[cfg(feature = "socket")]
@@ -1132,10 +1137,14 @@ impl Manager {
         match spawn::spawn(&opts) {
             Ok(sp) => {
                 if let Some(fd) = sp.stdout {
-                    self.out_fds.insert(fd.as_raw_fd(), name.to_string());
+                    let raw = fd.as_raw_fd();
+                    self.out_fds.insert(raw, name.to_string());
+                    self.owned_fds.insert(raw, fd);
                 }
                 if let Some(fd) = sp.stderr {
-                    self.out_fds.insert(fd.as_raw_fd(), name.to_string());
+                    let raw = fd.as_raw_fd();
+                    self.out_fds.insert(raw, name.to_string());
+                    self.owned_fds.insert(raw, fd);
                 }
                 let pid = sp.pid;
                 self.pid_unit.insert(pid, name.to_string());
@@ -1782,6 +1791,7 @@ impl Manager {
             .collect();
         for fd in fds {
             self.out_fds.remove(&fd);
+            self.owned_fds.remove(&fd);
         }
         // A Type=dbus unit that is stopped before acquiring its BusName= must
         // drop its pending name watch.
@@ -1865,6 +1875,10 @@ impl Manager {
     }
 
     fn rearm_timer(&mut self, name: &str) {
+        // Idempotent: drop any prior deadlines for this timer so repeated
+        // re-arms (load_all + timer_dep_check on every unit state change)
+        // don't accumulate duplicate entries that all fire at once.
+        self.wheel.cancel_by_unit(name);
         let tc = match self.units[name].timer_cfg() {
             Some(t) => t.clone(),
             None => return,
@@ -2345,11 +2359,13 @@ impl Manager {
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(_) => {
                     self.out_fds.remove(&fd);
+                    self.owned_fds.remove(&fd);
                     break;
                 }
             };
             if n == 0 {
                 self.out_fds.remove(&fd);
+                self.owned_fds.remove(&fd);
                 break;
             }
             if let Some(u) = self.units.get_mut(&name) {

@@ -151,6 +151,8 @@ pub fn parse_exit_status(value: &str) -> Result<ExitCodeSet, String> {
             out.codes.push((n, n));
         } else if let Some(sig) = sig_from_name(tok) {
             out.signals.push(sig as i32);
+        } else if let Some(code) = sysexit_from_name(tok) {
+            out.codes.push((code, code));
         } else {
             return Err(format!("invalid success exit status `{tok}`"));
         }
@@ -159,6 +161,34 @@ pub fn parse_exit_status(value: &str) -> Result<ExitCodeSet, String> {
         return Err("empty SuccessExitStatus".into());
     }
     Ok(out)
+}
+
+/// Parse a `sysexits(3)` exit-status name (`EX_DATAERR`, `DATAERR`, `TEMPFAIL`,
+/// `SUCCESS`, ...) into its numeric code. Case-insensitive; the `EX_` prefix
+/// is optional, matching systemd's `exit_status_from_string`.
+pub fn sysexit_from_name(s: &str) -> Option<u32> {
+    let s = s.to_ascii_uppercase();
+    let s = s.strip_prefix("EX_").unwrap_or(&s);
+    Some(match s {
+        "OK" | "SUCCESS" => 0,
+        "FAILURE" => 1,
+        "USAGE" => 64,
+        "DATAERR" => 65,
+        "NOINPUT" => 66,
+        "NOUSER" => 67,
+        "NOHOST" => 68,
+        "UNAVAILABLE" => 69,
+        "SOFTWARE" => 70,
+        "OSERR" => 71,
+        "OSFILE" => 72,
+        "CANTCREAT" => 73,
+        "IOERR" => 74,
+        "TEMPFAIL" => 75,
+        "PROTOCOL" => 76,
+        "NOPERM" => 77,
+        "CONFIG" => 78,
+        _ => return None,
+    })
 }
 
 /// Parse a signal by name, accepting `SIGTERM`, `TERM`, or a bare number.
@@ -289,9 +319,14 @@ pub struct ServiceConfig {
 
 impl ServiceConfig {
     pub fn effective_exit_success(&self) -> ExitCodeSet {
-        self.success_exit_status
-            .clone()
-            .unwrap_or_else(ExitCodeSet::default_success)
+        // Exit 0 is always a success; `SuccessExitStatus=` adds to it (never
+        // replaces it), matching systemd's `exit-status.c` semantics.
+        let mut set = ExitCodeSet::default_success();
+        if let Some(s) = &self.success_exit_status {
+            set.codes.extend_from_slice(&s.codes);
+            set.signals.extend_from_slice(&s.signals);
+        }
+        set
     }
 }
 
@@ -874,6 +909,28 @@ mod tests {
         assert!(!set.matches(Some(5), None));
         assert!(set.matches(None, Some(15)));
         assert!(!set.matches(None, Some(9)));
+    }
+
+    #[test]
+    fn sysexit_parsing() {
+        let set = parse_exit_status("DATAERR").unwrap();
+        assert!(set.matches(Some(65), None));
+        let set = parse_exit_status("EX_TEMPFAIL ex_config SUCCESS").unwrap();
+        assert!(set.matches(Some(75), None));
+        assert!(set.matches(Some(78), None));
+        assert!(set.matches(Some(0), None));
+    }
+
+    #[test]
+    fn effective_success_keeps_exit_zero() {
+        let cfg = ServiceConfig {
+            success_exit_status: Some(parse_exit_status("DATAERR").unwrap()),
+            ..Default::default()
+        };
+        let set = cfg.effective_exit_success();
+        assert!(set.matches(Some(0), None)); // exit 0 is always success
+        assert!(set.matches(Some(65), None)); // DATAERR
+        assert!(!set.matches(Some(1), None)); // anything else fails
     }
 
     #[test]

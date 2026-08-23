@@ -91,11 +91,13 @@ impl TimeSpan {
                 unit.push(chars[i]);
                 i += 1;
             }
-            if unit.is_empty() {
-                return Err(format!("missing unit after `{num}` in time span `{s}`"));
-            }
-            let factor = unit_factor(&unit)
-                .ok_or_else(|| format!("invalid time unit `{unit}` in time span `{s}`"))?;
+            // systemd.time(7): a bare number with no unit defaults to seconds.
+            let factor = if unit.is_empty() {
+                USEC_PER_SEC
+            } else {
+                unit_factor(&unit)
+                    .ok_or_else(|| format!("invalid time unit `{unit}` in time span `{s}`"))?
+            };
             total += (value * factor as f64) as u128;
             if total > u128::from(INFINITY_USEC) {
                 return Err(format!("time span `{s}` overflows"));
@@ -223,7 +225,7 @@ mod tests {
         assert!(TimeSpan::parse("infinity").unwrap().is_infinite());
         assert!(TimeSpan::parse("Infinity").unwrap().is_infinite());
         assert!(TimeSpan::parse("").is_err());
-        assert!(TimeSpan::parse("5").is_err()); // bare number, no unit
+        assert_eq!(us("5"), 5_000_000); // bare number -> seconds
         assert_eq!(TimeSpan::parse("1.5s").unwrap().usec, 1_500_000); // fractional
         assert!(TimeSpan::parse("banana").is_err());
         assert!(TimeSpan::parse("5 parsecs").is_err());

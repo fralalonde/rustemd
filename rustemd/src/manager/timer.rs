@@ -54,6 +54,13 @@ impl TimerWheel {
         self.entries.remove(&id);
     }
 
+    /// Cancel every scheduled entry for `unit`. Makes re-arming idempotent:
+    /// without this, each re-arm (one per unit state change) accumulates
+    /// duplicate deadlines that all fire in the same poll iteration.
+    pub fn cancel_by_unit(&mut self, unit: &str) {
+        self.entries.retain(|_, e| e.unit != unit);
+    }
+
     /// Earliest deadline still scheduled, pruning stale entries.
     pub fn next_deadline(&mut self) -> Option<Instant> {
         while let Some(&Reverse((_, id))) = self.heap.peek() {
