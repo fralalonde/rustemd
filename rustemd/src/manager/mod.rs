@@ -140,6 +140,11 @@ struct Job {
     failed_msg: Option<String>,
     /// For Stop jobs: unit to start once the stop completes.
     start_after_stop: Option<Name>,
+    /// True while [`Manager::expand_start_job`] is building this job's
+    /// `waiting` list. Guards against re-entrant `process_jobs` runs (e.g.
+    /// from a synchronously-failing spawn) starting the job before its
+    /// dependencies are known.
+    expanding: bool,
 }
 
 // ---- manager ----------------------------------------------------------------
@@ -322,7 +327,7 @@ impl Manager {
         let mut next: HashMap<Name, Unit> = HashMap::new();
         for name in names {
             match self.load_unit(&name) {
-                Ok(mut unit) => {
+                Ok(Some(mut unit)) => {
                     // Preserve runtime state for still-active units.
                     if let Some(old) = self.units.get(&name) {
                         if old.active != ActiveState::Inactive {
@@ -337,6 +342,12 @@ impl Manager {
                         }
                     }
                     next.insert(name, unit);
+                }
+                Ok(None) => {
+                    // A dependency reference (e.g. a dangling `.wants` dir
+                    // symlink) to a unit with no backing file. systemd silently
+                    // ignores these — the dependency is simply not activated —
+                    // so we skip the name rather than recording a load error.
                 }
                 Err(e) => {
                     let mut u = Unit::new(&name, unit_kind_of(&name));
@@ -363,11 +374,17 @@ impl Manager {
         errors
     }
 
-    fn load_unit(&self, name: &str) -> Result<Unit, String> {
+    /// Load one unit from disk.
+    ///
+    /// Returns `Ok(None)` when the unit has no backing file and is not a
+    /// builtin/synthesizable target. Such names come from dependency
+    /// references (e.g. a dangling `.wants` dir symlink) and are silently
+    /// ignored by systemd rather than treated as a load error.
+    fn load_unit(&self, name: &str) -> Result<Option<Unit>, String> {
         let kind = unit_kind_of(name);
         if kind == UnitKind::Target && self.cfg.paths.find_unit(name).is_none() && !is_builtin(name)
         {
-            return Ok(builtin_target(name));
+            return Ok(Some(builtin_target(name)));
         }
 
         let mut raw = crate::unit::parse::RawUnitFile { sections: vec![] };
@@ -382,7 +399,11 @@ impl Manager {
             raw.sections.extend(parsed.sections);
             path = Some(main);
         } else if !is_builtin(name) && !kind_unit_needs_file(kind) {
-            return Err(format!("unit file not found: {name}"));
+            // No backing file and not a builtin/synthesizable unit: a
+            // dependency reference to a unit that does not exist on this
+            // host. systemd treats this as a no-op (the dependency is simply
+            // not activated) rather than a load error.
+            return Ok(None);
         }
 
         for dropin in self.cfg.paths.dropins(name) {
@@ -420,7 +441,7 @@ impl Manager {
         unit.load = LoadState::Loaded;
         unit.path = path;
         unit.file = Some(file);
-        Ok(unit)
+        Ok(Some(unit))
     }
 
     // ---- IPC plumbing -------------------------------------------------------
@@ -638,6 +659,7 @@ impl Manager {
                 failed: false,
                 failed_msg: None,
                 start_after_stop: None,
+                expanding: false,
             },
         );
         self.unit_job.insert(unit.to_string(), id);
@@ -662,6 +684,10 @@ impl Manager {
             self.maybe_start_job(id);
             return;
         }
+        // Mark this job as mid-expansion so a re-entrant `process_jobs` (e.g.
+        // a dependency that fails to spawn synchronously) cannot start it
+        // before its `waiting` list is finalised below.
+        self.jobs.get_mut(&id).unwrap().expanding = true;
 
         let (needs, weak, requisite) = D::start_closure(&self.units, &name);
 
@@ -701,19 +727,31 @@ impl Manager {
             }
         }
 
-        // Start deps (needs + weak + after ordering).
+        // Activation dependencies: Requires= (fatal if missing) and Wants=
+        // (silently ignored if missing) pull units into the transaction.
+        // `After=` is deliberately *not* here — it only orders, never activates
+        // (systemd semantics).
         let needs_set: HashSet<String> = needs.into_iter().collect();
         let mut open: HashSet<String> = HashSet::new();
         open.extend(needs_set.iter().cloned());
         open.extend(weak.iter().cloned());
-        if let Some(f) = &self.units[&name].file {
-            open.extend(f.unit.after.iter().cloned());
-        }
         for d in open {
             if self.unit_active(&d) {
                 continue;
             }
             let required = needs_set.contains(&d);
+            if !self.units.contains_key(&d) {
+                // The dependency names a unit with no backing file. A missing
+                // Requires= fails the transaction; a missing Wants= is silent.
+                if required {
+                    self.jobs.get_mut(&id).unwrap().failed = true;
+                    self.jobs.get_mut(&id).unwrap().failed_msg =
+                        Some(format!("Dependency failed: {d} (unit not found)."));
+                    self.maybe_start_job(id);
+                    return;
+                }
+                continue;
+            }
             if let Some(jid) = self.unit_job.get(&d) {
                 if self.jobs[jid].kind == JobKind::Start {
                     waiting.push(WaitEntry { unit: d, required });
@@ -724,8 +762,32 @@ impl Manager {
             waiting.push(WaitEntry { unit: d, required });
         }
 
+        // Ordering only: `After=` never activates a unit. It merely makes this
+        // unit wait for an After= target that is *already* part of the
+        // transaction (has a pending start job). A missing or unrelated
+        // After= target is silently ignored.
+        let after_names: Vec<String> = self.units[&name]
+            .file
+            .as_ref()
+            .map(|f| f.unit.after.clone())
+            .unwrap_or_default();
+        for a in &after_names {
+            if self.unit_active(a) {
+                continue;
+            }
+            if let Some(jid) = self.unit_job.get(a) {
+                if self.jobs[jid].kind == JobKind::Start && !waiting.iter().any(|w| w.unit == *a) {
+                    waiting.push(WaitEntry {
+                        unit: a.clone(),
+                        required: false,
+                    });
+                }
+            }
+        }
+
         if let Some(j) = self.jobs.get_mut(&id) {
             j.waiting = waiting;
+            j.expanding = false;
         }
         self.maybe_start_job(id);
     }
@@ -820,6 +882,11 @@ impl Manager {
         }
         match self.jobs[&id].kind {
             JobKind::Start => {
+                // A job whose dependency list is still being built must not be
+                // started by a re-entrant `process_jobs` run.
+                if self.jobs[&id].expanding {
+                    return false;
+                }
                 if self.jobs[&id].failed {
                     self.finish_job_failed(id);
                     true
@@ -2674,5 +2741,81 @@ mod udev_tests {
         assert!(!mgr.units.contains_key(primary));
         assert!(!mgr.units.contains_key(alias));
         assert!(mgr.udev_devices.is_empty());
+    }
+}
+
+// ---- load/start dependency-leniency tests -----------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a user-mode config whose search path is a scratch dir.
+    fn scratch_cfg(dir: &tempfile::TempDir) -> ManagerCfg {
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let paths = Paths {
+            user: true,
+            unit_path: vec![units.clone()],
+            config_dir: units,
+            runtime_dir: dir.path().to_path_buf(),
+        };
+        ManagerCfg {
+            user: true,
+            paths,
+            hostname: "testhost".into(),
+            machine_id: "testid".into(),
+            uid: 1000,
+            username: "testuser".into(),
+            home: "/".into(),
+            base_env: HashMap::new(),
+            socket_activation: true,
+        }
+    }
+
+    /// A dangling `.wants`-dir reference (e.g. `podman.socket` on a host
+    /// without podman) must not be a load error — systemd silently ignores a
+    /// dependency on a unit that has no backing file.
+    #[test]
+    fn missing_wants_reference_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(units.join("sockets.target.wants")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent/podman.socket",
+            units.join("sockets.target.wants/podman.socket"),
+        )
+        .unwrap();
+
+        let mut mgr = Manager::new(scratch_cfg(&dir)).unwrap();
+        let errs = mgr.load_all();
+        assert!(
+            errs.is_empty(),
+            "missing dependency must not be a load error: {errs:?}"
+        );
+        assert!(!mgr.units.contains_key("podman.socket"));
+    }
+
+    /// `After=` and `Wants=` on units that do not exist must not activate (or
+    /// block) anything: the unit starts cleanly and the missing targets are
+    /// never pulled into the unit table.
+    #[test]
+    fn missing_after_and_wants_deps_are_silent_and_do_not_block_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(
+            units.join("a.target"),
+            "[Unit]\nDescription=test\nAfter=graphical.target\nWants=missing.service\n",
+        )
+        .unwrap();
+
+        let mut mgr = Manager::new(scratch_cfg(&dir)).unwrap();
+        mgr.load_all();
+        mgr.start("a.target").unwrap();
+
+        assert_eq!(mgr.units["a.target"].active, ActiveState::Active);
+        assert!(!mgr.units.contains_key("graphical.target"));
+        assert!(!mgr.units.contains_key("missing.service"));
     }
 }
