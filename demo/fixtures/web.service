@@ -1,0 +1,8 @@
+[Unit]
+Description=Demo task (oneshot)
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+[Install]
+WantedBy=default.target

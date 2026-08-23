@@ -1,0 +1,10 @@
+[Unit]
+Description=Hello world service (example)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env sh -c 'while true; do echo hello; sleep 5; done'
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

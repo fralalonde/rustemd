@@ -1,0 +1,2253 @@
+//! The manager: unit table, job engine, process supervision, timers, and
+//! the event loop. This is "PID 1 in a box" — spawnable as a container init
+//! (`--system`) or a per-user manager (`--user`).
+
+pub mod deps;
+pub mod ops;
+#[cfg(feature = "socket")]
+pub mod socket;
+pub mod state;
+pub mod timer;
+pub mod unit_type;
+
+use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
+
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
+
+use crate::log::mgr_log;
+use crate::paths::Paths;
+use crate::platform::cgroup;
+use crate::platform::process as spawn;
+use crate::platform::signals::SignalSource;
+use crate::specifier::SpecifierContext;
+use crate::unit::{KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind};
+
+use self::deps as D;
+#[cfg(feature = "socket")]
+use self::socket::{SocketListener, bind_listen_stream};
+use self::state::ControlCommand as UnitControlCommand;
+use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult};
+use self::timer::{TimerKind, TimerWheel};
+#[cfg(feature = "socket")]
+use self::unit_type::SocketUnit;
+use self::unit_type::{ServiceUnit, TargetUnit, TimerUnit, UnitType};
+
+pub type Name = String;
+
+// ---- configuration ----------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ManagerCfg {
+    pub user: bool,
+    pub paths: Paths,
+    pub hostname: String,
+    pub machine_id: String,
+    pub uid: u32,
+    pub username: String,
+    pub home: String,
+    /// Base environment inherited by services.
+    pub base_env: HashMap<String, String>,
+    /// Runtime gate for socket activation: when false, `.socket` units load
+    /// but bind/listen nothing (and never trigger their service).
+    pub socket_activation: bool,
+}
+
+impl ManagerCfg {
+    pub fn for_mode(user: bool) -> Result<ManagerCfg, String> {
+        let paths = if user {
+            Paths::user()?
+        } else {
+            Paths::system()
+        };
+        let uid = nix::unistd::geteuid().as_raw();
+        let user_entry = nix::unistd::User::from_uid(uid.into()).ok().flatten();
+        let username = user_entry
+            .as_ref()
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let home = user_entry
+            .as_ref()
+            .map(|u| u.dir.to_string_lossy().to_string())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_else(|| "/".into());
+        let hostname = nix::unistd::gethostname()
+            .ok()
+            .map(|os| os.to_string_lossy().to_string())
+            .unwrap_or_else(|| "localhost".into());
+        let machine_id = std::fs::read_to_string("/etc/machine-id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::var("RUSTEMD_MACHINE_ID").unwrap_or_else(|_| "unknown".into())
+            });
+        let base_env = std::env::vars().collect();
+        Ok(ManagerCfg {
+            user,
+            paths,
+            hostname,
+            machine_id,
+            uid,
+            username,
+            home,
+            base_env,
+            socket_activation: true,
+        })
+    }
+
+    pub fn specifier(&self, unit_name: &str) -> SpecifierContext {
+        SpecifierContext {
+            unit_name: unit_name.to_string(),
+            runtime_dir: self.paths.runtime_dir_spec().to_string_lossy().to_string(),
+            user_name: self.username.clone(),
+            uid: self.uid.to_string(),
+            home: self.home.clone(),
+            hostname: self.hostname.clone(),
+            machine_id: self.machine_id.clone(),
+        }
+    }
+}
+
+// ---- jobs -------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone)]
+struct WaitEntry {
+    unit: String,
+    required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Job {
+    unit: Name,
+    kind: JobKind,
+    waiting: Vec<WaitEntry>,
+    started: bool,
+    failed: bool,
+    failed_msg: Option<String>,
+    /// For Stop jobs: unit to start once the stop completes.
+    start_after_stop: Option<Name>,
+}
+
+// ---- manager ----------------------------------------------------------------
+
+pub struct Manager {
+    pub cfg: ManagerCfg,
+    pub units: HashMap<Name, Unit>,
+    jobs: HashMap<u64, Job>,
+    unit_job: HashMap<Name, u64>,
+    next_job: u64,
+    pub wheel: TimerWheel,
+    pid_unit: HashMap<i32, Name>,
+    /// (stdout/stderr raw fd) -> unit name
+    pub out_fds: HashMap<RawFd, Name>,
+    #[cfg(feature = "socket")]
+    pub socket_listeners: HashMap<RawFd, SocketListener>,
+    #[cfg(feature = "socket")]
+    pub socket_triggers: HashMap<RawFd, (Name, Name)>,
+    listener: Option<UnixListener>,
+    notify: Option<UnixDatagram>,
+    signalfd: Option<SignalSource>,
+    pub shutting_down: bool,
+    pub boot: SystemTime,
+    pub boot_instant: Instant,
+    pub as_pid1: bool,
+}
+
+impl Manager {
+    pub fn new(cfg: ManagerCfg) -> Result<Manager, String> {
+        crate::platform::process::set_subreaper();
+        Ok(Manager {
+            cfg,
+            units: HashMap::new(),
+            jobs: HashMap::new(),
+            unit_job: HashMap::new(),
+            next_job: 0,
+            wheel: TimerWheel::default(),
+            pid_unit: HashMap::new(),
+            out_fds: HashMap::new(),
+            #[cfg(feature = "socket")]
+            socket_listeners: HashMap::new(),
+            #[cfg(feature = "socket")]
+            socket_triggers: HashMap::new(),
+            listener: None,
+            notify: None,
+            signalfd: None,
+            shutting_down: false,
+            boot: SystemTime::now(),
+            boot_instant: Instant::now(),
+            as_pid1: nix::unistd::getpid() == Pid::from_raw(1),
+        })
+    }
+
+    pub fn spec_for(&self, name: &str) -> SpecifierContext {
+        self.cfg.specifier(name)
+    }
+
+    fn build_env(&self, u: &Unit) -> HashMap<String, String> {
+        let mut env = self.cfg.base_env.clone();
+        if let Some(sc) = u.service_cfg() {
+            for (k, v) in &sc.environment {
+                env.insert(k.clone(), v.clone());
+            }
+            for (path, ignore) in &sc.environment_files {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        for line in text.lines() {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                                continue;
+                            }
+                            if let Some((k, v)) = line.split_once('=') {
+                                env.insert(k.trim().to_string(), v.trim().to_string());
+                            }
+                        }
+                    }
+                    Err(_) if !*ignore => {
+                        mgr_log(&format!("[{}] EnvironmentFile {} missing", u.name, path));
+                    }
+                    Err(_) => {}
+                }
+            }
+            env.insert("UNIT_NAME".into(), u.name.clone());
+        }
+        env
+    }
+
+    // ---- unit loading -------------------------------------------------------
+
+    pub fn discover_names(&self) -> Vec<String> {
+        let mut names: HashSet<String> = HashSet::new();
+        for dir in &self.cfg.paths.unit_path {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let fname = match p.file_name().and_then(|f| f.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
+                if p.is_file() {
+                    for suffix in ["service", "timer", "target"] {
+                        if fname.ends_with(&format!(".{suffix}")) {
+                            names.insert(fname.clone());
+                        }
+                    }
+                    #[cfg(feature = "socket")]
+                    if fname.ends_with(".socket") {
+                        names.insert(fname.clone());
+                    }
+                }
+            }
+        }
+        // Wants/requires dirs imply units.
+        for dir in &self.cfg.paths.unit_path {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let fname = e.file_name().to_string_lossy().to_string();
+                if let Some(base) = fname.strip_suffix(".wants") {
+                    names.insert(format!("{base}.target"));
+                    if let Ok(rd2) = std::fs::read_dir(e.path()) {
+                        for d in rd2.flatten() {
+                            if let Some(n) = d.file_name().to_str() {
+                                names.insert(n.to_string());
+                            }
+                        }
+                    }
+                } else if let Some(base) = fname.strip_suffix(".requires") {
+                    names.insert(format!("{base}.target"));
+                }
+            }
+        }
+        names.insert("basic.target".into());
+        names.insert("multi-user.target".into());
+        names.insert("default.target".into());
+        if let Ok(md) = std::fs::read_link(self.cfg.paths.default_target()) {
+            if let Some(n) = md.file_name().and_then(|f| f.to_str()) {
+                names.insert(n.to_string());
+            }
+        }
+        let mut v: Vec<String> = names.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    pub fn load_all(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let names = self.discover_names();
+        let mut next: HashMap<Name, Unit> = HashMap::new();
+        for name in names {
+            match self.load_unit(&name) {
+                Ok(mut unit) => {
+                    // Preserve runtime state for still-active units.
+                    if let Some(old) = self.units.get(&name) {
+                        if old.active != ActiveState::Inactive {
+                            unit.main_pid = old.main_pid;
+                            unit.group_pid = old.group_pid;
+                            unit.cgroup = old.cgroup.clone();
+                            unit.control_pid = old.control_pid;
+                            unit.control_command = old.control_command;
+                            unit.active = old.active;
+                            unit.sub = old.sub;
+                            unit.log = old.log.clone();
+                        }
+                    }
+                    next.insert(name, unit);
+                }
+                Err(e) => {
+                    let mut u = Unit::new(&name, unit_kind_of(&name));
+                    u.load = LoadState::Error;
+                    u.load_error = Some(e.clone());
+                    let msg = format!("{name}: {e}");
+                    next.insert(name, u);
+                    errors.push(msg);
+                }
+            }
+        }
+        self.units = next;
+        self.rearm_all_timers();
+        errors
+    }
+
+    fn load_unit(&self, name: &str) -> Result<Unit, String> {
+        let kind = unit_kind_of(name);
+        if kind == UnitKind::Target && self.cfg.paths.find_unit(name).is_none() && !is_builtin(name)
+        {
+            return Ok(builtin_target(name));
+        }
+
+        let mut raw = crate::unit::parse::RawUnitFile { sections: vec![] };
+        let mut path: Option<PathBuf> = None;
+        let spec = self.cfg.specifier(name);
+
+        // Load main file if it exists; synthesized builtins have none.
+        let has_main = self.cfg.paths.find_unit(name).is_some();
+        if let Some(main) = self.cfg.paths.find_unit(name) {
+            let parsed =
+                crate::unit::parse::parse_file(&main).map_err(|e| format!("parse error: {e}"))?;
+            raw.sections.extend(parsed.sections);
+            path = Some(main);
+        } else if !is_builtin(name) && !kind_unit_needs_file(kind) {
+            return Err(format!("unit file not found: {name}"));
+        }
+
+        for dropin in self.cfg.paths.dropins(name) {
+            match crate::unit::parse::parse_file(&dropin) {
+                Ok(d) => raw.sections.extend(d.sections),
+                Err(e) => return Err(format!("drop-in error: {e}")),
+            }
+        }
+
+        let mut file = crate::unit::build(&raw, &spec)?;
+        // Wants/requires dirs contribute implicit dependencies.
+        file.unit
+            .wants
+            .extend(self.cfg.paths.dir_deps(name, "wants"));
+        file.unit
+            .requires
+            .extend(self.cfg.paths.dir_deps(name, "requires"));
+
+        if kind == UnitKind::Target && !has_main {
+            // Synthesized default.lower: default.target wants multi-user.target.
+            if name == "default.target" && file.unit.unit_defaults_empty() {
+                file.unit.wants.push("multi-user.target".into());
+                file.unit.after.push("multi-user.target".into());
+            }
+            // Builtin empty targets get a description.
+            if name == "basic.target" {
+                file.unit.description = "Basic System".into();
+            }
+            if name == "multi-user.target" {
+                file.unit.description = "Multi-User System".into();
+            }
+        }
+
+        let mut unit = Unit::new(name, file.kind());
+        unit.load = LoadState::Loaded;
+        unit.path = path;
+        unit.file = Some(file);
+        Ok(unit)
+    }
+
+    // ---- IPC plumbing -------------------------------------------------------
+
+    pub fn control_socket_path(&self) -> PathBuf {
+        let paths = self.cfg.paths.clone();
+        paths.control_socket()
+    }
+
+    pub fn bind_ipc(&mut self) -> Result<(), String> {
+        let path = self.control_socket_path();
+        self.listener = Some(crate::platform::net::bind_control(&path)?);
+        Ok(())
+    }
+
+    pub fn bind_notify(&mut self) -> Result<(), String> {
+        let path = self.cfg.paths.notify_socket();
+        self.notify = Some(crate::platform::net::bind_notify(&path)?);
+        Ok(())
+    }
+
+    fn handle_connection(&mut self, stream: UnixStream) {
+        use std::io::{BufRead, BufReader, BufWriter, Write};
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let resp = crate::ipc::dispatch(self, &line);
+        let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
+        out.push('\n');
+        let mut writer = BufWriter::new(reader.into_inner());
+        let _ = Write::write_all(&mut writer, out.as_bytes());
+    }
+
+    // ---- public control entry points ----------------------------------------
+
+    pub fn start(&mut self, name: &str) -> Result<(), String> {
+        if !self.units.contains_key(name) {
+            return Err(format!("Unit {name} not found."));
+        }
+        if self.unit_active(name) {
+            return Ok(());
+        }
+        if let Some(jid) = self.unit_job.get(name).copied() {
+            if self
+                .jobs
+                .get(&jid)
+                .map(|j| j.kind == JobKind::Start)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        self.enqueue_start_job(name);
+        self.process_jobs();
+        Ok(())
+    }
+
+    pub fn stop(&mut self, name: &str) -> Result<(), String> {
+        if !self.units.contains_key(name) {
+            return Err(format!("Unit {name} not found."));
+        }
+        if !self.unit_operational(name) {
+            return Ok(());
+        }
+        if let Some(jid) = self.unit_job.get(name).copied() {
+            let kind = self.jobs.get(&jid).map(|j| j.kind);
+            if kind == Some(JobKind::Stop) || kind == Some(JobKind::Restart) {
+                return Ok(());
+            }
+            if kind == Some(JobKind::Start) {
+                // Cancel the pending start and stop instead.
+                self.unit_job.remove(name);
+                self.jobs.remove(&jid);
+            }
+        }
+        self.enqueue_stop_job(name);
+        self.process_jobs();
+        Ok(())
+    }
+
+    pub fn restart(&mut self, name: &str) -> Result<(), String> {
+        if !self.units.contains_key(name) {
+            return Err(format!("Unit {name} not found."));
+        }
+        if self.unit_operational(name) {
+            if let Some(jid) = self.unit_job.get(name).copied() {
+                let kind = self.jobs.get(&jid).map(|j| j.kind);
+                if kind == Some(JobKind::Restart) {
+                    return Ok(());
+                }
+                if kind == Some(JobKind::Start) {
+                    self.unit_job.remove(name);
+                    self.jobs.remove(&jid);
+                }
+            }
+            self.enqueue_stop_job(name);
+            let stop_id = self.unit_job[name];
+            if let Some(j) = self.jobs.get_mut(&stop_id) {
+                j.start_after_stop = Some(name.to_string());
+            }
+        } else {
+            return self.start(name);
+        }
+        self.process_jobs();
+        Ok(())
+    }
+
+    pub fn reload(&mut self, name: &str) -> Result<(), String> {
+        if !self.units.contains_key(name) {
+            return Err(format!("Unit {name} not found."));
+        }
+        let has_reload = self.units[name]
+            .service_cfg()
+            .map(|s| !s.exec_reload.is_empty())
+            .unwrap_or(false);
+        if !has_reload {
+            return Err(format!("Unit {name} has no ExecReload."));
+        }
+        self.spawn_control(name, UnitControlCommand::Reload, 0);
+        Ok(())
+    }
+
+    pub fn kill(&mut self, name: &str, sig: Signal) -> Result<(), String> {
+        if !self.unit_has_processes(name) {
+            return Err(format!("Unit {name} has no processes."));
+        }
+        self.kill_tree(name, sig);
+        Ok(())
+    }
+
+    /// Does this unit currently have a live process tree to signal? A main
+    /// pid, a process-group leader, or a *non-empty* cgroup all count; a
+    /// lingering empty cgroup (oneshot that already exited) does not.
+    pub(crate) fn unit_has_processes(&self, name: &str) -> bool {
+        let u = &self.units[name];
+        u.main_pid.is_some()
+            || u.group_pid.is_some()
+            || u.cgroup
+                .as_ref()
+                .map(|d| !cgroup::is_empty(d))
+                .unwrap_or(false)
+    }
+
+    /// Create (or reuse) the unit's cgroup and apply its resource limits.
+    /// Returns `None` when cgroup v2 is unavailable; callers fall back to
+    /// process groups.
+    fn ensure_cgroup(&mut self, name: &str) -> Option<PathBuf> {
+        if let Some(dir) = self.units[name].cgroup.clone() {
+            return Some(dir);
+        }
+        let root = cgroup::root()?;
+        let dir = cgroup::create(&root, name).ok()?;
+        if let Some(sc) = self.units[name].service_cfg() {
+            let limits = sc.cgroup_limits;
+            cgroup::apply_limits(&dir, &limits);
+        }
+        self.units.get_mut(name).unwrap().cgroup = Some(dir.clone());
+        Some(dir)
+    }
+
+    /// Signal the whole process tree of a unit: the cgroup when present,
+    /// else the process group.
+    pub(crate) fn kill_tree(&self, name: &str, sig: Signal) {
+        if let Some(dir) = self.units.get(name).and_then(|u| u.cgroup.clone()) {
+            cgroup::kill(&dir, sig);
+        } else if let Some(gp) = self.units.get(name).and_then(|u| u.group_pid) {
+            spawn::kill_group(gp, sig).ok();
+        }
+    }
+
+    /// SIGKILL the whole process tree (cgroup.kill when available).
+    fn kill_tree_kill(&self, name: &str) {
+        if let Some(dir) = self.units.get(name).and_then(|u| u.cgroup.clone()) {
+            cgroup::kill_all(&dir);
+        } else if let Some(gp) = self.units.get(name).and_then(|u| u.group_pid) {
+            spawn::kill_group(gp, Signal::SIGKILL).ok();
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        let names: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(_, u)| u.active != ActiveState::Inactive)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in names {
+            self.stop(&n).ok();
+        }
+        self.process_jobs();
+    }
+
+    pub fn idle(&mut self) -> bool {
+        self.jobs.is_empty() && !self.wheel.has_service_timers()
+    }
+
+    // ---- job engine ---------------------------------------------------------
+
+    fn new_job(&mut self, kind: JobKind, unit: &str, waiting: Vec<WaitEntry>) -> u64 {
+        self.next_job += 1;
+        let id = self.next_job;
+        self.jobs.insert(
+            id,
+            Job {
+                unit: unit.to_string(),
+                kind,
+                waiting,
+                started: false,
+                failed: false,
+                failed_msg: None,
+                start_after_stop: None,
+            },
+        );
+        self.unit_job.insert(unit.to_string(), id);
+        id
+    }
+
+    fn enqueue_start_job(&mut self, name: &str) {
+        let id = self.new_job(JobKind::Start, name, vec![]);
+        self.expand_start_job(id);
+    }
+
+    fn expand_start_job(&mut self, id: u64) {
+        let name = self.jobs[&id].unit.clone();
+
+        // A dependency can name a unit that isn't loaded (missing unit file).
+        // Fail the job cleanly — like systemd's "Unit X not found" — instead
+        // of panicking on `self.units[&name]` below.
+        if !self.units.contains_key(&name) {
+            let job = self.jobs.get_mut(&id).unwrap();
+            job.failed = true;
+            job.failed_msg = Some(format!("Unit {name} not found."));
+            self.maybe_start_job(id);
+            return;
+        }
+
+        let (needs, weak, requisite) = D::start_closure(&self.units, &name);
+
+        let mut waiting: Vec<WaitEntry> = Vec::new();
+
+        // Requisite must already be active.
+        for r in requisite {
+            if self.unit_active(&r) {
+                continue;
+            }
+            if let Some(jid) = self.unit_job.get(&r) {
+                if self.jobs[jid].kind == JobKind::Start {
+                    waiting.push(WaitEntry {
+                        unit: r,
+                        required: true,
+                    });
+                    continue;
+                }
+            }
+            self.jobs.get_mut(&id).unwrap().failed = true;
+            self.jobs.get_mut(&id).unwrap().failed_msg =
+                Some(format!("Required unit {r} is not active (requisite)."));
+            self.maybe_start_job(id);
+            return;
+        }
+
+        // Conflicts: stop active/starting conflicting units first.
+        for c in D::closure_conflicts(&self.units, &name) {
+            if self.unit_operational(&c)
+                && self
+                    .unit_job
+                    .get(&c)
+                    .map(|j| self.jobs[j].kind == JobKind::Stop)
+                    != Some(true)
+            {
+                self.enqueue_stop_job(&c);
+            }
+        }
+
+        // Start deps (needs + weak + after ordering).
+        let needs_set: HashSet<String> = needs.into_iter().collect();
+        let mut open: HashSet<String> = HashSet::new();
+        open.extend(needs_set.iter().cloned());
+        open.extend(weak.iter().cloned());
+        if let Some(f) = &self.units[&name].file {
+            open.extend(f.unit.after.iter().cloned());
+        }
+        for d in open {
+            if self.unit_active(&d) {
+                continue;
+            }
+            let required = needs_set.contains(&d);
+            if let Some(jid) = self.unit_job.get(&d) {
+                if self.jobs[jid].kind == JobKind::Start {
+                    waiting.push(WaitEntry { unit: d, required });
+                    continue;
+                }
+            }
+            self.enqueue_start_job(&d);
+            waiting.push(WaitEntry { unit: d, required });
+        }
+
+        if let Some(j) = self.jobs.get_mut(&id) {
+            j.waiting = waiting;
+        }
+        self.maybe_start_job(id);
+    }
+
+    fn enqueue_stop_job(&mut self, name: &str) {
+        let id = self.new_job(JobKind::Stop, name, vec![]);
+        let dependents = D::stop_propagate(&self.units, name);
+        for d in dependents {
+            if self.unit_operational(&d) && !self.unit_job.contains_key(&d) {
+                self.enqueue_stop_job(&d);
+            }
+        }
+        self.maybe_stop_job(id);
+    }
+
+    fn unit_active(&self, name: &str) -> bool {
+        self.units
+            .get(name)
+            .map(|u| u.active == ActiveState::Active)
+            .unwrap_or(false)
+    }
+
+    fn unit_operational(&self, name: &str) -> bool {
+        self.units
+            .get(name)
+            .map(|u| u.active == ActiveState::Active || u.active == ActiveState::Activating)
+            .unwrap_or(false)
+    }
+
+    fn maybe_start_job(&mut self, id: u64) {
+        let unit = self.jobs[&id].unit.clone();
+        if self.jobs[&id].failed {
+            self.finish_job_failed(id);
+            return;
+        }
+        if !self.jobs[&id].waiting.is_empty() || self.jobs[&id].started {
+            return;
+        }
+        self.jobs.get_mut(&id).unwrap().started = true;
+        if self.check_start_limit(&unit) {
+            self.units.get_mut(&unit).unwrap().result = UnitResult::StartLimitHit;
+            self.jobs.get_mut(&id).unwrap().failed = true;
+            self.jobs.get_mut(&id).unwrap().failed_msg =
+                Some("Start request repeated too quickly (start-limit-hit).".into());
+            self.finish_job_failed(id);
+            return;
+        }
+        self.do_start(&unit);
+    }
+
+    fn maybe_stop_job(&mut self, id: u64) {
+        let unit = self.jobs[&id].unit.clone();
+        if !self.unit_operational(&unit) {
+            self.finish_job(id);
+            return;
+        }
+        if self.jobs[&id].started {
+            return;
+        }
+        self.unit_job.insert(unit.clone(), id);
+        self.jobs.get_mut(&id).unwrap().started = true;
+        self.do_stop(&unit);
+    }
+
+    pub fn tick(&mut self, now: Instant) {
+        for entry in self.wheel.pop_due(now) {
+            self.fire_timer(&entry.unit, entry.kind, now);
+        }
+        self.reap();
+        self.process_jobs();
+    }
+
+    fn process_jobs(&mut self) {
+        loop {
+            let ids: Vec<u64> = self.jobs.keys().copied().collect();
+            let mut changed = false;
+            for id in ids {
+                if !self.jobs.contains_key(&id) {
+                    continue;
+                }
+                changed |= self.try_advance_job(id);
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn try_advance_job(&mut self, id: u64) -> bool {
+        if !self.jobs.contains_key(&id) {
+            return false;
+        }
+        match self.jobs[&id].kind {
+            JobKind::Start => {
+                if self.jobs[&id].failed {
+                    self.finish_job_failed(id);
+                    true
+                } else if self.jobs[&id].waiting.is_empty() && !self.jobs[&id].started {
+                    self.maybe_start_job(id);
+                    true
+                } else {
+                    false
+                }
+            }
+            JobKind::Stop => {
+                if !self.jobs[&id].started {
+                    self.maybe_stop_job(id);
+                    true
+                } else {
+                    false
+                }
+            }
+            JobKind::Restart => false,
+        }
+    }
+
+    fn on_job_completed(&mut self, unit: &str, ok: bool) {
+        let ids: Vec<u64> = self.jobs.keys().copied().collect();
+        for id in ids {
+            if !self.jobs.contains_key(&id) {
+                continue;
+            }
+            let mut remove_required = false;
+            if let Some(j) = self.jobs.get(&id) {
+                if let Some(pos) = j.waiting.iter().position(|w| w.unit == unit) {
+                    if !ok && j.waiting[pos].required {
+                        remove_required = true;
+                    }
+                }
+            }
+            if remove_required {
+                self.jobs.get_mut(&id).unwrap().failed = true;
+                self.jobs.get_mut(&id).unwrap().failed_msg =
+                    Some(format!("Dependency failed: {unit}"));
+                continue;
+            }
+            if let Some(j) = self.jobs.get_mut(&id) {
+                let before = j.waiting.len();
+                j.waiting.retain(|w| w.unit != unit);
+                if j.waiting.len() != before {
+                    self.try_advance_job(id);
+                }
+            }
+        }
+    }
+
+    fn finish_job(&mut self, id: u64) {
+        let Some(job) = self.jobs.get(&id).cloned() else {
+            return;
+        };
+        let unit = job.unit.clone();
+        if job.kind == JobKind::Stop {
+            if let Some(next) = job.start_after_stop.clone() {
+                self.jobs.remove(&id);
+                if self.unit_job.get(&unit) == Some(&id) {
+                    self.unit_job.remove(&unit);
+                }
+                self.on_job_completed(&unit, true);
+                self.enqueue_start_job(&next);
+                return;
+            }
+        }
+        self.jobs.remove(&id);
+        if self.unit_job.get(&unit) == Some(&id) {
+            self.unit_job.remove(&unit);
+        }
+        self.on_job_completed(&unit, true);
+    }
+
+    fn finish_job_failed(&mut self, id: u64) {
+        let Some(job) = self.jobs.get(&id).cloned() else {
+            return;
+        };
+        let unit = job.unit.clone();
+        if let Some(msg) = &job.failed_msg {
+            self.mgr(&unit, msg);
+        }
+        self.jobs.remove(&id);
+        if self.unit_job.get(&unit) == Some(&id) {
+            self.unit_job.remove(&unit);
+        }
+        self.on_job_completed(&unit, false);
+    }
+
+    fn check_start_limit(&mut self, name: &str) -> bool {
+        let now = Instant::now();
+        let cutoff = now - Duration::from_secs(10);
+        let u = self.units.get_mut(name).unwrap();
+        u.start_window.retain(|t| *t >= cutoff);
+        if u.start_window.len() >= 5 {
+            return true;
+        }
+        u.start_window.push(now);
+        false
+    }
+
+    // ---- start / stop -------------------------------------------------------
+
+    /// Resolve the per-type behavior for a unit (the internal VTable dispatch).
+    fn unit_type(&self, name: &str) -> &'static dyn UnitType {
+        match self.units.get(name).map(|u| u.kind) {
+            Some(UnitKind::Timer) => &TimerUnit,
+            Some(UnitKind::Target) => &TargetUnit,
+            #[cfg(feature = "socket")]
+            Some(UnitKind::Socket) => &SocketUnit,
+            _ => &ServiceUnit,
+        }
+    }
+
+    fn do_start(&mut self, name: &str) {
+        let ut = self.unit_type(name);
+        ut.start(self, name);
+    }
+
+    fn run_main_start(&mut self, name: &str, idx: usize) {
+        // Oneshot & main process types both go through spawn_control(Start).
+        self.spawn_control(name, UnitControlCommand::Start, idx);
+    }
+
+    /// Run one Exec command for a unit, updating control/main bookkeeping.
+    pub(crate) fn spawn_control(&mut self, name: &str, cmd: UnitControlCommand, idx: usize) {
+        let sc = match self.units[name].service_cfg() {
+            Some(s) => s.clone(),
+            None => {
+                self.stage_done(name, cmd);
+                return;
+            }
+        };
+        let list_ref: &Vec<crate::unit::ExecCommand> = match cmd {
+            UnitControlCommand::StartPre => self.exec_slice(&sc, cmd),
+            UnitControlCommand::Start => self.exec_slice(&sc, cmd),
+            UnitControlCommand::StartPost => self.exec_slice(&sc, cmd),
+            UnitControlCommand::Stop => self.exec_slice(&sc, cmd),
+            UnitControlCommand::Reload => self.exec_slice(&sc, cmd),
+            UnitControlCommand::Kill => self.exec_slice(&sc, UnitControlCommand::Start),
+        };
+        if list_ref.is_empty() {
+            self.stage_done(name, cmd);
+            return;
+        }
+        let Some(exec) = list_ref.get(idx).cloned() else {
+            self.stage_done(name, cmd);
+            return;
+        };
+
+        // Env expansion at exec time.
+        let env = self.build_env(self.units.get(name).unwrap());
+        let env_refs: Vec<(String, String)> =
+            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let argv = spawn::expand_env_argv(&exec.argv, &env);
+
+        // Resolve user/group before the (async-signal-safe) pre_exec.
+        let uid = sc
+            .user
+            .clone()
+            .and_then(|u| spawn::resolve_user(&u).map(|t| t.0));
+        let gid = sc.group.clone().and_then(|g| spawn::resolve_group(&g));
+        let groups = sc
+            .user
+            .clone()
+            .and_then(|u| spawn::resolve_user(&u).map(|t| t.2))
+            .unwrap_or_default();
+
+        let cgroup = self.ensure_cgroup(name);
+
+        let opts = spawn::SpawnOptions {
+            argv,
+            env: env_refs,
+            cwd: sc.working_directory.as_ref().map(|(p, _)| PathBuf::from(p)),
+            uid,
+            gid,
+            groups,
+            nice: sc.nice,
+            umask: sc.umask,
+            rlimits: sc.rlimits.clone(),
+            stdout_target: sc.std_output,
+            stderr_target: sc.std_error,
+            stdin_null: !sc.std_input,
+            notify_socket: if sc.service_type == ServiceType::Notify {
+                Some(self.cfg.paths.notify_socket())
+            } else {
+                None
+            },
+            listen_fds: {
+                #[cfg(feature = "socket")]
+                {
+                    self.socket_fds_for(name)
+                }
+                #[cfg(not(feature = "socket"))]
+                {
+                    Vec::new()
+                }
+            },
+            cgroup,
+        };
+
+        match spawn::spawn(&opts) {
+            Ok(sp) => {
+                if let Some(fd) = sp.stdout {
+                    self.out_fds.insert(fd.as_raw_fd(), name.to_string());
+                }
+                if let Some(fd) = sp.stderr {
+                    self.out_fds.insert(fd.as_raw_fd(), name.to_string());
+                }
+                let pid = sp.pid;
+                self.pid_unit.insert(pid, name.to_string());
+                let u = self.units.get_mut(name).unwrap();
+                u.control_pid = Some(pid);
+                u.control_command = Some(cmd);
+                u.group_pid = Some(pid);
+                u.control_start = Some(Instant::now());
+
+                // Long-running / notify types: the Start command is the main
+                // process, considered active right away.
+                if cmd == UnitControlCommand::Start
+                    && matches!(
+                        sc.service_type,
+                        ServiceType::Simple
+                            | ServiceType::Exec
+                            | ServiceType::Idle
+                            | ServiceType::Notify
+                    )
+                {
+                    u.control_pid = None;
+                    u.control_command = None;
+                    u.main_pid = Some(pid);
+                    if sc.service_type != ServiceType::Notify {
+                        u.set_active(ActiveState::Active, SubState::Running, UnitResult::Success);
+                        self.complete_start_job(name);
+                        return;
+                    }
+                    // Notify: wait for READY=1 or TimeoutStartSec.
+                    self.arm_start_timeout(name);
+                    return;
+                }
+
+                // Oneshot / forking: wait for exec completion or pidfile.
+                if cmd == UnitControlCommand::Start {
+                    if sc.service_type == ServiceType::Forking {
+                        self.arm_start_timeout(name);
+                    } else {
+                        self.units.get_mut(name).unwrap().sub = SubState::Start;
+                        self.arm_start_timeout(name);
+                    }
+                } else {
+                    self.arm_start_timeout(name);
+                }
+            }
+            Err(e) => {
+                self.mgr(name, &format!("failed to spawn: {e}"));
+                if exec.ignore_failure && cmd != UnitControlCommand::Stop {
+                    self.stage_done(name, cmd);
+                } else {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Exec;
+                    self.fail_unit(name, format!("Failed to execute: {e}"));
+                }
+            }
+        }
+    }
+
+    fn exec_slice<'a>(
+        &self,
+        sc: &'a ServiceConfig,
+        cmd: UnitControlCommand,
+    ) -> &'a Vec<crate::unit::ExecCommand> {
+        match cmd {
+            UnitControlCommand::StartPre => &sc.exec_start_pre,
+            UnitControlCommand::Start => &sc.exec_start,
+            UnitControlCommand::StartPost => &sc.exec_start_post,
+            UnitControlCommand::Stop => &sc.exec_stop,
+            UnitControlCommand::Reload => &sc.exec_reload,
+            UnitControlCommand::Kill => &sc.exec_start,
+        }
+    }
+
+    pub(crate) fn complete_start_job(&mut self, name: &str) {
+        if let Some(jid) = self.unit_job.get(name).copied() {
+            let kind = self.jobs[&jid].kind;
+            if kind == JobKind::Start {
+                self.finish_job(jid);
+            }
+        }
+        self.timer_dep_check(name);
+    }
+
+    /// Advance after a control-command stage is exhausted.
+    fn stage_done(&mut self, name: &str, cmd: UnitControlCommand) {
+        match cmd {
+            UnitControlCommand::StartPre => self.run_main_start(name, 0),
+            UnitControlCommand::Start => self.oneshot_done(name),
+            UnitControlCommand::Stop => self.finalize_stop(name),
+            UnitControlCommand::Reload => self.mgr(name, "reloaded"),
+            UnitControlCommand::StartPost => {}
+            UnitControlCommand::Kill => {}
+        }
+    }
+
+    fn oneshot_done(&mut self, name: &str) {
+        let remain = self.units[name]
+            .service_cfg()
+            .map(|s| s.remain_after_exit)
+            .unwrap_or(false);
+        let state = if remain {
+            ActiveState::Active
+        } else {
+            ActiveState::Inactive
+        };
+        let sub = if remain {
+            SubState::Exited
+        } else {
+            SubState::Dead
+        };
+        self.units
+            .get_mut(name)
+            .unwrap()
+            .set_active(state, sub, UnitResult::Success);
+        self.complete_start_job(name);
+    }
+
+    fn handle_control_exit(&mut self, name: &str, code: i32, signal: Option<i32>) {
+        // Capture state before mutating.
+        let ccmd = self.units[name].control_command;
+        let cidx = self.units[name].cmd_index;
+        let stopping = self.units[name].active == ActiveState::Deactivating;
+        let service_type = self.units[name]
+            .service_cfg()
+            .map(|s| s.service_type)
+            .unwrap_or(ServiceType::Simple);
+        let sc = self.units[name].service_cfg().cloned();
+        self.units.get_mut(name).unwrap().control_pid = None;
+        self.units.get_mut(name).unwrap().group_pid = None;
+        self.units.get_mut(name).unwrap().control_command = None;
+
+        // A stop is in progress: the control command's death (however it was
+        // signalled — e.g. shutdown SIGTERMing an in-flight oneshot ExecStart)
+        // completes the stop. Route to `finalize_stop` instead of the
+        // start-failure path, which would otherwise leave the Stop job pending
+        // forever and hang shutdown.
+        if stopping {
+            self.finalize_stop(name);
+            return;
+        }
+
+        let exit_ok = sc
+            .as_ref()
+            .map(|s| match signal {
+                Some(sig) => s.effective_exit_success().matches(None, Some(sig)),
+                None => s.effective_exit_success().matches(Some(code), None),
+            })
+            .unwrap_or(code == 0 && signal.is_none());
+        let ignore_failure = sc
+            .as_ref()
+            .map(|s| {
+                matches!(ccmd, Some(UnitControlCommand::Start))
+                    && s.exec_start
+                        .get(cidx)
+                        .map(|c| c.ignore_failure)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        match ccmd {
+            Some(UnitControlCommand::StartPre) => {
+                if exit_ok || ignore_failure {
+                    self.run_main_start(name, 0);
+                } else {
+                    self.units.get_mut(name).unwrap().result = UnitResult::ExitCode;
+                    self.fail_unit(
+                        name,
+                        format!("ExecStartPre failed: {}", self.describe_exit(code, signal)),
+                    );
+                }
+            }
+            Some(UnitControlCommand::Start) => match service_type {
+                ServiceType::Oneshot => {
+                    if exit_ok || ignore_failure {
+                        let next = cidx + 1;
+                        let has_next = sc
+                            .as_ref()
+                            .map(|s| s.exec_start.len() > next)
+                            .unwrap_or(false);
+                        if has_next {
+                            self.units.get_mut(name).unwrap().cmd_index = next;
+                            self.spawn_control(name, UnitControlCommand::Start, next);
+                        } else {
+                            self.units.get_mut(name).unwrap().cmd_index = 0;
+                            self.run_start_post_or_finish(name);
+                        }
+                    } else {
+                        self.units.get_mut(name).unwrap().result = UnitResult::ExitCode;
+                        self.fail_unit(
+                            name,
+                            format!("ExecStart failed: {}", self.describe_exit(code, signal)),
+                        );
+                    }
+                }
+                ServiceType::Forking => {
+                    self.handle_forking_start_done(name);
+                }
+                _ => {
+                    // Simple/exec/notify main process is not a control command.
+                    self.main_exit(name, code, signal);
+                }
+            },
+            Some(UnitControlCommand::StartPost) => {
+                self.units.get_mut(name).unwrap().set_active(
+                    if sc.as_ref().map(|s| s.remain_after_exit).unwrap_or(false) {
+                        ActiveState::Active
+                    } else {
+                        ActiveState::Inactive
+                    },
+                    if sc.as_ref().map(|s| s.remain_after_exit).unwrap_or(false) {
+                        SubState::Exited
+                    } else {
+                        SubState::Dead
+                    },
+                    UnitResult::Success,
+                );
+                self.complete_start_job(name);
+            }
+            Some(UnitControlCommand::Stop) => {
+                self.finalize_stop(name);
+            }
+            Some(UnitControlCommand::Reload) => {
+                self.mgr(name, "reloaded");
+            }
+            Some(UnitControlCommand::Kill) => {}
+            None => {
+                self.main_exit(name, code, signal);
+            }
+        }
+    }
+
+    fn run_start_post_or_finish(&mut self, name: &str) {
+        let has_post = self.units[name]
+            .service_cfg()
+            .map(|s| !s.exec_start_post.is_empty())
+            .unwrap_or(false);
+        if has_post {
+            self.spawn_control(name, UnitControlCommand::StartPost, 0);
+        } else {
+            self.oneshot_done(name);
+        }
+    }
+
+    fn handle_forking_start_done(&mut self, name: &str) {
+        // Try to read PIDFile; if it appears, the daemon is up.
+        let pid = self.read_forked_pidfile(name);
+        if let Some(pid) = pid {
+            self.units.get_mut(name).unwrap().forked_main_pid = Some(pid);
+            self.units.get_mut(name).unwrap().main_pid = Some(pid);
+            self.pid_unit.insert(pid, name.to_string());
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Active,
+                SubState::Running,
+                UnitResult::Success,
+            );
+            self.complete_start_job(name);
+        } else {
+            // No pidfile; treat as started (best-effort for cgroup-less mode).
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Active,
+                SubState::Running,
+                UnitResult::Success,
+            );
+            self.complete_start_job(name);
+        }
+    }
+
+    fn read_forked_pidfile(&self, name: &str) -> Option<i32> {
+        let sc = self.units[name].service_cfg().cloned()?;
+        let pf = sc.pid_file?;
+        let text = std::fs::read_to_string(pf).ok()?;
+        text.trim().parse::<i32>().ok().filter(|p| *p > 0)
+    }
+
+    fn main_exit(&mut self, name: &str, code: i32, signal: Option<i32>) {
+        let group_pid = self.units[name].group_pid;
+        let u = self.units.get_mut(name).unwrap();
+        u.main_pid = None;
+        u.group_pid = None;
+        u.last_exit_code = if signal.is_none() { Some(code) } else { None };
+        u.last_exit_signal = signal;
+        let state = u.active;
+        let u = self.units.get_mut(name).unwrap();
+        let exit_ok = u
+            .service_cfg()
+            .map(|s| match signal {
+                Some(sig) => s.effective_exit_success().matches(None, Some(sig)),
+                None => s.effective_exit_success().matches(Some(code), None),
+            })
+            .unwrap_or(code == 0 && signal.is_none());
+
+        // "Don't self-daemonize" enforcement: if the main process of a still-
+        // running foreground service exits but its process group still has live
+        // members, the service double-forked (or forked workers and died).
+        // With KillMode=control-group — the cgroups stand-in — SIGKILL the
+        // survivors so nothing escapes tracking; always log loudly.
+        if state == ActiveState::Active
+            && let Some(pgid) = group_pid
+        {
+            self.sweep_orphaned_group(name, pgid);
+        }
+
+        match state {
+            ActiveState::Deactivating => self.on_stop_main_exit(name),
+            ActiveState::Activating => {
+                if exit_ok {
+                    self.units.get_mut(name).unwrap().set_active(
+                        ActiveState::Inactive,
+                        SubState::Dead,
+                        UnitResult::Success,
+                    );
+                } else {
+                    self.units.get_mut(name).unwrap().result = if signal.is_some() {
+                        UnitResult::Signal
+                    } else {
+                        UnitResult::ExitCode
+                    };
+                    self.fail_unit(name, self.describe_exit(code, signal));
+                }
+            }
+            _ => self.handle_active_exit(name, code, signal),
+        }
+    }
+
+    fn describe_exit(&self, code: i32, signal: Option<i32>) -> String {
+        match signal {
+            Some(sig) => format!("killed by signal {}", signal_name(sig)),
+            None => format!("exited with status {code}"),
+        }
+    }
+
+    /// Probe whether a process group still has live members (null signal).
+    fn group_alive(pgid: i32) -> bool {
+        nix::sys::signal::kill(Pid::from_raw(-pgid), None).is_ok()
+    }
+
+    /// Detect and clean up a self-daemonizing service: after a foreground main
+    /// process exits while its unit is still running, any members still in its
+    /// process group are orphans (a double-forked daemon, or forked workers
+    /// left behind). Log a loud warning and, under the default
+    /// `KillMode=control-group`, SIGKILL them so they can't escape tracking.
+    /// `Type=forking` is exempt — its pidfile daemon legitimately detaches.
+    fn sweep_orphaned_group(&mut self, name: &str, pgid: i32) {
+        let (kill_mode, is_forking) = match self.units[name].service_cfg() {
+            Some(s) => (s.kill_mode, s.service_type == ServiceType::Forking),
+            None => return,
+        };
+        if is_forking || !Self::group_alive(pgid) {
+            return;
+        }
+        self.mgr(
+            name,
+            "WARNING: main process exited but its process group still has live members — service appears to have self-daemonized",
+        );
+        if kill_mode == KillMode::ControlGroup && spawn::kill_group(pgid, Signal::SIGKILL).is_ok() {
+            self.mgr(
+                name,
+                "killed orphaned process group (KillMode=control-group)",
+            );
+        }
+    }
+
+    fn handle_active_exit(&mut self, name: &str, code: i32, signal: Option<i32>) {
+        let u = self.units.get_mut(name).unwrap();
+        let sc = u.service_cfg().cloned();
+        let exit_ok = sc
+            .as_ref()
+            .map(|s| match signal {
+                Some(sig) => s.effective_exit_success().matches(None, Some(sig)),
+                None => s.effective_exit_success().matches(Some(code), None),
+            })
+            .unwrap_or(code == 0 && signal.is_none());
+        let policy = sc.as_ref().map(|s| s.restart).unwrap_or(RestartPolicy::No);
+        let restart_sec = sc
+            .as_ref()
+            .map(|s| s.restart_sec.as_duration().unwrap_or(Duration::ZERO))
+            .unwrap_or(Duration::ZERO);
+        let remain_after = sc.as_ref().map(|s| s.remain_after_exit).unwrap_or(false);
+
+        let should_restart = match policy {
+            RestartPolicy::No => false,
+            RestartPolicy::Always => true,
+            RestartPolicy::OnSuccess => exit_ok,
+            RestartPolicy::OnFailure => !exit_ok,
+            RestartPolicy::OnAbnormal => signal.is_some(),
+            RestartPolicy::OnAbort => signal.is_some(),
+            RestartPolicy::OnWatchdog => false,
+        };
+
+        if should_restart {
+            if self.check_start_limit(name) {
+                self.units.get_mut(name).unwrap().result = UnitResult::StartLimitHit;
+                self.units.get_mut(name).unwrap().set_active(
+                    ActiveState::Failed,
+                    SubState::Failed,
+                    UnitResult::StartLimitHit,
+                );
+                self.poke_failed(name);
+                return;
+            }
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Activating,
+                SubState::AutoRestart,
+                UnitResult::Success,
+            );
+            self.wheel
+                .schedule(Instant::now() + restart_sec, TimerKind::RestartDelay, name);
+        } else if exit_ok {
+            let state = if remain_after {
+                ActiveState::Active
+            } else {
+                ActiveState::Inactive
+            };
+            let sub = if remain_after {
+                SubState::Exited
+            } else {
+                SubState::Dead
+            };
+            self.units
+                .get_mut(name)
+                .unwrap()
+                .set_active(state, sub, UnitResult::Success);
+            self.complete_start_job(name);
+            self.timer_dep_check(name);
+        } else {
+            self.units.get_mut(name).unwrap().result = if signal.is_some() {
+                UnitResult::Signal
+            } else {
+                UnitResult::ExitCode
+            };
+            let res = self.units[name].result;
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Failed,
+                SubState::Failed,
+                res,
+            );
+            self.poke_failed(name);
+            self.fire_on_failure(name);
+        }
+    }
+
+    fn poke_failed(&mut self, name: &str) {
+        let ids: Vec<u64> = self.jobs.keys().copied().collect();
+        for id in ids {
+            if !self.jobs.contains_key(&id) {
+                continue;
+            }
+            let mut required = false;
+            if let Some(j) = self.jobs.get(&id) {
+                if let Some(w) = j.waiting.iter().find(|w| w.unit == name) {
+                    if w.required {
+                        required = true;
+                    }
+                }
+            }
+            if required {
+                self.jobs.get_mut(&id).unwrap().failed = true;
+                self.jobs.get_mut(&id).unwrap().failed_msg =
+                    Some(format!("Dependency failed: {name}"));
+                self.finish_job_failed(id);
+            } else if let Some(j) = self.jobs.get_mut(&id) {
+                let before = j.waiting.len();
+                j.waiting.retain(|w| w.unit != name);
+                if j.waiting.len() != before {
+                    self.try_advance_job(id);
+                }
+            }
+        }
+    }
+
+    fn fire_on_failure(&mut self, name: &str) {
+        let onfail: Vec<String> = self.units[name]
+            .file
+            .as_ref()
+            .map(|f| f.unit.on_failure.clone())
+            .unwrap_or_default();
+        for t in onfail {
+            self.start(&t).ok();
+        }
+        self.process_jobs();
+    }
+
+    fn fail_unit(&mut self, name: &str, msg: String) {
+        self.mgr(name, &format!("failed: {msg}"));
+        let res = self.units[name].result;
+        self.units
+            .get_mut(name)
+            .unwrap()
+            .set_active(ActiveState::Failed, SubState::Failed, res);
+        if let Some(jid) = self.unit_job.get(name).copied() {
+            let job = self.jobs[&jid].clone();
+            if job.kind == JobKind::Start {
+                self.jobs.get_mut(&jid).unwrap().failed_msg = Some(msg);
+                self.finish_job_failed(jid);
+            } else {
+                self.poke_failed(name);
+            }
+        } else {
+            self.poke_failed(name);
+        }
+        self.fire_on_failure(name);
+    }
+
+    fn do_stop(&mut self, name: &str) {
+        let u = self.units.get_mut(name).unwrap();
+        u.set_active(
+            ActiveState::Deactivating,
+            SubState::Stop,
+            UnitResult::Success,
+        );
+        u.stop_started = Some(Instant::now());
+        let ut = self.unit_type(name);
+        ut.stop(self, name);
+    }
+
+    /// `.socket` start: bind each `ListenStream=` and register the fds with the
+    /// event loop so a connection activates the matching service.
+    #[cfg(feature = "socket")]
+    pub(crate) fn start_socket(&mut self, name: &str) {
+        let scfg = match self.units[name].socket_cfg().cloned() {
+            Some(c) => c,
+            None => {
+                self.units.get_mut(name).unwrap().set_active(
+                    ActiveState::Active,
+                    SubState::Dead,
+                    UnitResult::Success,
+                );
+                self.complete_start_job(name);
+                return;
+            }
+        };
+        if !self.cfg.socket_activation {
+            self.mgr(
+                name,
+                "socket activation disabled at runtime; binding nothing",
+            );
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Active,
+                SubState::Dead,
+                UnitResult::Success,
+            );
+            self.complete_start_job(name);
+            return;
+        }
+        let service = self.units[name].activated_service();
+        for spec in &scfg.listen_stream {
+            match bind_listen_stream(spec) {
+                Ok(listener) => {
+                    let fd = listener.as_raw_fd();
+                    self.socket_listeners.insert(fd, listener);
+                    self.socket_triggers
+                        .insert(fd, (name.to_string(), service.clone()));
+                }
+                Err(e) => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                    self.fail_unit(name, format!("Failed to bind socket {spec}: {e}"));
+                    return;
+                }
+            }
+        }
+        if scfg.accept {
+            self.mgr(name, "Accept=yes not yet supported; treating as Accept=no");
+        }
+        self.units.get_mut(name).unwrap().set_active(
+            ActiveState::Active,
+            SubState::Running,
+            UnitResult::Success,
+        );
+        self.complete_start_job(name);
+    }
+
+    /// `.socket` stop: close the bound listeners and drop their triggers.
+    #[cfg(feature = "socket")]
+    pub(crate) fn stop_socket(&mut self, name: &str) {
+        let fds: Vec<RawFd> = self
+            .socket_triggers
+            .iter()
+            .filter(|(_, (unit, _))| unit == name)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in fds {
+            self.socket_listeners.remove(&fd);
+            self.socket_triggers.remove(&fd);
+        }
+        self.finalize_stop(name);
+    }
+
+    /// Listening fds to pass to a service being socket-activated.
+    #[cfg(feature = "socket")]
+    fn socket_fds_for(&self, service: &str) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .socket_triggers
+            .iter()
+            .filter(|(_, (_, svc))| svc == service)
+            .map(|(fd, _)| *fd)
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
+    fn arm_start_timeout(&mut self, name: &str) {
+        let lim = self.units[name].service_cfg().map(|s| s.timeout_start_sec);
+        if let Some(ts) = lim {
+            if let Some(d) = ts.as_duration() {
+                self.wheel
+                    .schedule(Instant::now() + d, TimerKind::StartTimeout, name);
+            }
+        }
+    }
+
+    pub(crate) fn arm_stop_timeout(&mut self, name: &str) {
+        let lim = self.units[name].service_cfg().map(|s| s.timeout_stop_sec);
+        if let Some(ts) = lim {
+            if let Some(d) = ts.as_duration() {
+                self.wheel
+                    .schedule(Instant::now() + d, TimerKind::StopTimeout, name);
+            }
+        }
+    }
+
+    fn on_stop_main_exit(&mut self, name: &str) {
+        self.kill_tree_kill(name);
+        self.finalize_stop(name);
+    }
+
+    pub(crate) fn finalize_stop(&mut self, name: &str) {
+        // Drain stdout fds for this unit.
+        let fds: Vec<RawFd> = self
+            .out_fds
+            .iter()
+            .filter(|(_, n)| *n == name)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in fds {
+            self.out_fds.remove(&fd);
+        }
+        let u = self.units.get_mut(name).unwrap();
+        u.main_pid = None;
+        u.group_pid = None;
+        if let Some(dir) = u.cgroup.take() {
+            cgroup::release(&dir);
+        }
+        u.control_pid = None;
+        u.control_command = None;
+        u.cmd_index = 0;
+        u.forked_main_pid = None;
+        u.stop_started = None;
+        u.set_active(ActiveState::Inactive, SubState::Dead, UnitResult::Success);
+
+        if let Some(jid) = self.unit_job.get(name).copied() {
+            let kind = self.jobs[&jid].kind;
+            if kind == JobKind::Stop || kind == JobKind::Restart {
+                self.finish_job(jid);
+            }
+        }
+        self.timer_dep_check(name);
+    }
+
+    fn mgr(&self, unit: &str, msg: &str) {
+        mgr_log(&format!("[{unit}] {msg}"));
+    }
+
+    // ---- reaping ------------------------------------------------------------
+
+    fn reap(&mut self) {
+        for (pid, exit) in spawn::reap_children() {
+            let name = self.pid_unit.remove(&pid);
+            let (code, signal) = match exit {
+                crate::platform::process::ChildExit::Exited(c) => (c, None),
+                crate::platform::process::ChildExit::Signaled(s) => (0, Some(s)),
+            };
+            if let Some(n) = name {
+                self.handle_process_exit(&n, pid, code, signal);
+            }
+        }
+    }
+
+    fn handle_process_exit(&mut self, name: &str, pid: i32, code: i32, signal: Option<i32>) {
+        if self
+            .units
+            .get(name)
+            .map(|u| u.kind == UnitKind::Target)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let is_control = self
+            .units
+            .get(name)
+            .map(|u| u.control_pid == Some(pid))
+            .unwrap_or(false);
+        if is_control {
+            self.handle_control_exit(name, code, signal);
+        } else {
+            self.main_exit(name, code, signal);
+        }
+    }
+
+    // ---- timers -------------------------------------------------------------
+
+    fn rearm_all_timers(&mut self) {
+        self.wheel = TimerWheel::default();
+        let timers: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(_, u)| u.kind == UnitKind::Timer)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for t in timers {
+            self.rearm_timer(&t);
+        }
+    }
+
+    fn rearm_timer(&mut self, name: &str) {
+        let tc = match self.units[name].timer_cfg() {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let mut st = self
+            .units
+            .get_mut(name)
+            .unwrap()
+            .timer
+            .take()
+            .unwrap_or_else(|| {
+                TimerState::new(tc.on_calendar.iter().map(|c| c.to_string()).collect())
+            });
+
+        let now_civil = chrono::Local::now().naive_local();
+        let mut next_calendar: Option<(u64, usize)> = None;
+        for (i, spec) in tc.on_calendar.iter().enumerate() {
+            if let Some(dt) = spec.next_elapse(now_civil) {
+                let epoch = dt.and_utc().timestamp().max(0) as u64;
+                if next_calendar.map(|(e, _)| epoch < e).unwrap_or(true) {
+                    next_calendar = Some((epoch, i));
+                }
+            }
+        }
+
+        let mut next_mono: Option<Instant> = None;
+        for ts in tc.on_boot_sec.iter().chain(tc.on_startup_sec.iter()) {
+            if let Some(d) = ts.as_duration() {
+                next_mono = min_of(next_mono, self.boot_instant + d);
+            }
+        }
+        let target = self.units[name].activated_unit();
+        if let Some(tu) = self.units.get(&target) {
+            if tu.active == ActiveState::Active {
+                for ts in tc.on_active_sec.iter() {
+                    if let Some(d) = ts.as_duration() {
+                        next_mono = min_of(next_mono, Instant::now() + d);
+                    }
+                }
+            } else {
+                for ts in tc.on_inactive_sec.iter() {
+                    if let Some(d) = ts.as_duration() {
+                        next_mono = min_of(next_mono, Instant::now() + d);
+                    }
+                }
+            }
+        }
+
+        // Record the next fire time for `list-timers`' NEXT column. Without
+        // this, `next_display` stays None and list-timers always shows "-".
+        let mut next_display: Option<SystemTime> = None;
+        if let Some((epoch, _)) = next_calendar {
+            next_display = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(epoch));
+        }
+
+        if let Some((epoch, idx)) = next_calendar {
+            let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+            let delta = epoch.saturating_sub(now_epoch).max(1);
+            self.wheel.schedule(
+                Instant::now() + Duration::from_secs(delta),
+                TimerKind::CalendarElapse(idx),
+                name,
+            );
+        }
+        if let Some(when) = next_mono {
+            if when >= Instant::now() {
+                let sys_when = SystemTime::now() + when.duration_since(Instant::now());
+                next_display = Some(match next_display {
+                    Some(cur) if cur <= sys_when => cur,
+                    _ => sys_when,
+                });
+                self.wheel.schedule(when, TimerKind::MonotonicElapse, name);
+            }
+        }
+
+        st.next_display = next_display;
+        self.units.get_mut(name).unwrap().timer = Some(st);
+    }
+
+    fn timer_dep_check(&mut self, _name: &str) {
+        let timers: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(_, u)| u.kind == UnitKind::Timer)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for t in timers {
+            self.rearm_timer(&t);
+        }
+    }
+
+    fn fire_timer(&mut self, unit: &str, kind: TimerKind, _now: Instant) {
+        if self.units.get(unit).map(|u| u.kind) != Some(UnitKind::Timer) {
+            self.fire_service_timer(unit, kind);
+            return;
+        }
+        let target = self.units.get(unit).unwrap().activated_unit();
+        let now_epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(t) = self.units.get_mut(unit) {
+            if let Some(ts) = t.timer.as_mut() {
+                ts.last_trigger = Some(SystemTime::now());
+                match kind {
+                    TimerKind::CalendarElapse(idx) => {
+                        ts.last_trigger_calendar = Some((now_epoch, idx));
+                    }
+                    TimerKind::MonotonicElapse => {
+                        ts.last_trigger_monotonic = Some(Instant::now());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.mgr(unit, &format!("triggered {target}"));
+        self.start(&target).ok();
+        self.rearm_timer(unit);
+        self.process_jobs();
+    }
+
+    fn fire_service_timer(&mut self, unit: &str, kind: TimerKind) {
+        match kind {
+            TimerKind::RestartDelay => {
+                let restart_pending = self
+                    .units
+                    .get(unit)
+                    .map(|u| u.sub == SubState::AutoRestart)
+                    .unwrap_or(false);
+                if restart_pending {
+                    self.do_start(unit);
+                    self.process_jobs();
+                }
+            }
+            TimerKind::StartTimeout => {
+                let activating = self
+                    .units
+                    .get(unit)
+                    .map(|u| u.active == ActiveState::Activating)
+                    .unwrap_or(false);
+                if activating {
+                    self.units.get_mut(unit).unwrap().result = UnitResult::Timeout;
+                    self.kill_tree_kill(unit);
+                    self.fail_unit(unit, "start operation timed out".to_string());
+                }
+            }
+            TimerKind::StopTimeout => {
+                let deactivating = self
+                    .units
+                    .get(unit)
+                    .map(|u| u.active == ActiveState::Deactivating)
+                    .unwrap_or(false);
+                if deactivating {
+                    self.kill_tree_kill(unit);
+                    self.finalize_stop(unit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- signal handling ------------------------------------------------------
+
+    /// Block the manager's signals and install the signalfd used by the event
+    /// loop to read them. Idempotent; called once at daemon startup.
+    pub fn setup_signals(&mut self) {
+        self.signalfd = SignalSource::new();
+    }
+
+    fn handle_signals(&mut self, sig: Signal) {
+        match sig {
+            Signal::SIGCHLD => self.reap(),
+            Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
+                mgr_log("received shutdown signal");
+                self.shutdown();
+            }
+            Signal::SIGHUP => {
+                let errs = self.load_all();
+                for e in errs {
+                    mgr_log(&e);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- event loop -----------------------------------------------------------
+
+    pub fn run(&mut self) {
+        self.process_jobs();
+        loop {
+            self.tick(Instant::now());
+            if self.shutting_down && self.idle() {
+                break;
+            }
+
+            // Cap the poll wait so the loop re-runs `tick()` (reaping, timers)
+            // within a bounded latency even when no fd is ready. This matters
+            // when SIGCHLD is not delivered to the signalfd (e.g. a manager
+            // embedded in a multi-threaded process): `reap()` is `waitpid`
+            // based, so a periodic wake guarantees zombies are collected.
+            const MAX_POLL_MS: u16 = 1_000;
+            let timeout = {
+                let deadline = self.wheel.next_deadline();
+                match deadline {
+                    Some(d) => {
+                        let ms = d
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .min(u16::MAX as u128) as u16;
+                        nix::poll::PollTimeout::from(ms.min(MAX_POLL_MS))
+                    }
+                    None => nix::poll::PollTimeout::from(MAX_POLL_MS),
+                }
+            };
+            let has_sig = self.signalfd.is_some();
+            let has_listener = self.listener.is_some();
+            let has_notify = self.notify.is_some();
+            let out_ids: Vec<RawFd> = self.out_fds.keys().copied().collect();
+            // Socket activation: poll a listener only while its target service
+            // is Inactive, so a connection triggers the service once (and a
+            // running/failed service keeps the fd out of the poll set).
+            #[cfg(feature = "socket")]
+            let socket_ids: Vec<RawFd> = self
+                .socket_triggers
+                .iter()
+                .filter(|(_, (_, service))| {
+                    self.units
+                        .get(service)
+                        .map(|u| u.active == ActiveState::Inactive)
+                        .unwrap_or(true)
+                })
+                .map(|(fd, _)| *fd)
+                .collect();
+
+            let mut pfds: Vec<nix::poll::PollFd> = Vec::new();
+            if let Some(sfd) = &self.signalfd {
+                pfds.push(nix::poll::PollFd::new(
+                    sfd.as_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            if let Some(l) = &self.listener {
+                pfds.push(nix::poll::PollFd::new(
+                    l.as_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            if let Some(n) = &self.notify {
+                pfds.push(nix::poll::PollFd::new(
+                    n.as_fd(),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            #[cfg(feature = "socket")]
+            for &fd in &socket_ids {
+                pfds.push(nix::poll::PollFd::new(
+                    borrowed_fd(fd),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            for &fd in &out_ids {
+                pfds.push(nix::poll::PollFd::new(
+                    borrowed_fd(fd),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+
+            if nix::poll::poll(&mut pfds, timeout).unwrap_or(0) == 0 {
+                continue;
+            }
+
+            // Extract readiness before touching `self` mutably.
+            let mut idx = 0usize;
+            let sig_ready = if has_sig {
+                let r = pfds[idx]
+                    .revents()
+                    .unwrap_or(nix::poll::PollFlags::empty())
+                    .contains(nix::poll::PollFlags::POLLIN);
+                idx += 1;
+                r
+            } else {
+                false
+            };
+            let listener_ready = if has_listener {
+                let r = pfds[idx]
+                    .revents()
+                    .unwrap_or(nix::poll::PollFlags::empty())
+                    .contains(nix::poll::PollFlags::POLLIN);
+                idx += 1;
+                r
+            } else {
+                false
+            };
+            let notify_ready = if has_notify {
+                let r = pfds[idx]
+                    .revents()
+                    .unwrap_or(nix::poll::PollFlags::empty())
+                    .contains(nix::poll::PollFlags::POLLIN);
+                idx += 1;
+                r
+            } else {
+                false
+            };
+            #[cfg(feature = "socket")]
+            let socket_ready: Vec<(RawFd, bool)> = socket_ids
+                .iter()
+                .map(|fd| {
+                    let r = pfds[idx]
+                        .revents()
+                        .unwrap_or(nix::poll::PollFlags::empty())
+                        .contains(nix::poll::PollFlags::POLLIN);
+                    idx += 1;
+                    (*fd, r)
+                })
+                .collect();
+            let out_ready: Vec<(RawFd, bool)> = out_ids
+                .iter()
+                .map(|fd| {
+                    let r = pfds[idx]
+                        .revents()
+                        .unwrap_or(nix::poll::PollFlags::empty())
+                        .contains(nix::poll::PollFlags::POLLIN);
+                    idx += 1;
+                    (*fd, r)
+                })
+                .collect();
+
+            if sig_ready {
+                self.read_signalfd();
+            }
+            if listener_ready {
+                self.accept_connections();
+            }
+            if notify_ready {
+                self.read_notify();
+            }
+            #[cfg(feature = "socket")]
+            for (fd, ready) in &socket_ready {
+                if *ready {
+                    // Idempotent: start() no-ops if the service is already
+                    // active or has a pending start job.
+                    if let Some((_, service)) = self.socket_triggers.get(fd).cloned() {
+                        let _ = self.start(&service);
+                    }
+                }
+            }
+            for (fd, ready) in out_ready {
+                if ready {
+                    self.read_stdout(fd);
+                }
+            }
+        }
+    }
+
+    fn read_signalfd(&mut self) {
+        let Some(sfd) = &self.signalfd else { return };
+        let signals = sfd.read();
+        for s in signals {
+            self.handle_signals(s);
+        }
+    }
+
+    fn accept_connections(&mut self) {
+        let accepted: Vec<UnixStream> = if let Some(listener) = &self.listener {
+            let mut v = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                v.push(stream);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        for s in accepted {
+            self.handle_connection(s);
+        }
+    }
+
+    fn read_notify(&mut self) {
+        let datagrams: Vec<Vec<u8>> = {
+            let Some(sock) = &self.notify else {
+                return;
+            };
+            let mut out = Vec::new();
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.push(buf[..n].to_vec());
+            }
+            out
+        };
+        for d in datagrams {
+            self.handle_notify_datagram(&d);
+        }
+    }
+
+    fn handle_notify_datagram(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        let mut ready = false;
+        let mut mainpid: Option<i32> = None;
+        for kv in text.split('\n') {
+            let Some(eq) = kv.find('=') else { continue };
+            match (&kv[..eq], &kv[eq + 1..]) {
+                ("READY", "1") => ready = true,
+                ("MAINPID", v) => mainpid = v.trim().parse().ok(),
+                _ => {}
+            }
+        }
+        let candidates: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(_, u)| {
+                u.service_cfg()
+                    .map(|s| s.service_type == ServiceType::Notify)
+                    .unwrap_or(false)
+                    && (u.active == ActiveState::Activating || u.active == ActiveState::Active)
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        let target = if let Some(mp) = mainpid {
+            candidates
+                .iter()
+                .find(|c| self.pid_unit.get(&mp).map(|n| n == *c).unwrap_or(false))
+                .cloned()
+                .or_else(|| candidates.first().cloned())
+        } else {
+            candidates.first().cloned()
+        };
+        let Some(unit) = target else { return };
+        if ready && self.units[&unit].active == ActiveState::Activating {
+            self.units.get_mut(&unit).unwrap().set_active(
+                ActiveState::Active,
+                SubState::Running,
+                UnitResult::Success,
+            );
+            self.complete_start_job(&unit);
+        }
+    }
+
+    fn read_stdout(&mut self, fd: RawFd) {
+        let name = match self.out_fds.get(&fd) {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match nix::unistd::read(borrowed_fd(fd), &mut buf) {
+                Ok(n) => n,
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(_) => {
+                    self.out_fds.remove(&fd);
+                    break;
+                }
+            };
+            if n == 0 {
+                self.out_fds.remove(&fd);
+                break;
+            }
+            if let Some(u) = self.units.get_mut(&name) {
+                u.log.push_chunk(&String::from_utf8_lossy(&buf[..n]));
+            }
+        }
+    }
+}
+
+impl Default for ManagerCfg {
+    fn default() -> Self {
+        ManagerCfg::for_mode(false).expect("default cfg")
+    }
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+fn unit_kind_of(name: &str) -> UnitKind {
+    UnitKind::from_unit_name(name).unwrap_or(UnitKind::Service)
+}
+
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "basic.target" | "multi-user.target" | "default.target"
+    )
+}
+
+fn kind_unit_needs_file(kind: UnitKind) -> bool {
+    kind == UnitKind::Target
+}
+
+fn builtin_target(name: &str) -> Unit {
+    let mut u = Unit::new(name, UnitKind::Target);
+    u.load = LoadState::Loaded;
+    u.file = Some(UnitFile {
+        path: None,
+        unit: crate::unit::UnitConfig {
+            description: match name {
+                "basic.target" => "Basic System".into(),
+                "multi-user.target" => "Multi-User System".into(),
+                "default.target" => "Default".into(),
+                _ => String::new(),
+            },
+            ..Default::default()
+        },
+        service: None,
+        timer: None,
+        #[cfg(feature = "socket")]
+        socket: None,
+        install: Default::default(),
+    });
+    u
+}
+
+fn min_of(a: Option<Instant>, b: Instant) -> Option<Instant> {
+    Some(match a {
+        Some(x) => x.min(b),
+        None => b,
+    })
+}
+
+fn signal_name(sig: i32) -> String {
+    crate::unit::sig_from_name(&format!("{sig}"))
+        .map(|s| format!("{s}"))
+        .unwrap_or_else(|| format!("{sig}"))
+}
+
+/// Borrow a raw fd for the duration of one poll/read call.
+///
+/// # Safety
+/// The fd belongs to an owned handle held by the manager (a child stdout
+/// pipe tracked in `out_fds`, or a bound socket). It stays open for the
+/// whole event-loop iteration; we never poll an fd after removing it from
+/// `out_fds`.
+fn borrowed_fd(fd: RawFd) -> BorrowedFd<'static> {
+    // SAFETY: the fd is valid and stays open through the poll/read; see above.
+    unsafe { BorrowedFd::borrow_raw(fd) }
+}
+
+// ---- trait helper for unit config checks -------------------------------------
+
+/// Extension used by the loader to detect a blank synthesized target.
+pub trait UnitConfigCheck {
+    fn unit_defaults_empty(&self) -> bool;
+}
+impl UnitConfigCheck for crate::unit::UnitConfig {
+    fn unit_defaults_empty(&self) -> bool {
+        self.after.is_empty() && self.wants.is_empty() && self.requires.is_empty()
+    }
+}

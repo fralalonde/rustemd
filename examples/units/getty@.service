@@ -1,0 +1,11 @@
+[Unit]
+Description=Getty on %i
+After=basic.target
+
+[Service]
+# A console login prompt. `%i` is the TTY instance (tty1, ttyS0, ...), resolved
+# by template instantiation: `getty@tty1.service` loads this file.
+Type=idle
+ExecStart=-/sbin/agetty --noclear %i 38400 linux
+Restart=always
+RestartSec=1

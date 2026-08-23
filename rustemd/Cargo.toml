@@ -1,0 +1,34 @@
+[package]
+name = "rustemd"
+version = "0.1.0"
+edition = "2024"
+description = "A systemd init reimplementation in Rust: a drop-in systemctl replacement with unit files, user services, and timers."
+license = "MIT"
+rust-version = "1.85"
+
+[features]
+default = []
+# Linux PID-1 boot support: mount the API/virtual filesystems, run early-boot
+# configuration, and instantiate template units (getty@tty1 -> getty@.service).
+boot = []
+# Socket activation: `.socket` units that bind listening sockets and activate a
+# matching `.service` on the first connection (inetd-style, via LISTEN_FDS).
+socket = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_complete_nushell = "4.6.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "resource", "socket", "poll", "hostname"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rustemd"
+path = "src/main.rs"

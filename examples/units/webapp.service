@@ -1,0 +1,11 @@
+[Unit]
+Description=Web app with a database dependency (example)
+Requires=postgres.service
+After=postgres.service
+
+[Service]
+ExecStart=/usr/local/bin/webapp
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

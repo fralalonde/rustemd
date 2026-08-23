@@ -1,0 +1,7 @@
+[Unit]
+Description=Demo web app (long-running)
+[Service]
+Type=simple
+ExecStart=/bin/sleep 3600
+[Install]
+WantedBy=default.target

@@ -1,0 +1,415 @@
+//! Process spawning and supervision primitives.
+//!
+//! A service runs in its own **cgroup** (Linux cgroup v2) when available; the
+//! spawned process adopts itself into the unit's cgroup before exec, so the
+//! kernel tracks the whole tree and `cgroup.kill` reaches every descendant.
+//! When cgroups aren't usable the fallback is a **process group**: the
+//! spawned process becomes a *session* leader (and therefore a process-group
+//! leader), so `kill(-pid, sig)` reaches the tree and the process can acquire
+//! a controlling terminal (which `getty`/login programs require). See
+//! [`crate::platform::cgroup`] for the cgroup side.
+//!
+//! `unsafe` is confined to the `pre_exec` closure, which is the one place
+//! the language requires it (the API is `unsafe fn pre_exec`). Everything
+//! inside it is async-signal-safe: setsid, chdir, setgroups/setgid/setuid,
+//! umask, setpriority, setrlimit, and the cgroup self-adopt (open/write/
+//! close). User/group *name* lookups (NSS) happen in the parent before
+//! spawn and are passed in as uid/gid numbers.
+
+use std::collections::HashMap;
+use std::ffi::{CString, OsString};
+use std::os::fd::{OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use nix::sys::resource::setrlimit;
+use nix::sys::signal::{SigSet, SigmaskHow, Signal};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Gid, Pid, Uid};
+use nix::unistd::{chdir, setgid, setgroups, setsid, setuid};
+
+use crate::unit::{Rlimit, StdioTarget};
+
+/// A spawned service process and any captured output pipes.
+pub struct Spawned {
+    pub pid: i32,
+    pub stdout: Option<OwnedFd>,
+    pub stderr: Option<OwnedFd>,
+}
+
+pub struct SpawnOptions {
+    pub argv: Vec<String>,
+    /// Final environment (already includes the manager's + unit's).
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<PathBuf>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Supplementary groups for `User=` (resolved in the parent).
+    pub groups: Vec<u32>,
+    pub nice: Option<i32>,
+    pub umask: Option<u32>,
+    pub rlimits: Vec<Rlimit>,
+    pub stdout_target: StdioTarget,
+    pub stderr_target: StdioTarget,
+    pub stdin_null: bool,
+    /// NOTIFY_SOCKET value, if this is a Type=notify service.
+    pub notify_socket: Option<PathBuf>,
+    /// Listening socket fds to pass to the child as fd 3..3+n (socket
+    /// activation), advertised via LISTEN_FDS/LISTEN_PID.
+    pub listen_fds: Vec<RawFd>,
+    /// cgroup v2 directory (Linux) the child self-adopts into before exec.
+    /// `None` = no cgroup, process-group only.
+    pub cgroup: Option<PathBuf>,
+}
+
+/// How a reaped child terminated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    /// Exited normally with this code.
+    Exited(i32),
+    /// Killed by this signal number.
+    Signaled(i32),
+}
+
+/// Resolve a username to a numeric uid + gid + supplementary groups.
+pub fn resolve_user(name: &str) -> Option<(u32, u32, Vec<u32>)> {
+    let user = nix::unistd::User::from_name(name).ok()??;
+    let cname = CString::new(name).ok()?;
+    let groups = nix::unistd::getgrouplist(&cname, user.gid)
+        .map(|gs| gs.into_iter().map(|g: Gid| g.as_raw()).collect())
+        .unwrap_or_default();
+    Some((user.uid.as_raw(), user.gid.as_raw(), groups))
+}
+
+pub fn resolve_group(name: &str) -> Option<u32> {
+    Some(nix::unistd::Group::from_name(name).ok()??.gid.as_raw())
+}
+
+/// Expand `$VAR`/`${VAR}` in each argv token against `env`.
+pub fn expand_env_argv(argv: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    argv.iter().map(|t| expand_env_token(t, env)).collect()
+}
+
+/// Expand `$VAR` and `${VAR}` in a single argv token against `env`.
+/// Unset variables expand to the empty string.
+pub fn expand_env_token(tok: &str, env: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let bytes = tok.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let rest = &tok[i + 1..];
+            let (name, consumed) = if let Some(braced) = rest.strip_prefix('{') {
+                match braced.find('}') {
+                    Some(end) => (&braced[..end], end + 2),
+                    None => ("", rest.len() + 1),
+                }
+            } else {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (&rest[..end], end + 1)
+            };
+            if name.is_empty() {
+                out.push('$');
+                out.push_str(rest);
+                break;
+            }
+            out.push_str(env.get(name).map(String::as_str).unwrap_or(""));
+            i += consumed;
+            continue;
+        }
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&tok[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Format a non-negative integer as a NUL-terminated C string in `buf`
+/// (async-signal-safe — no allocation). Returns a pointer to the digits.
+fn itoa_cstr(buf: &mut [u8], mut v: i32) -> *const libc::c_char {
+    let n = buf.len();
+    buf[n - 1] = 0; // null terminator
+    let mut i = n - 1;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    buf[i..].as_ptr().cast()
+}
+
+/// Spawn `argv` as a new process-group leader with the given environment and
+/// process attributes. The returned pid is the group leader; kill with
+/// [`kill_group`].
+pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
+    let argv = opts.argv.clone();
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+
+    let mut env: Vec<(OsString, OsString)> = opts
+        .env
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+    if let Some(ns) = &opts.notify_socket {
+        env.push((
+            OsString::from("NOTIFY_SOCKET"),
+            OsString::from(ns.as_os_str()),
+        ));
+    }
+    cmd.envs(env);
+
+    let (stdout, stderr) = setup_stdio(&opts.stdout_target, &opts.stderr_target);
+    if let Some(s) = stdout {
+        cmd.stdout(s);
+    }
+    if let Some(s) = stderr {
+        cmd.stderr(s);
+    }
+    if opts.stdin_null {
+        cmd.stdin(Stdio::null());
+    }
+
+    let uid = opts.uid;
+    let gid = opts.gid;
+    let groups = opts.groups.clone();
+    let umaskv = opts.umask;
+    let nice = opts.nice;
+    let rlimits = opts.rlimits.clone();
+    let cwd = opts.cwd.clone();
+    let listen_fds = opts.listen_fds.clone();
+
+    // Path to the cgroup's `cgroup.procs`, pre-encoded for the async-signal-
+    // safe open() in pre_exec (a Rust `fs::File::open` allocates and is not
+    // legal in a pre_exec hook).
+    let cgroup_procs: Option<CString> = opts
+        .cgroup
+        .as_ref()
+        .and_then(|d| CString::new(d.join("cgroup.procs").as_os_str().as_bytes()).ok());
+
+    // The one justified `unsafe` in the spawn path: pre_exec is the only
+    // hook between fork and exec. We call only async-signal-safe functions;
+    // errors are propagated back through std's exec-status pipe, so a failed
+    // attribute turns into an Err here and the child is reaped by std.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Reset the inherited signal mask. The manager blocks SIGTERM /
+            // SIGINT / SIGCHLD / … for its signalfd, and a forked child
+            // inherits that mask across fork+exec — which would make every
+            // service immune to its (default SIGTERM) stop signal. A service
+            // must start with a clean, empty signal mask. `sigprocmask` is
+            // async-signal-safe, so it is legal in pre_exec.
+            if let Err(e) =
+                nix::sys::signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
+            {
+                return Err(std::io::Error::from(e));
+            }
+            // Own session (the non-cgroup fallback; also matters for
+            // KillMode=process semantics). `setsid` makes the child a session
+            // leader AND process-group leader, so it can acquire a controlling
+            // terminal (busybox getty calls setsid() and fails with EPERM if
+            // the process is already a plain process-group leader).
+            if let Err(e) = setsid() {
+                return Err(std::io::Error::from(e));
+            }
+            // Socket activation: dup2 the listening fds to 3..3+n and advertise
+            // them via LISTEN_FDS/LISTEN_PID (systemd's sd_listen_fds(3)
+            // protocol). dup2 clears CLOEXEC on the target fd, so they survive
+            // exec; the manager's own copies stay CLOEXEC and close on exec.
+            for (i, fd) in listen_fds.iter().enumerate() {
+                if libc::dup2(*fd, 3 + i as libc::c_int) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if !listen_fds.is_empty() {
+                let mut fds_buf = [0u8; 16];
+                let fds_ptr = itoa_cstr(&mut fds_buf, listen_fds.len() as i32);
+                libc::setenv(c"LISTEN_FDS".as_ptr(), fds_ptr, 1);
+                let mut pid_buf = [0u8; 16];
+                let pid_ptr = itoa_cstr(&mut pid_buf, libc::getpid());
+                libc::setenv(c"LISTEN_PID".as_ptr(), pid_ptr, 1);
+            }
+            // Move this (still pre-exec) process into its cgroup by writing
+            // our own pid to `cgroup.procs`. Doing it here — before exec —
+            // means every process the service forks later is captured by the
+            // kernel, closing the double-fork escape hatch a process group
+            // can't. open/write/close are async-signal-safe and the path is
+            // pre-encoded in the parent. Best-effort: failure just leaves us
+            // in the process-group fallback.
+            if let Some(cg) = &cgroup_procs {
+                let fd = libc::open(cg.as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    let pid = libc::getpid();
+                    let mut buf = [0u8; 32];
+                    let mut n = pid;
+                    let mut i = buf.len();
+                    loop {
+                        i -= 1;
+                        buf[i] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    libc::write(fd, buf[i..].as_ptr().cast(), buf.len() - i);
+                    libc::close(fd);
+                }
+            }
+            if let Some(dir) = &cwd {
+                if let Err(e) = chdir(dir) {
+                    return Err(std::io::Error::from(e));
+                }
+            }
+            if !groups.is_empty() {
+                if let Err(e) =
+                    setgroups(&groups.iter().map(|&g| Gid::from_raw(g)).collect::<Vec<_>>())
+                {
+                    return Err(std::io::Error::from(e));
+                }
+            }
+            if let Some(g) = gid {
+                if let Err(e) = setgid(Gid::from_raw(g)) {
+                    return Err(std::io::Error::from(e));
+                }
+            }
+            if let Some(u) = uid {
+                if let Err(e) = setuid(Uid::from_raw(u)) {
+                    return Err(std::io::Error::from(e));
+                }
+            }
+            if let Some(m) = umaskv {
+                nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(m));
+            }
+            if let Some(n) = nice {
+                libc::setpriority(libc::PRIO_PROCESS, 0, n);
+            }
+            for rl in &rlimits {
+                if let Err(e) = setrlimit(rl.resource, rl.soft, rl.hard) {
+                    return Err(std::io::Error::from(e));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id() as i32;
+    // Take the pipes out before dropping the child handle so they stay open.
+    let mut stdout: Option<OwnedFd> = child.stdout.take().map(Into::into);
+    let mut stderr: Option<OwnedFd> = child.stderr.take().map(Into::into);
+    drop(child);
+
+    set_nonblocking_opt(&mut stdout)?;
+    set_nonblocking_opt(&mut stderr)?;
+
+    Ok(Spawned {
+        pid,
+        stdout,
+        stderr,
+    })
+}
+
+fn set_nonblocking_opt(fd: &mut Option<OwnedFd>) -> std::io::Result<()> {
+    if let Some(fd) = fd {
+        set_nonblocking(fd)?;
+    }
+    Ok(())
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+    let flags =
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        ),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+fn setup_stdio(out: &StdioTarget, err: &StdioTarget) -> (Option<Stdio>, Option<Stdio>) {
+    let to_stdio = |t: &StdioTarget| -> Option<Stdio> {
+        match t {
+            StdioTarget::Journal | StdioTarget::Inherit => Some(Stdio::piped()),
+            StdioTarget::Discard => Some(Stdio::null()),
+            StdioTarget::File(p) => open_file_stdio(p),
+        }
+    };
+    (to_stdio(out), to_stdio(err))
+}
+
+fn open_file_stdio(path: &Path) -> Option<Stdio> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    Some(Stdio::from(f))
+}
+
+/// Signal the whole process group led by `group_pid`. A negative pid passed
+/// to `kill(2)` addresses the group.
+pub fn kill_group(group_pid: i32, sig: Signal) -> nix::Result<()> {
+    nix::sys::signal::kill(Pid::from_raw(-group_pid), sig)
+}
+
+/// Reap every exited direct child (non-blocking). Returns `(pid, exit)`
+/// pairs. The manager correlates pids back to units; the raw `waitpid` loop
+/// is kept here because it is the OS-specific primitive.
+pub fn reap_children() -> Vec<(i32, ChildExit)> {
+    let mut out = Vec::new();
+    loop {
+        let status = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => break,
+            Ok(status) => status,
+            Err(_) => break,
+        };
+        let Some(pid) = status.pid().map(|p| p.as_raw()) else {
+            break;
+        };
+        let exit = match status {
+            WaitStatus::Exited(_, c) => ChildExit::Exited(c),
+            WaitStatus::Signaled(_, s, _) => ChildExit::Signaled(s as i32),
+            _ => continue,
+        };
+        out.push((pid, exit));
+    }
+    out
+}
+
+/// Become a subreaper: adopted orphaned grandchildren get reparented to us so
+/// we can reap them (matters for `Type=forking`/daemonizing services). No-op
+/// when already PID 1 (which is inherently the reaper).
+pub fn set_subreaper() {
+    if nix::unistd::getpid() == Pid::from_raw(1) {
+        return;
+    }
+    // SAFETY: prctl(PR_SET_CHILD_SUBREAPER, 1) is a single, always-safe
+    // syscall with no pointer or memory-safety implications.
+    unsafe {
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    }
+}

@@ -1,0 +1,8 @@
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/touch /tmp/rustemd-flag
+ExecStop=/usr/bin/rm -f /tmp/rustemd-flag
+
+[Install]
+WantedBy=default.target

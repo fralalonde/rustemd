@@ -1,0 +1,5 @@
+/target
+.idea
+
+# Generated boot artifact (see scripts/build-initramfs.sh)
+/initramfs.cpio.gz
