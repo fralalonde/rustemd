@@ -1,0 +1,30 @@
+<!-- WiX 4 installer for rustemd (Windows MSI). Built by release.yml with:
+       wix build -d Version=<x.y.z> rustemd.wxs -o rustemd-<ver>-x86_64.msi
+     The workflow copies this file next to the built .exe files first so the
+     relative Source= paths resolve. Version must be a clean x.y.z semver. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="rustemd"
+      Manufacturer="fralalonde"
+      Version="$(Version)"
+      UpgradeCode="6882fed4-7c00-432d-989d-7f886f127b6d"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of rustemd is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="rustemd" />
+    </StandardDirectory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="Binaries" Guid="03dc31c0-b987-46ed-afa6-0716ef27367d">
+        <File Id="rustemdExe" Source="rustemd.exe" />
+        <File Id="rustemdTuiExe" Source="rustemd-tui.exe" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="rustemd" Level="1">
+      <ComponentRef Id="Binaries" />
+    </Feature>
+  </Package>
+</Wix>

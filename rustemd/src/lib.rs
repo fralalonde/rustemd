@@ -31,4 +31,4 @@ pub mod specifier;
 pub mod timespan;
 pub mod unit;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = env!("RUSTEMD_VERSION");

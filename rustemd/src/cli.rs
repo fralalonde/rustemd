@@ -30,7 +30,7 @@ fn normalize_units(names: &[String]) -> Vec<String> {
 #[derive(Parser)]
 #[command(
     name = "rustemd",
-    version,
+    version = crate::VERSION,
     about = "A systemd init reimplementation: unit manager + systemctl-compatible CLI"
 )]
 pub struct Cli {

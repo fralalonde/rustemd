@@ -16,7 +16,7 @@ mod theme;
 #[derive(Parser)]
 #[command(
     name = "rustemd-tui",
-    version,
+    version = rustemd::VERSION,
     about = "Terminal UI client for a running rustemd unit manager"
 )]
 struct Cli {

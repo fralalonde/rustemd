@@ -1,4 +1,4 @@
-name: Build and release rsdk
+name: release
 
 on:
   push:
@@ -7,132 +7,144 @@ on:
 permissions:
   contents: write
 
+env:
+  # e.g. "v0.2.0" — scripts strip the leading 'v' for package versions.
+  VERSION: ${{ github.ref_name }}
+
 jobs:
-  build:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  linux:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2022
-            platform: windows
-            arch: x86_64
-            target: x86_64-pc-windows-msvc
-            extension: zip
           - runner: ubuntu-22.04
-            platform: linux
-            arch: x86_64
             target: x86_64-unknown-linux-gnu
-            extension: tar.gz
-          - runner: macos-14
-            platform: mac
-            arch: aarch64
-            target: aarch64-apple-darwin
-            extension: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target ${{ matrix.target }}
-      - name: Sanity checks (macOS)
-        if: matrix.platform == 'mac'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release/rsdk"
-          "$bin" --version | grep -q 'rsdk '
-          "$bin" --help >/dev/null
-          cargo test
-      - name: Assemble release tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="stage/rsdk"
-          mkdir -p "$root/bin" "$root/shell/bash" "$root/shell/zsh" "$root/shell/fish" "$root/shell/nushell"
-          if [ "${{ matrix.platform }}" = windows ]; then cp "target/${{ matrix.target }}/release/rsdk.exe" "$root/bin/rsdk.exe"; else cp "target/${{ matrix.target }}/release/rsdk" "$root/bin/rsdk"; fi
-          cp templates/bash/rsdk.bash "$root/shell/bash/rsdk.bash"
-          cp templates/zsh/rsdk.zsh "$root/shell/zsh/rsdk.zsh"
-          cp templates/fish/*.fish "$root/shell/fish/"
-          cp templates/nushell/rsdk.nu "$root/shell/nushell/rsdk.nu"
-          if [ "${{ matrix.platform }}" = windows ]; then mkdir -p "$root/shell/powershell"; cp templates/powershell/Rsdk.psd1 templates/powershell/Rsdk.psm1 "$root/shell/powershell/"; fi
-          printf '%s\n' "${GITHUB_REF_NAME#v}" > "$root/VERSION"
-          if command -v sha256sum >/dev/null 2>&1; then
-            checksum() { sha256sum "$@"; }
-          else
-            checksum() { shasum -a 256 "$@"; }
-          fi
-          (cd "$root" && checksum bin/* shell/bash/* shell/zsh/* shell/fish/* shell/nushell/* VERSION > checksums.txt && if [ -d shell/powershell ]; then checksum shell/powershell/* >> checksums.txt; fi)
-      - name: Archive release tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="rsdk-${GITHUB_REF_NAME#v}-${{ matrix.platform }}-${{ matrix.arch }}"
-          if [ "${{ matrix.extension }}" = zip ]; then (cd stage && 7z a "../$name.zip" rsdk); else tar -C stage -czf "$name.tar.gz" rsdk; fi
-      # Every archive has this root layout: rsdk/bin/rsdk.exe (Windows) or rsdk/bin/rsdk,
-      # rsdk/shell/bash/rsdk.bash, rsdk/shell/zsh/rsdk.zsh, rsdk/shell/fish/rsdk.fish,
-      # rsdk/shell/nushell/rsdk.nu, rsdk/shell/powershell/Rsdk.psd1 (Windows only),
-      # rsdk/shell/powershell/Rsdk.psm1 (Windows only), and rsdk/VERSION.
+      - run: sudo apt-get update && sudo apt-get install -y rpm
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: bash scripts/package-linux.sh ${{ matrix.target }} "${VERSION#v}"
       - uses: actions/upload-artifact@v4
         with:
-          name: rsdk-${{ matrix.platform }}-${{ matrix.arch }}
-          path: rsdk-*-${{ matrix.platform }}-${{ matrix.arch }}.${{ matrix.extension }}
-  test:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            platform: linux
-          - runner: windows-2022
-            platform: windows
+          name: linux-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+
+  windows:
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      # Installer tests are platform-specific: POSIX scripts on Linux (they
-      # self-skip elsewhere), PowerShell on Windows, none on macOS (assumed
-      # identical to Linux).
-      - name: Installer tests (POSIX)
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          sh test/test-release-installer-posix.sh
-          sh test/test-release-installer-posix-integration.sh
-      - name: Build binary for PowerShell integration test
-        if: matrix.platform == 'windows'
-        shell: bash
-        run: cargo build --release
-      - name: Prepare installed-binary fixture
-        if: matrix.platform == 'windows'
-        shell: bash
-        run: |
-          mkdir -p "$HOME/.rsdk"
-          cp target/release/rsdk.exe "$HOME/.rsdk/rsdk.exe"
-      - name: Installer tests (PowerShell)
-        if: matrix.platform == 'windows'
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package zip + msi
         shell: pwsh
         run: |
-          ./test/test-release-installer-powershell.ps1
-          ./test/test-release-installer-powershell-integration.ps1
-  release:
-    needs: [build, test]
-    runs-on: ubuntu-22.04
+          $ver = $env:VERSION.TrimStart('v')
+          $bin = "target/x86_64-pc-windows-msvc/release"
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          # Portable zip.
+          $stage = "dist/rustemd-$ver-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "$bin/rustemd.exe" $stage
+          Copy-Item "$bin/rustemd-tui.exe" $stage
+          Set-Content -Path "$stage/VERSION.txt" -Value $ver
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/rustemd-$ver-x86_64-pc-windows-msvc.zip"
+
+          # MSI via WiX 4 (.NET tool). Build from the bin dir so relative
+          # Source= paths in the .wxs resolve against the .exe files.
+          dotnet tool install --global wix
+          Copy-Item packaging/windows/rustemd.wxs $bin/
+          Push-Location $bin
+          wix build -d Version=$ver rustemd.wxs -o "rustemd-$ver-x86_64.msi"
+          Pop-Location
+          Move-Item "$bin/rustemd-$ver-x86_64.msi" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.msi
+
+  macos:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - name: Package tar.gz + dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${VERSION#v}"
+          bin="target/aarch64-apple-darwin/release"
+          mkdir -p dist
+
+          # Portable tar.gz.
+          stage="dist/rustemd-$ver-aarch64-apple-darwin"
+          mkdir -p "$stage/bin" "$stage/completions"
+          install -m 0755 "$bin/rustemd"     "$stage/bin/rustemd"
+          install -m 0755 "$bin/rustemd-tui" "$stage/bin/rustemd-tui"
+          "$bin/rustemd" completions bash       > "$stage/completions/rustemd.bash"
+          "$bin/rustemd" completions zsh        > "$stage/completions/_rustemd"
+          "$bin/rustemd" completions fish       > "$stage/completions/rustemd.fish"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          tar -C dist -czf "dist/rustemd-$ver-aarch64-apple-darwin.tar.gz" "rustemd-$ver-aarch64-apple-darwin"
+
+          # Disk image (drag the binaries to /usr/local/bin).
+          dmgroot="$(mktemp -d)"
+          mkdir -p "$dmgroot/rustemd"
+          install -m 0755 "$bin/rustemd"     "$dmgroot/rustemd/rustemd"
+          install -m 0755 "$bin/rustemd-tui" "$dmgroot/rustemd/rustemd-tui"
+          printf 'Copy rustemd and rustemd-tui to /usr/local/bin.\n' > "$dmgroot/rustemd/README.txt"
+          hdiutil create -volname "rustemd $ver" -srcfolder "$dmgroot/rustemd" \
+              -ov -format UDZO "dist/rustemd-$ver-aarch64.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/*.tar.gz
+            dist/*.dmg
+
+  release:
+    needs: [test, linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
-      - name: Add installers and checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp scripts/install.sh release-assets/install.sh
-          cp scripts/install.ps1 release-assets/install.ps1
-          (cd release-assets && sha256sum rsdk-* > checksums.txt)
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

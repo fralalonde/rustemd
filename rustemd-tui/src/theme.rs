@@ -1,4 +1,4 @@
-//! Color palette and shared styles — mirrors rsdk's TUI palette.
+//! Color palette and shared styles for the rustemd TUI.
 
 use ratatui::style::{Color, Style};
 

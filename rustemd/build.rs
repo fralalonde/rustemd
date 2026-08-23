@@ -3,15 +3,15 @@ use std::process::Command;
 fn main() {
     // Derive a human-friendly version string from the Git tag.
     //
-    //   Tagged release       → "0.5.5"
-    //   Dirty on tag         → "0.5.5+dirty"
-    //   Between tags         → "0.5.5-dev.3+gabcdef"
-    //   Dirty between tags   → "0.5.5-dev.3+gabcdef.dirty"
-    //   No tags / bare       → Cargo.toml fallback
+    //   Tagged release       -> "0.5.5"
+    //   Dirty on tag         -> "0.5.5+dirty"
+    //   Between tags         -> "0.5.5-dev.3+gabcdef"
+    //   Dirty between tags   -> "0.5.5-dev.3+gabcdef.dirty"
+    //   No tags / bare       -> Cargo.toml fallback
     let fallback = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
     let desc = Command::new("git")
-        .args(["describe", "--tags", "--always", "--dirty"])
+        .args(["describe", "--tags", "--dirty"])
         .output()
         .ok()
         .and_then(|o| {
@@ -27,15 +27,16 @@ fn main() {
         None => fallback,
         Some(raw) => {
             let raw = raw.strip_prefix('v').unwrap_or(raw);
+            // `--dirty` appends "-dirty" when the tree has uncommitted changes;
+            // strip it before parsing the version, then re-append it.
             let suffix = if raw.ends_with("dirty") {
-                // Save 'dirty' marker and remove it before parsing.
                 raw.trim_end_matches("-dirty")
             } else {
                 raw
             };
 
             let base = if suffix.contains('-') {
-                // v0.5.5-3-gabcdef  →  0.5.5-dev.3+gabcdef
+                // v0.5.5-3-gabcdef  ->  0.5.5-dev.3+gabcdef
                 let parts: Vec<&str> = suffix.splitn(3, '-').collect();
                 if parts.len() == 3 {
                     format!("{}-dev.{}+{}", parts[0], parts[1], parts[2])
@@ -54,6 +55,7 @@ fn main() {
         }
     };
 
-    println!("cargo:rustc-env=RSDK_VERSION={version}");
+    println!("cargo:rustc-env=RUSTEMD_VERSION={version}");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
 }

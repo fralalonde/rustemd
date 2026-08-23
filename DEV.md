@@ -14,11 +14,17 @@ Git tags are the source of truth for versioning; the build files (`Cargo.toml`,
 
 ## CI
 
-GitHub Actions (`.github/workflows/release.yml`) builds release artifacts for targets on
-every `v*` tag push:
+GitHub Actions (`.github/workflows/release.yml`) builds and packages release
+artifacts on every `v*` tag push:
 
-| Target                    | Runner      |
-|---------------------------|-------------|
-| `x86_64-pc-windows-msvc`  | `windows-2022` |
-| `x86_64-unknown-linux-gnu`| `ubuntu-22.04`|
-| `aarch64-apple-darwin`    | `macos-14` (native ARM) |
+| Target                       | Runner             | Packages      |
+|------------------------------|--------------------|---------------|
+| `x86_64-unknown-linux-gnu`   | `ubuntu-22.04`     | tar.gz, deb, rpm |
+| `aarch64-unknown-linux-gnu`  | `ubuntu-24.04-arm` | tar.gz, deb, rpm |
+| `x86_64-pc-windows-msvc`     | `windows-2022`     | zip, msi      |
+| `aarch64-apple-darwin`       | `macos-14`         | tar.gz, dmg   |
+
+The package version comes from the git tag at build time (see
+`rustemd/build.rs`); `Cargo.toml`/`Cargo.lock` are kept in sync by `release.sh`
+at release time. Linux packaging lives in `scripts/package-linux.sh` +
+`packaging/`.

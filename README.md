@@ -52,6 +52,30 @@ rustemd completions powershell   # pipe into Register-ArgumentCompleter
 rustemd completions nushell
 ```
 
+## Homebrew
+
+On Linux (e.g. Bazzite) or macOS, install from a tap without layering via
+`rpm-ostree`:
+
+```sh
+brew tap fralalonde/rustemd https://github.com/fralalonde/rustemd
+brew install rustemd
+```
+
+The formula (`Formula/rustemd.rb`) installs `rustemd` and `rustemd-tui` plus
+shell completions. It deliberately does **not** create a `systemctl` symlink —
+on a systemd host that would shadow the real `systemctl` in your PATH. To
+exercise the drop-in CLI, symlink it into a directory you keep ahead of
+`/usr/bin` only while testing:
+
+```sh
+ln -s "$(brew --prefix)/bin/rustemd" ~/.local/bin/systemctl
+```
+
+Refresh the formula's pinned sha256 after each release with
+`scripts/gen-brew-formula.sh <version>` (run once the release assets are
+published).
+
 ## TUI
 
 `rustemd-tui` is a terminal client that talks to a running manager over the

@@ -3,3 +3,6 @@
 
 # Generated boot artifact (see scripts/build-initramfs.sh)
 /initramfs.cpio.gz
+
+# Local packaging output (see scripts/package-linux.sh)
+/dist
