@@ -23,6 +23,8 @@ pub enum UnitKind {
     Target,
     #[cfg(feature = "socket")]
     Socket,
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    Device,
 }
 
 impl UnitKind {
@@ -33,6 +35,8 @@ impl UnitKind {
             UnitKind::Target => "target",
             #[cfg(feature = "socket")]
             UnitKind::Socket => "socket",
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            UnitKind::Device => "device",
         }
     }
     pub fn from_suffix(s: &str) -> Option<UnitKind> {
@@ -42,6 +46,8 @@ impl UnitKind {
             "target" => Some(UnitKind::Target),
             #[cfg(feature = "socket")]
             "socket" => Some(UnitKind::Socket),
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            "device" => Some(UnitKind::Device),
             _ => None,
         }
     }

@@ -134,3 +134,26 @@ impl UnitType for SocketUnit {
         mgr.stop_socket(name);
     }
 }
+
+/// A `.device`: runtime-generated from the sysfs device tree and uevents —
+/// never parsed from a file. A device is active the instant it exists; there
+/// is no process to spawn, so "start" simply confirms activation (a no-op for
+/// an already-active unit) and "stop" finalizes immediately.
+#[cfg(all(target_os = "linux", feature = "udev"))]
+pub struct DeviceUnit;
+
+#[cfg(all(target_os = "linux", feature = "udev"))]
+impl UnitType for DeviceUnit {
+    fn start(&self, mgr: &mut Manager, name: &str) {
+        mgr.units.get_mut(name).unwrap().set_active(
+            ActiveState::Active,
+            SubState::Dead,
+            UnitResult::Success,
+        );
+        mgr.complete_start_job(name);
+    }
+
+    fn stop(&self, mgr: &mut Manager, name: &str) {
+        mgr.finalize_stop(name);
+    }
+}

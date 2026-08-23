@@ -715,6 +715,12 @@ pub fn run_daemon(user: bool, no_socket_activation: bool) -> i32 {
         eprintln!("{}", style::warn(&format!("[load] {e}")));
     }
 
+    // Discover kernel devices and begin monitoring uevents, so that
+    // `After=sys-…device` / `Requires=sys-…device` ordering resolves before
+    // the default target (and its dependencies) start.
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    mgr.udev_init();
+
     if !mgr.as_pid1 && !user {
         // Become a subreaper so orphaned daemonized children reparent to us.
         #[cfg(target_os = "linux")]

@@ -33,6 +33,8 @@ use self::socket::{SocketListener, bind_listen_stream};
 use self::state::ControlCommand as UnitControlCommand;
 use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult};
 use self::timer::{TimerKind, TimerWheel};
+#[cfg(all(target_os = "linux", feature = "udev"))]
+use self::unit_type::DeviceUnit;
 #[cfg(feature = "socket")]
 use self::unit_type::SocketUnit;
 use self::unit_type::{ServiceUnit, TargetUnit, TimerUnit, UnitType};
@@ -169,6 +171,15 @@ pub struct Manager {
     /// `Type=dbus` units waiting on their `BusName=` (bus name -> unit name).
     #[cfg(target_os = "linux")]
     pending_bus_names: HashMap<String, String>,
+    /// Live uevent monitor (hotplug add/remove). `None` when unavailable or
+    /// before [`Manager::udev_init`] runs.
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    pub udev: Option<crate::platform::udev::UdevMonitor>,
+    /// The device registry: every known device keyed by sysfs path. This is
+    /// the source of truth for `.device` units and survives `load_all`
+    /// reloads (which rebuild the transient `units` table from disk).
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    udev_devices: HashMap<String, crate::platform::udev::Device>,
 }
 
 impl Manager {
@@ -198,6 +209,10 @@ impl Manager {
             dbus: None,
             #[cfg(target_os = "linux")]
             pending_bus_names: HashMap::new(),
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            udev: None,
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            udev_devices: HashMap::new(),
         })
     }
 
@@ -329,6 +344,16 @@ impl Manager {
             }
         }
         self.units = next;
+        // `.device` units are runtime-generated (never parsed from disk), so a
+        // reload would drop them. Re-register from the device registry.
+        #[cfg(all(target_os = "linux", feature = "udev"))]
+        {
+            let devices: Vec<crate::platform::udev::Device> =
+                self.udev_devices.values().cloned().collect();
+            for dev in devices {
+                self.udev_register(&dev);
+            }
+        }
         self.rearm_all_timers();
         errors
     }
@@ -901,6 +926,8 @@ impl Manager {
             Some(UnitKind::Target) => &TargetUnit,
             #[cfg(feature = "socket")]
             Some(UnitKind::Socket) => &SocketUnit,
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            Some(UnitKind::Device) => &DeviceUnit,
             _ => &ServiceUnit,
         }
     }
@@ -908,6 +935,116 @@ impl Manager {
     fn do_start(&mut self, name: &str) {
         let ut = self.unit_type(name);
         ut.start(self, name);
+    }
+
+    // ---- udev device tracking (Linux + `udev` feature) ----------------------
+
+    /// Discover kernel devices and start monitoring uevents. Idempotent: runs
+    /// once, at startup, before any unit is started so that
+    /// `After=sys-…device` / `Requires=sys-…device` ordering resolves against
+    /// the freshly enumerated table.
+    ///
+    /// Ordering matters here: subscribe to the uevent socket **before**
+    /// enumerating, then drain any events that raced the walk. That closes the
+    /// classic subscribe/enumerate race without missing a hotplug event.
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    pub fn udev_init(&mut self) {
+        if self.udev.is_some() {
+            return;
+        }
+        self.udev = match crate::platform::udev::UdevMonitor::new() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                mgr_log(&format!(
+                    "udev: monitor unavailable ({e}); hotplug disabled"
+                ));
+                None
+            }
+        };
+        for dev in crate::platform::udev::enumerate_devices() {
+            self.udev_register(&dev);
+        }
+        // Drain any uevents that arrived while we enumerated.
+        self.udev_process();
+        let device_units = self
+            .units
+            .values()
+            .filter(|u| u.kind == UnitKind::Device)
+            .count();
+        mgr_log(&format!(
+            "udev: {} devices → {device_units} .device units",
+            self.udev_devices.len()
+        ));
+    }
+
+    /// Register (or refresh) the `.device` unit(s) for a discovered device.
+    /// A device is active the instant it exists, so the unit is inserted
+    /// already `active`; no start job is involved.
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    fn udev_register(&mut self, dev: &crate::platform::udev::Device) {
+        self.udev_devices.insert(dev.devpath.clone(), dev.clone());
+        for name in dev.unit_names() {
+            if self.units.contains_key(&name) {
+                continue;
+            }
+            let mut u = Unit::new(&name, UnitKind::Device);
+            u.load = LoadState::Loaded;
+            u.file = Some(self.udev_unit_file(dev));
+            u.set_active(ActiveState::Active, SubState::Dead, UnitResult::Success);
+            self.units.insert(name, u);
+        }
+    }
+
+    /// Remove the `.device` unit(s) for a device that disappeared (hotplug
+    /// remove or a synthetic `change` that dropped the node).
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    fn udev_remove(&mut self, dev: &crate::platform::udev::Device) {
+        self.udev_devices.remove(&dev.devpath);
+        for name in dev.unit_names() {
+            self.units.remove(&name);
+        }
+    }
+
+    /// Drain pending uevents and apply them to the unit table.
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    fn udev_process(&mut self) {
+        let events = match self.udev.as_mut() {
+            Some(m) => m.read_events(),
+            None => return,
+        };
+        for (action, dev) in events {
+            use crate::platform::udev::UEventAction;
+            match action {
+                UEventAction::Add | UEventAction::Change | UEventAction::Move => {
+                    self.udev_register(&dev);
+                }
+                UEventAction::Remove => self.udev_remove(&dev),
+                UEventAction::Other => {}
+            }
+        }
+    }
+
+    /// The synthesized unit file backing a `.device` unit (description only —
+    /// no config is ever parsed from disk).
+    #[cfg(all(target_os = "linux", feature = "udev"))]
+    fn udev_unit_file(&self, dev: &crate::platform::udev::Device) -> UnitFile {
+        let description = if dev.devname.is_empty() {
+            format!("{} {}", dev.subsystem, dev.sysname())
+        } else {
+            format!("{} {}", dev.subsystem, dev.devname)
+        };
+        UnitFile {
+            path: None,
+            unit: crate::unit::UnitConfig {
+                description,
+                ..Default::default()
+            },
+            service: None,
+            timer: None,
+            #[cfg(feature = "socket")]
+            socket: None,
+            install: Default::default(),
+        }
     }
 
     fn run_main_start(&mut self, name: &str, idx: usize) {
@@ -1951,6 +2088,8 @@ impl Manager {
             let has_sig = self.signalfd.is_some();
             let has_listener = self.listener.is_some();
             let has_notify = self.notify.is_some();
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            let has_udev = self.udev.is_some();
             let out_ids: Vec<RawFd> = self.out_fds.keys().copied().collect();
             // Socket activation: poll a listener only while its target service
             // is Inactive, so a connection triggers the service once (and a
@@ -1997,6 +2136,13 @@ impl Manager {
             for &fd in &out_ids {
                 pfds.push(nix::poll::PollFd::new(
                     borrowed_fd(fd),
+                    nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            if let Some(m) = &self.udev {
+                pfds.push(nix::poll::PollFd::new(
+                    m.as_fd(),
                     nix::poll::PollFlags::POLLIN,
                 ));
             }
@@ -2060,6 +2206,15 @@ impl Manager {
                     (*fd, r)
                 })
                 .collect();
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            let udev_ready = if has_udev {
+                pfds[idx]
+                    .revents()
+                    .unwrap_or(nix::poll::PollFlags::empty())
+                    .contains(nix::poll::PollFlags::POLLIN)
+            } else {
+                false
+            };
 
             if sig_ready {
                 self.read_signalfd();
@@ -2084,6 +2239,10 @@ impl Manager {
                 if ready {
                     self.read_stdout(fd);
                 }
+            }
+            #[cfg(all(target_os = "linux", feature = "udev"))]
+            if udev_ready {
+                self.udev_process();
             }
         }
     }
@@ -2459,5 +2618,45 @@ pub trait UnitConfigCheck {
 impl UnitConfigCheck for crate::unit::UnitConfig {
     fn unit_defaults_empty(&self) -> bool {
         self.after.is_empty() && self.wants.is_empty() && self.requires.is_empty()
+    }
+}
+
+// ---- udev device-tracking tests ---------------------------------------------
+
+#[cfg(all(test, target_os = "linux", feature = "udev"))]
+mod udev_tests {
+    use super::*;
+    use crate::platform::udev::Device;
+
+    fn fake(devpath: &str, subsystem: &str, devname: &str) -> Device {
+        Device {
+            devpath: devpath.to_string(),
+            subsystem: subsystem.to_string(),
+            devname: devname.to_string(),
+            devtype: String::new(),
+        }
+    }
+
+    /// Registering a device inserts *both* names (sysfs-path primary + subsystem
+    /// alias) as active `.device` units; removing it deletes both. This is the
+    /// hotplug create/remove path, exercised without a live uevent.
+    #[test]
+    fn register_and_remove_track_device_units() {
+        let mut mgr = Manager::new(ManagerCfg::for_mode(false).unwrap()).unwrap();
+        let dev = fake("devices/virtual/test/fake0", "test", "fake0");
+
+        mgr.udev_register(&dev);
+        let primary = "sys-devices-virtual-test-fake0.device";
+        let alias = "sys-test-fake0.device";
+        assert_eq!(mgr.units.get(primary).unwrap().active, ActiveState::Active);
+        assert_eq!(mgr.units.get(alias).unwrap().active, ActiveState::Active);
+        assert_eq!(mgr.units.get(primary).unwrap().kind, UnitKind::Device);
+        assert_eq!(mgr.units.get(primary).unwrap().load, LoadState::Loaded);
+        assert_eq!(mgr.udev_devices.len(), 1);
+
+        mgr.udev_remove(&dev);
+        assert!(!mgr.units.contains_key(primary));
+        assert!(!mgr.units.contains_key(alias));
+        assert!(mgr.udev_devices.is_empty());
     }
 }
