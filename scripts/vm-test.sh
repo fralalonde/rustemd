@@ -22,7 +22,7 @@ if [ -z "$KERNEL" ]; then
   KERNEL=$(ls -1 /lib/modules/*/vmlinuz /usr/lib/modules/*/vmlinuz 2>/dev/null | sort -V | tail -1)
 fi
 QEMU=${QEMU:-qemu-system-x86_64}
-INITRD=./initramfs.cpio.gz
+INITRD=./target/initramfs.cpio.gz
 
 if [ -z "$KERNEL" ] || [ ! -r "$KERNEL" ]; then
   echo "error: no kernel found (pass one as \$1)" >&2; exit 2

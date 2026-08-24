@@ -18,8 +18,10 @@ if [ ! -x "$BIN" ]; then
   exit 2
 fi
 
-# Temp dir under cwd, NOT /tmp — rustemd mounts a fresh /tmp and would hide it.
-D=$(mktemp -d "./.ns-boot-XXXXXX")
+# Temp dir under target/, NOT /tmp (rustemd mounts a fresh /tmp and would hide
+# it) and not the repo root (keep generated artifacts out of the tree).
+mkdir -p target
+D=$(mktemp -d "./target/.ns-boot-XXXXXX")
 trap 'rm -rf "$D"' EXIT
 mkdir -p "$D/units/default.target.wants"
 

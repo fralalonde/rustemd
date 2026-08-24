@@ -17,8 +17,9 @@ set -euo pipefail
 
 BIN=${1:-./target/release/rustemd}
 CTL=${CTL:-./target/release/rustemctl}
-OUT=${2:-./initramfs.cpio.gz}
+OUT=${2:-./target/initramfs.cpio.gz}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
+mkdir -p "$(dirname "$OUT")"
 
 [ -x "$BIN" ] || { echo "error: rustemd binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
 [ -x "$CTL" ] || { echo "error: rustemctl binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }

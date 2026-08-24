@@ -32,7 +32,7 @@ fi
 QEMU=${QEMU:-qemu-system-x86_64}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
 BIN=${BIN:-./target/release/rustemd}
-INITRD=./initramfs-live.cpio.gz
+INITRD=./target/initramfs-live.cpio.gz
 EXTRA_UNITS=${RUSTEMD_EXTRA_UNITS:-examples/live}
 
 if [ -z "$KERNEL" ] || [ ! -r "$KERNEL" ]; then

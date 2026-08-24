@@ -18,7 +18,7 @@ esac
 # Absolute — rpmbuild changes cwd into its BUILD dir, so a relative path
 # would break inside %install.
 BIN_DIR="$(pwd)/target/$TARGET/release"
-DIST="dist"
+DIST="target/dist"
 mkdir -p "$DIST"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
