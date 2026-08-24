@@ -42,12 +42,14 @@ command -v "$QEMU" >/dev/null || { echo "error: $QEMU not found" >&2; exit 2; }
 [ -n "$BUSYBOX" ] && [ -x "$BUSYBOX" ] || { echo "error: need busybox (set BUSYBOX=/path/to/busybox)" >&2; exit 2; }
 [ -d "$EXTRA_UNITS" ] || { echo "error: demo units dir $EXTRA_UNITS not found" >&2; exit 2; }
 
-# Build the PID-1 binary if it isn't there yet (boot feature mounts the API
-# filesystems itself; our /init also does it, so the initramfs is explicit).
-if [ ! -x "$BIN" ]; then
-  echo "building $BIN (cargo build --release --features boot)..."
-  cargo build --release --features boot
-fi
+# Always (re)build the PID-1 binary with the `boot` feature. Cargo is
+# incremental, so this is a fast no-op when up to date — but it guarantees a
+# stale default build (no `boot`) is never silently reused. The `boot`
+# feature mounts the API filesystems itself; our /init also does it, so the
+# initramfs is explicit. The `--features boot` at the workspace root applies
+# `boot` to rustemd and is ignored by rustemctl/rustemd-tui.
+echo "building $BIN (cargo build --release --features boot)..."
+cargo build --release --features boot
 
 # Build the live initramfs: demo units enabled at boot, no auto-poweroff.
 export BUSYBOX RUSTEMD_EXTRA_UNITS="$EXTRA_UNITS" RUSTEMD_NO_BOOTTEST=1

@@ -6,6 +6,13 @@
 set -uo pipefail
 
 BIN=${1:-./target/release/rustemd}
+
+# Always (re)build the PID-1 binary with the `boot` feature (incremental, so
+# a fast no-op when current). This guarantees a stale default build is never
+# reused when $BIN is the default path; a caller-supplied $1 is still honored
+# as-is below.
+cargo build --release --features boot
+
 if [ ! -x "$BIN" ]; then
   echo "error: need a rustemd binary (build with: cargo build --release --features boot)" >&2
   exit 2

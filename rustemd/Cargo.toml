@@ -9,7 +9,8 @@ rust-version = "1.85"
 [features]
 default = ["socket", "udev"]
 # Linux PID-1 boot support: mount the API/virtual filesystems, run early-boot
-# configuration, and instantiate template units (getty@tty1 -> getty@.service).
+# configuration (hostname, machine-id, sysctl, modules, tmpfiles, fstab), and
+# power the machine off on shutdown.
 boot = []
 # Socket activation: `.socket` units that bind listening sockets and activate a
 # matching `.service` on the first connection (inetd-style, via LISTEN_FDS).

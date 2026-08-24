@@ -1175,6 +1175,7 @@ dependencies = [
  "clap_complete",
  "clap_complete_nushell",
  "colored",
+ "libc",
  "nix",
  "rustemd",
  "serde_json",

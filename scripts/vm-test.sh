@@ -28,6 +28,13 @@ if [ -z "$KERNEL" ] || [ ! -r "$KERNEL" ]; then
   echo "error: no kernel found (pass one as \$1)" >&2; exit 2
 fi
 command -v "$QEMU" >/dev/null || { echo "error: $QEMU not found" >&2; exit 2; }
+
+# Always (re)build the PID-1 binary with the `boot` feature (incremental, so
+# a fast no-op when current). Guarantees a stale default build is never
+# reused — without `boot` the getty template doesn't resolve and no prompt
+# appears. The `boot` feature is ignored by rustemctl/rustemd-tui.
+cargo build --release --features boot
+
 [ -f "$INITRD" ] || { echo "building initramfs..."; scripts/build-initramfs.sh; }
 
 LOG=$(mktemp)

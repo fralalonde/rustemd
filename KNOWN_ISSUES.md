@@ -14,12 +14,15 @@ Nothing here blocks the current dogfood scope; it is triage material.
 
 ## Bugs
 
-### CLI panics on a broken stdout pipe
-`rustemctl list-units | head` (any command whose stdout pipe closes early) panics
-instead of exiting cleanly. Rust's runtime ignores `SIGPIPE` by default, so
-`println!` surfaces `EPIPE` and the CLI unwraps it into a panic; `systemctl`
-dies silently (the default `SIGPIPE` action). Fix: restore the `SIGPIPE`
-default disposition early in `main`, or handle `EPIPE` at the write sites.
+### ~~CLI panics on a broken stdout pipe~~ — fixed (rustemctl)
+`rustemctl list-units | head` (any command whose stdout pipe closes early) used
+to panic instead of exiting cleanly. Rust's runtime ignores `SIGPIPE` by
+default, so `println!` surfaced `EPIPE` and the CLI unwrapped it into a panic;
+`systemctl` dies silently (the default `SIGPIPE` action). Fixed by restoring
+the `SIGPIPE` default disposition (`libc::signal(SIGPIPE, SIG_DFL)`) early in
+`rustemctl/src/main.rs`; the CLI now dies via `SIGPIPE` (exit 141) like
+systemd. See also the design hole below — the daemon/IPC write paths still
+make the same assumption.
 
 ### Timer re-arm fires units that were never started
 `OnUnitActiveSec` / `OnUnitInactiveSec` / `OnCalendar` re-arm and fire even

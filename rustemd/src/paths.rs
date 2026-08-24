@@ -109,20 +109,19 @@ impl Paths {
                 return Some(p);
             }
         }
-        #[cfg(feature = "boot")]
-        {
-            // Template instantiation: `getty@tty1.service` -> `getty@.service`.
-            // The requested name is still used for specifier expansion, so
-            // `%i` = "tty1", `%p` = "getty".
-            if let Some(at) = name.find('@') {
-                if let Some(dot) = name.rfind('.') {
-                    if dot > at {
-                        let tmpl = format!("{}.{}", &name[..=at], &name[dot + 1..]);
-                        for dir in &self.unit_path {
-                            let p = dir.join(&tmpl);
-                            if p.is_file() {
-                                return Some(p);
-                            }
+        // Template instantiation: `getty@tty1.service` -> `getty@.service`.
+        // This is a CORE unit-loading behavior (not PID-1 boot behavior), so
+        // it always compiles — the getty prompt must never silently vanish
+        // because of a feature flag. The requested name is still used for
+        // specifier expansion, so `%i` = "tty1", `%p` = "getty".
+        if let Some(at) = name.find('@') {
+            if let Some(dot) = name.rfind('.') {
+                if dot > at {
+                    let tmpl = format!("{}.{}", &name[..=at], &name[dot + 1..]);
+                    for dir in &self.unit_path {
+                        let p = dir.join(&tmpl);
+                        if p.is_file() {
+                            return Some(p);
                         }
                     }
                 }
@@ -232,7 +231,6 @@ mod tests {
         assert!(paths.find_unit("nope.service").is_none());
     }
 
-    #[cfg(feature = "boot")]
     #[test]
     fn template_instantiation() {
         let d = tempfile::tempdir().unwrap();
