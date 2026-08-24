@@ -30,13 +30,14 @@ class Rustemd < Formula
   end
 
   def install
-    bin.install "bin/rustemd", "bin/rustemd-tui"
-    bash_completion.install "completions/rustemd.bash" => "rustemd"
-    zsh_completion.install "completions/_rustemd"
-    fish_completion.install "completions/rustemd.fish"
+    bin.install "bin/rustemd", "bin/rustemctl", "bin/rustemd-tui"
+    bash_completion.install "completions/rustemctl.bash" => "rustemctl"
+    zsh_completion.install "completions/_rustemctl"
+    fish_completion.install "completions/rustemctl.fish"
   end
 
   test do
     assert_match "rustemd", shell_output("#{bin}/rustemd --version")
+    assert_match "rustemctl", shell_output("#{bin}/rustemctl --version")
   end
 end

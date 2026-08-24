@@ -73,6 +73,7 @@ jobs:
           $stage = "dist/rustemd-$ver-x86_64-pc-windows-msvc"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "$bin/rustemd.exe" $stage
+          Copy-Item "$bin/rustemctl.exe" $stage
           Copy-Item "$bin/rustemd-tui.exe" $stage
           Set-Content -Path "$stage/VERSION.txt" -Value $ver
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/rustemd-$ver-x86_64-pc-windows-msvc.zip"
@@ -115,10 +116,11 @@ jobs:
           stage="dist/rustemd-$ver-aarch64-apple-darwin"
           mkdir -p "$stage/bin" "$stage/completions"
           install -m 0755 "$bin/rustemd"     "$stage/bin/rustemd"
+          install -m 0755 "$bin/rustemctl"   "$stage/bin/rustemctl"
           install -m 0755 "$bin/rustemd-tui" "$stage/bin/rustemd-tui"
-          "$bin/rustemd" completions bash       > "$stage/completions/rustemd.bash"
-          "$bin/rustemd" completions zsh        > "$stage/completions/_rustemd"
-          "$bin/rustemd" completions fish       > "$stage/completions/rustemd.fish"
+          "$bin/rustemctl" completions bash       > "$stage/completions/rustemctl.bash"
+          "$bin/rustemctl" completions zsh        > "$stage/completions/_rustemctl"
+          "$bin/rustemctl" completions fish       > "$stage/completions/rustemctl.fish"
           printf '%s\n' "$ver" > "$stage/VERSION"
           tar -C dist -czf "dist/rustemd-$ver-aarch64-apple-darwin.tar.gz" "rustemd-$ver-aarch64-apple-darwin"
 
@@ -126,8 +128,9 @@ jobs:
           dmgroot="$(mktemp -d)"
           mkdir -p "$dmgroot/rustemd"
           install -m 0755 "$bin/rustemd"     "$dmgroot/rustemd/rustemd"
+          install -m 0755 "$bin/rustemctl"   "$dmgroot/rustemd/rustemctl"
           install -m 0755 "$bin/rustemd-tui" "$dmgroot/rustemd/rustemd-tui"
-          printf 'Copy rustemd and rustemd-tui to /usr/local/bin.\n' > "$dmgroot/rustemd/README.txt"
+          printf 'Copy rustemd, rustemctl and rustemd-tui to /usr/local/bin.\n' > "$dmgroot/rustemd/README.txt"
           hdiutil create -volname "rustemd $ver" -srcfolder "$dmgroot/rustemd" \
               -ov -format UDZO "dist/rustemd-$ver-aarch64.dmg"
       - uses: actions/upload-artifact@v4

@@ -19,6 +19,7 @@
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="Binaries" Guid="03dc31c0-b987-46ed-afa6-0716ef27367d">
         <File Id="rustemdExe" Source="rustemd.exe" />
+        <File Id="rustemctlExe" Source="rustemctl.exe" />
         <File Id="rustemdTuiExe" Source="rustemd-tui.exe" />
       </Component>
     </DirectoryRef>
