@@ -75,28 +75,31 @@ the `udev` feature's sysfs walk registers a `.device` unit per device
 (`sys-devices-…device` / `sys-<subsystem>-<name>.device`). `rustemd list-units`
 shows them; `rustemd status sys-tty-ttyS0.device` works, for example.
 
-## TUI over serial — honest status
+## TUI over serial
 
 `rustemd-tui` is ratatui/crossterm: it needs raw mode, an alternate screen and
-cursor addressing. **Over the dumb serial console it does not render.**
-Tested in the booted VM: `stty size` fails (the `ttyS0` line has no
-`TIOCGWINSZ` size, so crossterm sees a 0×0 terminal), and running
-`rustemd-tui` only emits cursor-hide/color-reset escape sequences with no
-usable frame — no visible list. The process runs (and is killed cleanly by a
-timeout) but draws nothing.
+cursor addressing. A bare serial console has no window size — `TIOCGWINSZ`
+reports 0×0, so crossterm sees a 0×0 terminal and ratatui's draw area would be
+empty. Two things make the TUI render over the serial console:
 
-**The CLI is the primary interactive path in the VM.** To use the TUI, run it
-against the daemon's control socket from a real terminal on the host (it needs
-a real TTY with a window size):
+1. **`/init` sets a real size.** The initramfs runs
+   `stty rows 24 cols 80 < /dev/ttyS0` before exec'ing rustemd, so `stty size`
+   reports `24 80` and crossterm sees a normal 80×24 terminal — the TUI needs
+   no fallback. Resize it to match your host terminal with
+   `stty rows N cols N < /dev/ttyS0`.
+2. **The TUI has a 0×0 fallback.** `init_terminal()` queries the terminal
+   size; if it is missing or 0 in either dimension it pins ratatui to a fixed
+   80×24 viewport and emits a resize, so a frame is drawn even on a terminal
+   that never got a size.
+
+Run it straight from the getty shell (`q` quits):
 
 ```sh
-# host, after starting the daemon somewhere reachable:
-rustemd-tui           # system manager (default socket path)
-rustemd-tui --user    # per-user manager
+rustemd-tui
 ```
 
-The TUI connects over the same unix control socket the CLI uses, so it works
-from any terminal with a proper TTY.
+The TUI connects over the same unix control socket the CLI uses, so it also
+works from any real terminal on the host (`rustemd-tui` / `rustemd-tui --user`).
 
 ## Notes / bugs fixed along the way
 
@@ -156,4 +159,5 @@ piped over the serial console. Observed, from the captured serial log:
   `active (running)` (`activated via socket`).
 - `rustemd poweroff` → `shutdown complete, powering off` → `reboot: Power
   down`. Clean.
-- TUI over serial does **not** render (see the section above).
+- TUI over serial **renders** a frame now that `/init` sets a size and the TUI
+  has a 0×0 fallback (see the section above).
