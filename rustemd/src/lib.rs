@@ -12,8 +12,9 @@
 //! - `daemon` — the PID-1 manager entry point (`rustemd daemon`).
 //! - `unit` — unit-file parsing and typed unit configuration.
 //! - `calendar` / `timespan` — systemd calendar expressions and time spans.
-//! - `dbus` (Linux only) — `Type=dbus`/`BusName=` activation and a manager
-//!   control interface, bridged to the poll loop over channels on a thread.
+//! - `dbus` (Linux only, opt-in `dbus` feature) — `Type=dbus`/`BusName=`
+//!   activation and a manager control interface, bridged to the poll loop
+//!   over channels on a thread.
 //!
 //! The `systemctl`-compatible CLI lives in the sibling `rustemctl` crate,
 //! which uses this library's `client`/`paths`/`enable`/`cli_style` modules.
@@ -27,7 +28,7 @@ pub mod cli_style;
 pub mod client;
 pub mod control;
 pub mod daemon;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "dbus"))]
 pub mod dbus;
 pub mod enable;
 pub mod ipc;

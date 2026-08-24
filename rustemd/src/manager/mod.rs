@@ -176,11 +176,12 @@ pub struct Manager {
     pub boot: SystemTime,
     pub boot_instant: Instant,
     pub as_pid1: bool,
-    /// D-Bus bridge (Linux only): control interface + name-ownership events.
-    #[cfg(target_os = "linux")]
+    /// D-Bus bridge (Linux, opt-in `dbus` feature): control interface +
+    /// name-ownership events.
+    #[cfg(all(target_os = "linux", feature = "dbus"))]
     dbus: Option<crate::dbus::DbusHandle>,
     /// `Type=dbus` units waiting on their `BusName=` (bus name -> unit name).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "dbus"))]
     pending_bus_names: HashMap<String, String>,
     /// Live uevent monitor (hotplug add/remove). `None` when unavailable or
     /// before [`Manager::udev_init`] runs.
@@ -217,9 +218,9 @@ impl Manager {
             boot: SystemTime::now(),
             boot_instant: Instant::now(),
             as_pid1: nix::unistd::getpid() == Pid::from_raw(1),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "dbus"))]
             dbus: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "dbus"))]
             pending_bus_names: HashMap::new(),
             #[cfg(all(target_os = "linux", feature = "udev"))]
             udev: None,
@@ -1574,7 +1575,7 @@ impl Manager {
             ActiveState::Activating => {
                 // A Type=dbus main process died before acquiring its BusName=;
                 // drop the pending watch so the name can't revive the unit.
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", feature = "dbus"))]
                 self.release_bus_name_watch(name);
                 if exit_ok {
                     self.units.get_mut(name).unwrap().set_active(
@@ -1980,7 +1981,7 @@ impl Manager {
         }
         // A Type=dbus unit that is stopped before acquiring its BusName= must
         // drop its pending name watch.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "dbus"))]
         self.release_bus_name_watch(name);
         let u = self.units.get_mut(name).unwrap();
         u.main_pid = None;
@@ -2265,7 +2266,7 @@ impl Manager {
             // Drain D-Bus commands/events queued by the dedicated D-Bus
             // thread(s). The poll timeout below is capped at ~1s, so this
             // runs at least that often even when no fd is ready.
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "dbus"))]
             self.drain_dbus();
             if self.shutting_down && self.idle() {
                 break;
@@ -2568,8 +2569,8 @@ impl Manager {
 
 impl Manager {
     /// Called when a `Type=dbus` main process has been spawned: the unit stays
-    /// `activating` until `BusName=` is acquired (Linux) or, absent D-Bus
-    /// support, until `TimeoutStartSec`.
+    /// `activating` until `BusName=` is acquired (Linux, `dbus` feature) or,
+    /// absent D-Bus support, until `TimeoutStartSec`.
     fn begin_bus_name_wait(&mut self, name: &str, bus_name: Option<&str>) {
         let Some(bn) = bus_name else {
             // Type=dbus requires BusName=; without it we can never go active.
@@ -2579,17 +2580,19 @@ impl Manager {
             return;
         };
         self.units.get_mut(name).unwrap().sub = SubState::WaitingForBus;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "dbus"))]
         self.watch_bus_name(name, bn);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "dbus")))]
         self.mgr(
             name,
-            &format!("BusName={bn} ignored: D-Bus support is Linux-only"),
+            &format!(
+                "BusName={bn} ignored: D-Bus support is disabled (build without the `dbus` feature)"
+            ),
         );
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "dbus"))]
 impl Manager {
     /// Bring up the D-Bus bridge (control interface + name-ownership
     /// monitoring) on a dedicated thread. Safe to call even when no bus is

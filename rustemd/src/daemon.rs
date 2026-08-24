@@ -102,10 +102,11 @@ pub fn run_daemon(user: bool, no_socket_activation: bool) -> i32 {
     }
     mgr.setup_signals();
 
-    // Bring up the D-Bus bridge (Linux): Type=dbus/BusName= activation plus a
-    // manager control interface. Best-effort — if the bus is unreachable the
-    // bridge logs a warning and the manager keeps running without D-Bus.
-    #[cfg(target_os = "linux")]
+    // Bring up the D-Bus bridge (Linux, opt-in `dbus` feature): Type=dbus/
+    // BusName= activation plus a manager control interface. Best-effort — if
+    // the bus is unreachable the bridge logs a warning and the manager keeps
+    // running without D-Bus.
+    #[cfg(all(target_os = "linux", feature = "dbus"))]
     if let Err(e) = mgr.start_dbus() {
         eprintln!("{}", style::warn(&format!("D-Bus: {e}")));
     }

@@ -19,12 +19,17 @@ socket = []
 # built on `nix` netlink sockets and the sysfs tree. Disable for headless /
 # non-Linux builds that don't need device ordering.
 udev = []
+# D-Bus integration: `Type=dbus`/`BusName=` service activation plus a manager
+# control interface over zbus. Opt-in (NOT in `default`) so the default build
+# is free of the zbus/zvariant/async-executor dependency tree. Linux-only.
+dbus = ["dep:zbus"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # D-Bus (Linux only): pure-Rust, no C dependency. `blocking-api` runs the
 # async machinery on internal threads, so the synchronous poll loop never
 # does async work; `async-io` is the executor backend the blocking API uses.
-zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+# Optional — pulled in only by the `dbus` feature (not in `default`).
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"], optional = true }
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

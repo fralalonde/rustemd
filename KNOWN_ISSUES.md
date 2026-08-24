@@ -42,7 +42,8 @@ Only a rustemd-specific `org.fralalonde.rustemd1.Manager` interface
 (`ListUnits`/`GetUnit`/`StartUnit`/`StopUnit`/`Version`). No per-unit object
 graph, no `org.freedesktop.DBus.Properties`, no job objects or signals — real
 D-Bus clients (logind, desktop integration, `systemctl --user` over the bus)
-won't work.
+won't work. D-Bus is also opt-in (the `dbus` cargo feature, off by default):
+builds without it omit the zbus dependency tree entirely.
 
 ### No journald
 Service stdout/stderr go to the manager's in-memory capture, not a queryable,

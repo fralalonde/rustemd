@@ -7,7 +7,8 @@ and dependency-driven lifecycle. Per-service **cgroups** (Linux cgroup v2) with
 available.
 
 > **Status:** functional core, Linux-focused. Unit parsing, service
-> supervision, timers, socket activation, a D-Bus manager interface,
+> supervision, timers, socket activation, a D-Bus manager interface
+> (opt-in `dbus` feature),
 > udev `.device` units, `.mount` units, `enable`/`disable`, a JSON IPC
 > daemon, and a `systemctl`-compatible CLI all work and are tested. No
 > journald or service sandboxing yet.
@@ -131,7 +132,7 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
   `udev` feature, default-on); no unit file, matching systemd
 - D-Bus — `org.fralalonde.rustemd1.Manager` (`ListUnits`/`GetUnit`/`StartUnit`/
   `StopUnit`/`Version`) plus `Type=dbus`/`BusName=` activation (Linux only;
-  not a `systemd1` drop-in)
+  behind the opt-in `dbus` feature, not in `default`; not a `systemd1` drop-in)
 
 **Lifecycle & supervision**
 - Dependency graph (start order from `After`/`Requires`, stop order reversed)
@@ -206,7 +207,7 @@ which depends on the library's `Control` API).
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
 | `platform` | OS-specific surface: `process` (spawn/kill/reap), `signals` (signalfd), `net` (unix sockets), `mount` (mount/umount), `udev` (sysfs/netlink devices) |
-| `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux) |
+| `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux, opt-in `dbus` feature) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
 | `daemon` | The PID-1 manager entry point (`rustemd daemon`) |
@@ -252,6 +253,11 @@ daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
   `scripts/ns-boot-test.sh` (unprivileged namespaces, no qemu),
   `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
   interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
+- **D-Bus is opt-in** — the `dbus` cargo feature pulls in zbus for
+  `Type=dbus`/`BusName=` activation and the `org.fralalonde.rustemd1.Manager`
+  control interface. Off by default to keep the default build free of the
+  zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
+  `--features dbus` to enable it.
 - **Linux/unix only** — `platform/` is `#[cfg(unix)]`; Windows/Mac are planned.
 - No journald, service sandboxing (`ProtectSystem=`, `DynamicUser=`, seccomp,
   capability/device restrictions), or `systemd-analyze`-style tooling. See
