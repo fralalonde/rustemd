@@ -203,6 +203,6 @@ Every path is overridable for tests via `RUSTEMD_UNIT_PATH`,
   `Control` API (it detects the socket; it never starts a second daemon) and
   shows tabbed live views: Units / Services / Timers / Unit files, with a
   status pane and single-key actions (`s` start, `x` stop, `r` restart, …).
-- **Completions** — `rustemd completions <bash|fish|zsh|powershell|nushell>`
+- **Completions** — `rustemctl completions <bash|fish|zsh|powershell|nushell>`
   emits a completion script for that shell, named after the invoked binary.
 

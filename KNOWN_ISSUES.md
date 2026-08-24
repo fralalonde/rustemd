@@ -15,7 +15,7 @@ Nothing here blocks the current dogfood scope; it is triage material.
 ## Bugs
 
 ### CLI panics on a broken stdout pipe
-`rustemd list-units | head` (any command whose stdout pipe closes early) panics
+`rustemctl list-units | head` (any command whose stdout pipe closes early) panics
 instead of exiting cleanly. Rust's runtime ignores `SIGPIPE` by default, so
 `println!` surfaces `EPIPE` and the CLI unwraps it into a panic; `systemctl`
 dies silently (the default `SIGPIPE` action). Fix: restore the `SIGPIPE`
@@ -72,7 +72,7 @@ but those jobs have never run — the first CI run will exercise untested
 ### Live VM has no standard shutdown commands
 Inside the live env, `shutdown` / `halt` / `poweroff` / `init 0` don't exist
 (rustemd *is* PID 1) and `exit` at the getty just respawns the shell
-(`Restart=always`). The only clean shutdown is `rustemd poweroff`. The
+(`Restart=always`). The only clean shutdown is `rustemctl poweroff`. The
 `live-vm.sh` banner documents it, but it's an easy trap.
 
 ## Design holes

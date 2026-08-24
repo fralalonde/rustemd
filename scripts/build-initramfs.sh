@@ -16,10 +16,12 @@
 set -euo pipefail
 
 BIN=${1:-./target/release/rustemd}
+CTL=${CTL:-./target/release/rustemctl}
 OUT=${2:-./initramfs.cpio.gz}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
 
 [ -x "$BIN" ] || { echo "error: rustemd binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
+[ -x "$CTL" ] || { echo "error: rustemctl binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
 [ -n "$BUSYBOX" ] && [ -x "$BUSYBOX" ] || { echo "error: need a static busybox (set BUSYBOX=/path/to/busybox)" >&2; exit 2; }
 
 STAGE=$(mktemp -d)
@@ -59,6 +61,10 @@ copy_binary() {
   done
 }
 copy_binary "$BIN" rustemd
+# The systemctl-compatible control CLI (talks to the rustemd daemon over its
+# control socket). Required: the boottest service uses it to query/stop the
+# manager, and the live env uses it to drive the PID-1 daemon by hand.
+copy_binary "$CTL" rustemctl
 # The TUI is optional (the live env is CLI-first); ship it when present so a
 # human can run `rustemd-tui` from the getty shell.
 TUI=${TUI:-./target/release/rustemd-tui}
@@ -119,7 +125,7 @@ if [ -z "${RUSTEMD_NO_BOOTTEST:-}" ]; then
 cat > "$STAGE/etc/rustemd/boottest.sh" <<'SCRIPT_EOF'
 #!/bin/sh
 sleep 1
-state=$(/usr/bin/rustemd is-active getty@ttyS0.service)
+state=$(/usr/bin/rustemctl is-active getty@ttyS0.service)
 cat > /dev/console <<EOF
 
 ==========================================
@@ -134,7 +140,7 @@ BOOTTEST getty=$state
   shutting down -- goodbye!
 
 EOF
-/usr/bin/rustemd poweroff
+/usr/bin/rustemctl poweroff
 SCRIPT_EOF
 chmod +x "$STAGE/etc/rustemd/boottest.sh"
 

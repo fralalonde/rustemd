@@ -36,7 +36,7 @@ fn req_units(req: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|v| v.as_str().map(crate::cli::normalize_unit))
+                .filter_map(|v| v.as_str().map(crate::names::normalize_unit))
                 .collect()
         })
         .unwrap_or_default()

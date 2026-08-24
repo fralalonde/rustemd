@@ -1,5 +1,5 @@
-//! `rustemd` — the init/manager binary and the `systemctl`-compatible CLI.
+//! `rustemd` — the PID-1 init/manager binary.
 
 fn main() {
-    std::process::exit(rustemd::cli::entry());
+    std::process::exit(rustemd::daemon::entry());
 }

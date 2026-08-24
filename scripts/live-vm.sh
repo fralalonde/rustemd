@@ -2,13 +2,13 @@
 # Interactive live environment: boot rustemd as PID 1 in qemu and hand the
 # serial console straight to your terminal, so you can drive the daemon by
 # hand. A busybox getty on /dev/ttyS0 gives you a shell where you can type
-# `rustemd list-units`, `rustemd start demo.service`, `rustemd status demo.mount`,
+# `rustemctl list-units`, `rustemctl start demo.service`, `rustemctl status demo.mount`,
 # `rustemd-tui`, and so on — against the real PID-1 manager.
 #
 # Unlike vm-test.sh (which redirects the console to a log and auto-powers-off
 # for CI assertions), this script passes qemu's stdin/stdout through to your
 # terminal (qemu -nographic, no redirection) and boots WITHOUT auto-poweroff.
-# You quit cleanly by typing `rustemd poweroff` at the getty shell, or force
+# You quit cleanly by typing `rustemctl poweroff` at the getty shell, or force
 # qemu to exit with Ctrl-A x.
 #
 # The initramfs installs the friendly demo units from examples/live/ (one of
@@ -64,16 +64,16 @@ cat <<EOF
   Boots rustemd as PID 1 and drops you into a getty shell on /dev/ttyS0.
 
   Try:
-    rustemd list-units
-    rustemd status demo.service demo.mount demo.socket demo.timer demo.target
-    rustemd start demo.mount && ls /mnt/demo
-    rustemd is-active demo.mount
-    rustemd list-timers
+    rustemctl list-units
+    rustemctl status demo.service demo.mount demo.socket demo.timer demo.target
+    rustemctl start demo.mount && ls /mnt/demo
+    rustemctl is-active demo.mount
+    rustemctl list-timers
     printf 'hi\n' | nc 127.0.0.1 8080     # socket-activates demo-echo.service
-    rustemd status demo-echo.service
+    rustemctl status demo-echo.service
     rustemd-tui                            # see DEMO.md — TUI over serial is limited
 
-  Quit:  rustemd poweroff   (or Ctrl-A x to force qemu to exit)
+  Quit:  rustemctl poweroff   (or Ctrl-A x to force qemu to exit)
 ============================================================
 EOF
 

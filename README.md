@@ -22,35 +22,35 @@ cargo build --release
 # Run the manager (user mode — no root needed):
 ./target/release/rustemd daemon --user
 
-# In another terminal, control it (the same binary, non-daemon mode):
-./target/release/rustemd --user list-units
-./target/release/rustemd --user start myapp.service
-./target/release/rustemd --user status myapp.service
+# In another terminal, control it with the systemctl-compatible CLI:
+./target/release/rustemctl --user list-units
+./target/release/rustemctl --user start myapp.service
+./target/release/rustemctl --user status myapp.service
 ```
 
-One binary does both jobs. To make existing `systemctl` scripts work
-unchanged, symlink it under that name:
+Two binaries split the work: `rustemd` is the PID-1 manager daemon, and
+`rustemctl` is the `systemctl`-compatible CLI that talks to it. To make
+existing `systemctl` scripts work unchanged, symlink the CLI under that name:
 
 ```sh
 ln -s /path/to/rustemd /usr/local/bin/rustemd
-ln -s /path/to/rustemd /usr/local/bin/systemctl
+ln -s /path/to/rustemctl /usr/local/bin/systemctl
 ```
 
-`rustemd` (invoked without `daemon`) is the `systemctl`-compatible CLI, so
-running it via the symlink gives you a drop-in `systemctl`.
+`rustemctl` (optionally invoked via the symlink) is a drop-in `systemctl`.
 
 ### Shell completions
 
 Generate completion scripts for your shell. Completions follow the invoked
-binary name, so `rustemd completions …` and (via the symlink)
+binary name, so `rustemctl completions …` and (via the symlink)
 `systemctl completions …` both work:
 
 ```sh
-rustemd completions bash        > ~/.bash_completion.d/rustemd
-rustemd completions fish        > ~/.config/fish/completions/rustemd.fish
-rustemd completions zsh         > ~/.zsh/completions/_rustemd
-rustemd completions powershell   # pipe into Register-ArgumentCompleter
-rustemd completions nushell
+rustemctl completions bash        > ~/.bash_completion.d/rustemctl
+rustemctl completions fish        > ~/.config/fish/completions/rustemctl.fish
+rustemctl completions zsh         > ~/.zsh/completions/_rustemctl
+rustemctl completions powershell   # pipe into Register-ArgumentCompleter
+rustemctl completions nushell
 ```
 
 ## Homebrew
@@ -63,14 +63,14 @@ brew tap fralalonde/rustemd https://github.com/fralalonde/rustemd
 brew install rustemd
 ```
 
-The formula (`Formula/rustemd.rb`) installs `rustemd` and `rustemd-tui` plus
-shell completions. It deliberately does **not** create a `systemctl` symlink —
-on a systemd host that would shadow the real `systemctl` in your PATH. To
-exercise the drop-in CLI, symlink it into a directory you keep ahead of
-`/usr/bin` only while testing:
+The formula (`Formula/rustemd.rb`) installs `rustemd`, `rustemctl`, and
+`rustemd-tui` plus shell completions. It deliberately does **not** create a
+`systemctl` symlink — on a systemd host that would shadow the real `systemctl`
+in your PATH. To exercise the drop-in CLI, symlink it into a directory you
+keep ahead of `/usr/bin` only while testing:
 
 ```sh
-ln -s "$(brew --prefix)/bin/rustemd" ~/.local/bin/systemctl
+ln -s "$(brew --prefix)/bin/rustemctl" ~/.local/bin/systemctl
 ```
 
 Refresh the formula's pinned sha256 after each release with
@@ -192,10 +192,10 @@ same types the wire protocol carries.
 
 ## Architecture
 
-This is a Cargo **workspace** with two crates: `rustemd` (the library,
-the `rustemd` daemon, and the `systemctl`-compatible CLI) and
-`rustemd-tui` (the terminal client, which depends on the library's
-`Control` API).
+This is a Cargo **workspace** with three crates: `rustemd` (the library and
+the PID-1 `rustemd` daemon), `rustemctl` (the `systemctl`-compatible control
+CLI, which depends on the library), and `rustemd-tui` (the terminal client,
+which depends on the library's `Control` API).
 
 | Module | Responsibility |
 | --- | --- |
@@ -209,9 +209,13 @@ the `rustemd` daemon, and the `systemctl`-compatible CLI) and
 | `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
-| `cli` | `systemctl`-compatible command surface |
+| `daemon` | The PID-1 manager entry point (`rustemd daemon`) |
 | `enable` | `[Install]` symlink management |
 | `paths` | System vs. user filesystem layout |
+
+The `systemctl`-compatible CLI lives in the separate `rustemctl` crate (its
+`cli` module), which consumes the library's `client`/`paths`/`enable`/
+`cli_style`/`names` modules.
 
 **Portability.** All raw Linux/unix syscalls live in `platform/` behind small,
 documented functions. Porting to a new OS means reimplementing those three
@@ -224,15 +228,15 @@ a one-line `prctl(PR_SET_CHILD_SUBREAPER)`.
 ## Testing
 
 ```sh
-cargo test            # 72 unit tests + 10 end-to-end daemon tests
+cargo test            # 72 unit tests + 10 e2e daemon tests + 1 rustemctl CLI test
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-Integration tests (`tests/e2e.rs`) boot the real manager in a thread and drive
-it over the socket with the `Control` API — starting/stopping real processes,
-checking lifecycle states, and round-tripping `enable`/`disable` — against a
-scratch filesystem via the `RUSTEMD_*` env hooks.
+Integration tests boot the real manager and drive it over the socket —
+`rustemd/tests/e2e.rs` uses the programmatic `Control` API, and
+`rustemctl/tests/cli.rs` runs the compiled `rustemctl` binary against the
+daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
 
 ---
 

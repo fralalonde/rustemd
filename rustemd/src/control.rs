@@ -179,7 +179,7 @@ impl Control for Manager {
     fn kill(&mut self, unit: &str, signal: &str) -> Result<(), Error> {
         let sig = crate::unit::sig_from_name(signal)
             .ok_or_else(|| Error(format!("unknown signal `{signal}`")))?;
-        self.kill(&crate::cli::normalize_unit(unit), sig)
+        self.kill(&crate::names::normalize_unit(unit), sig)
             .map_err(Error)
     }
     fn reload_daemon(&mut self) -> Result<(), Error> {
@@ -303,7 +303,7 @@ impl Control for SocketClient {
         Ok(())
     }
     fn kill(&mut self, unit: &str, signal: &str) -> Result<(), Error> {
-        let unit = crate::cli::normalize_unit(unit);
+        let unit = crate::names::normalize_unit(unit);
         self.call(serde_json::json!({ "op": "kill", "units": [unit], "signal": signal }))?;
         Ok(())
     }
@@ -312,11 +312,11 @@ impl Control for SocketClient {
         Ok(())
     }
     fn isolate(&mut self, unit: &str) -> Result<(), Error> {
-        self.op_name("isolate", &crate::cli::normalize_unit(unit))?;
+        self.op_name("isolate", &crate::names::normalize_unit(unit))?;
         Ok(())
     }
     fn set_default(&mut self, unit: &str) -> Result<(), Error> {
-        self.op_name("set_default", &crate::cli::normalize_unit(unit))?;
+        self.op_name("set_default", &crate::names::normalize_unit(unit))?;
         Ok(())
     }
 
@@ -393,7 +393,7 @@ impl Control for SocketClient {
 fn normalize(units: &[&str]) -> Vec<String> {
     units
         .iter()
-        .map(|u| crate::cli::normalize_unit(u))
+        .map(|u| crate::names::normalize_unit(u))
         .collect()
 }
 

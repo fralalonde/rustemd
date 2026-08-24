@@ -27,17 +27,17 @@ Inside the VM you land on a busybox getty (`/dev/ttyS0`, shell is `/bin/sh`).
 Try:
 
 ```sh
-rustemd list-units                      # see .device units appear (udev)
-rustemd status demo.service demo.mount demo.socket demo.timer demo.target
-rustemd start demo.mount && ls /mnt/demo
-rustemd is-active demo.mount
-rustemd list-timers
+rustemctl list-units                      # see .device units appear (udev)
+rustemctl status demo.service demo.mount demo.socket demo.timer demo.target
+rustemctl start demo.mount && ls /mnt/demo
+rustemctl is-active demo.mount
+rustemctl list-timers
 printf 'hi\n' | nc 127.0.0.1 8080          # socket-activates demo-echo.service
-rustemd status demo-echo.service
-rustemd poweroff                        # clean shutdown
+rustemctl status demo-echo.service
+rustemctl poweroff                        # clean shutdown
 ```
 
-Quit at any time with `rustemd poweroff`, or force qemu to exit with `Ctrl-A x`
+Quit at any time with `rustemctl poweroff`, or force qemu to exit with `Ctrl-A x`
 (`-nographic` multiplexes qemu's monitor onto the same keys).
 
 ## The demo units (`examples/live/`)
@@ -72,8 +72,8 @@ There is deliberately **no `.device` unit file** — systemd (and rustemd) deriv
 device units from the kernel, not from disk. The live env's `/init` mounts
 `/proc`, `/sys` (sysfs) and `/dev` (devtmpfs) before exec'ing the daemon, so
 the `udev` feature's sysfs walk registers a `.device` unit per device
-(`sys-devices-…device` / `sys-<subsystem>-<name>.device`). `rustemd list-units`
-shows them; `rustemd status sys-tty-ttyS0.device` works, for example.
+(`sys-devices-…device` / `sys-<subsystem>-<name>.device`). `rustemctl list-units`
+shows them; `rustemctl status sys-tty-ttyS0.device` works, for example.
 
 ## TUI over serial — honest status
 
@@ -144,16 +144,16 @@ The live env was booted for real in qemu (KVM, `-nographic`) with commands
 piped over the serial console. Observed, from the captured serial log:
 
 - `rustemd manager started` and a getty shell on `/dev/ttyS0` responds.
-- `rustemd list-units` shows every demo unit in the right state at boot:
+- `rustemctl list-units` shows every demo unit in the right state at boot:
   `demo.mount active(mounted)`, `demo.service active(exited)`,
   `demo.socket active(running)`, `demo.timer active`, `demo.target active`,
   `getty@ttyS0.service active(running)`.
 - `udev: 325 devices → 650 .device units` — real `.device` units appear.
-- `rustemd status demo.mount` → `Active: active (mounted)`; `/mnt/demo` exists.
+- `rustemctl status demo.mount` → `Active: active (mounted)`; `/mnt/demo` exists.
 - The timer fires: `[demo.timer] triggered demo-tick.service`, then
   `[rustemd demo] tick from demo-tick.service`.
 - Socket activation: `nc -z 127.0.0.1 8080` → `demo-echo.service` goes
   `active (running)` (`activated via socket`).
-- `rustemd poweroff` → `shutdown complete, powering off` → `reboot: Power
+- `rustemctl poweroff` → `shutdown complete, powering off` → `reboot: Power
   down`. Clean.
 - TUI over serial does **not** render (see the section above).

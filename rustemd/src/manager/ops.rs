@@ -293,7 +293,7 @@ impl Manager {
 
     /// `isolate`: stop everything not required by `name`, then start it.
     pub fn isolate(&mut self, name: &str) -> Result<(), String> {
-        let name = crate::cli::normalize_unit(name);
+        let name = crate::names::normalize_unit(name);
         let names: Vec<String> = self
             .units
             .iter()

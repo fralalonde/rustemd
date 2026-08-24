@@ -26,8 +26,8 @@ trap 'kill "$DAEMON_PID" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
 sleep 1
 
 # Pre-arm state so the recording shows color and a live timer countdown.
-./target/release/rustemd --user enable app.service backup.timer >/dev/null 2>&1 || true
-./target/release/rustemd --user start backup.timer >/dev/null 2>&1 || true
+./target/release/rustemctl --user enable app.service backup.timer >/dev/null 2>&1 || true
+./target/release/rustemctl --user start backup.timer >/dev/null 2>&1 || true
 
 vhs demo/demo.tape
 echo "wrote docs/demo.gif"

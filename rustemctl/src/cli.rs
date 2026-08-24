@@ -1,7 +1,7 @@
-//! The `systemctl`-compatible command surface. A single binary serves both
-//! the manager daemon (`daemon` subcommand / `rustemd --system`) and the
-//! control CLI (everything else). Invoking the binary as `systemctl`
-//! (symlink) also enters CLI mode.
+//! The `systemctl`-compatible command surface. `rustemctl` is the control
+//! CLI that talks to a running `rustemd` manager over its control socket;
+//! the daemon itself lives in the `rustemd` crate. Invoking `rustemctl` as
+//! `systemctl` (symlink) also enters CLI mode.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -10,18 +10,10 @@ use colored::Colorize;
 use serde_json::{Value, json};
 use std::io::Write;
 
-use crate::cli_style as style;
-use crate::client::Client;
-use crate::paths::Paths;
-
-/// Append `.service` when a unit name has no type suffix.
-pub fn normalize_unit(name: &str) -> String {
-    if name.contains('.') {
-        name.to_string()
-    } else {
-        format!("{name}.service")
-    }
-}
+use rustemd::cli_style as style;
+use rustemd::client::Client;
+use rustemd::names::normalize_unit;
+use rustemd::paths::Paths;
 
 fn normalize_units(names: &[String]) -> Vec<String> {
     names.iter().map(|n| normalize_unit(n)).collect()
@@ -29,9 +21,9 @@ fn normalize_units(names: &[String]) -> Vec<String> {
 
 #[derive(Parser)]
 #[command(
-    name = "rustemd",
-    version = crate::VERSION,
-    about = "A systemd init reimplementation: unit manager + systemctl-compatible CLI"
+    name = "rustemctl",
+    version = rustemd::VERSION,
+    about = "systemctl-compatible control CLI for the rustemd unit manager"
 )]
 pub struct Cli {
     /// Talk to the per-user manager instead of the system one.
@@ -47,14 +39,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the manager daemon (init). `rustemd daemon --user`.
-    #[command(name = "daemon", hide = true)]
-    Daemon {
-        /// Disable socket activation: load `.socket` units but bind/listen nothing.
-        #[arg(long)]
-        no_socket_activation: bool,
-    },
-
     /// Start (activate) one or more units.
     Start { units: Vec<String> },
     /// Stop (deactivate) one or more units.
@@ -176,13 +160,8 @@ pub enum Shell {
 
 pub fn run(cli: Cli) -> i32 {
     let res = match &cli.cmd {
-        Command::Daemon {
-            no_socket_activation,
-        } => {
-            return run_daemon(cli.user, *no_socket_activation);
-        }
         Command::Version => {
-            println!("rustemd {}", crate::VERSION);
+            println!("rustemctl {}", rustemd::VERSION);
             return 0;
         }
         command => dispatch(&cli, command),
@@ -206,7 +185,6 @@ fn paths(user: bool) -> Result<Paths, String> {
 
 fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
     match cmd {
-        Command::Daemon { .. } => unreachable!(),
         Command::Version => Ok(0),
         Command::Start { units } => units_op(cli, "start", units).map(|_| 0),
         Command::Stop { units } => units_op(cli, "stop", units).map(|_| 0),
@@ -217,7 +195,7 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             let client = Client::for_mode(cli.user)?;
             let sig = signal
                 .as_deref()
-                .and_then(crate::unit::sig_from_name)
+                .and_then(rustemd::unit::sig_from_name)
                 .unwrap_or(nix::sys::signal::Signal::SIGTERM);
             client
                 .op_with(
@@ -298,7 +276,7 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
 
 /// Generate a shell completion script for the invoked binary. Derives the
 /// program name from `argv[0]` so `systemctl completions bash` emits
-/// completions for `systemctl`, not the internal `rustemd` name.
+/// completions for `systemctl`, not the internal `rustemctl` name.
 fn cmd_completions(shell: Shell) {
     let mut cmd = Cli::command();
     let name = std::env::args()
@@ -391,7 +369,7 @@ fn cmd_is_enabled(cli: &Cli, units: &[String]) -> Result<i32, String> {
     let paths = paths(cli.user)?;
     let mut worst = 0;
     for u in units {
-        let state = crate::enable::enabled_state(&paths, u);
+        let state = rustemd::enable::enabled_state(&paths, u);
         println!("{state}");
         worst = worst.max(match state.as_str() {
             "not-found" => 3,
@@ -406,7 +384,7 @@ fn cmd_enable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
     let paths = paths(cli.user)?;
     for u in units {
         let norm = normalize_unit(u);
-        let msgs = crate::enable::enable(&paths, &norm)?;
+        let msgs = rustemd::enable::enable(&paths, &norm)?;
         for m in msgs {
             println!("{}", style::ok(&m));
         }
@@ -428,7 +406,7 @@ fn cmd_disable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
     let paths = paths(cli.user)?;
     for u in units {
         let norm = normalize_unit(u);
-        let msgs = crate::enable::disable(&paths, &norm)?;
+        let msgs = rustemd::enable::disable(&paths, &norm)?;
         for m in msgs {
             println!("{}", style::ok(&m));
         }
@@ -521,7 +499,7 @@ fn fmt_epoch(secs: u64) -> String {
     format!(
         "{}; {}",
         s,
-        crate::timespan::fmt_ago(std::time::Duration::from_secs(ago))
+        rustemd::timespan::fmt_ago(std::time::Duration::from_secs(ago))
     )
 }
 
@@ -605,7 +583,7 @@ fn cmd_list_timers(cli: &Cli, no_legend: bool, _all: bool) -> Result<i32, String
             .map(|d| {
                 format!(
                     "{} left",
-                    crate::timespan::fmt_left(std::time::Duration::from_secs(d.max(0) as u64))
+                    rustemd::timespan::fmt_left(std::time::Duration::from_secs(d.max(0) as u64))
                 )
             })
             .unwrap_or_else(String::new);
@@ -618,7 +596,7 @@ fn cmd_list_timers(cli: &Cli, no_legend: bool, _all: bool) -> Result<i32, String
             .get("last_passed")
             .and_then(Value::as_i64)
             .filter(|d| *d >= 0)
-            .map(|d| crate::timespan::fmt_ago(std::time::Duration::from_secs(d as u64)))
+            .map(|d| rustemd::timespan::fmt_ago(std::time::Duration::from_secs(d as u64)))
             .unwrap_or_else(String::new);
         println!(
             "{:<26} {:<12} {:<26} {:<12} {:<20} {}",
@@ -680,94 +658,8 @@ fn cmd_show(
     Ok(0)
 }
 
-// ---- daemon ------------------------------------------------------------
-
-pub fn run_daemon(user: bool, no_socket_activation: bool) -> i32 {
-    // PID 1 boot: mount the API/virtual filesystems and run early-boot
-    // configuration *before* reading the manager config, so the manager sees
-    // the real hostname and a mounted /run (needed to bind its control
-    // socket). Only compiled with the `boot` feature.
-    #[cfg(feature = "boot")]
-    if nix::unistd::getpid() == nix::unistd::Pid::from_raw(1) {
-        if let Err(e) = crate::platform::boot::mount_api_filesystems() {
-            eprintln!("rustemd: mount API filesystems failed: {e}");
-        }
-        crate::platform::boot::early_boot();
-    }
-
-    let mut cfg = match crate::manager::ManagerCfg::for_mode(user) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 1;
-        }
-    };
-    cfg.socket_activation = !no_socket_activation;
-    let mut mgr = match crate::manager::Manager::new(cfg) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 1;
-        }
-    };
-    let errs = mgr.load_all();
-    for e in &errs {
-        eprintln!("{}", style::warn(&format!("[load] {e}")));
-    }
-
-    // Discover kernel devices and begin monitoring uevents, so that
-    // `After=sys-…device` / `Requires=sys-…device` ordering resolves before
-    // the default target (and its dependencies) start.
-    #[cfg(all(target_os = "linux", feature = "udev"))]
-    mgr.udev_init();
-
-    if !mgr.as_pid1 && !user {
-        // Become a subreaper so orphaned daemonized children reparent to us.
-        #[cfg(target_os = "linux")]
-        nix::sys::prctl::set_child_subreaper(true).ok();
-    }
-
-    if let Err(e) = mgr.bind_ipc() {
-        eprintln!("Failed to bind control socket: {e}");
-        return 1;
-    }
-    if let Err(e) = mgr.bind_notify() {
-        eprintln!("Failed to bind notify socket: {e}");
-        return 1;
-    }
-    mgr.setup_signals();
-
-    // Bring up the D-Bus bridge (Linux): Type=dbus/BusName= activation plus a
-    // manager control interface. Best-effort — if the bus is unreachable the
-    // bridge logs a warning and the manager keeps running without D-Bus.
-    #[cfg(target_os = "linux")]
-    if let Err(e) = mgr.start_dbus() {
-        eprintln!("{}", style::warn(&format!("D-Bus: {e}")));
-    }
-
-    if mgr.as_pid1 || !user {
-        // Boot into the default target.
-        let _ = mgr.start("default.target");
-    } else {
-        let _ = mgr.start("default.target");
-    }
-    eprintln!("rustemd {} manager started", crate::VERSION);
-    mgr.run();
-    // Shutdown complete. As PID 1, power the machine off; elsewhere just exit.
-    #[cfg(feature = "boot")]
-    if nix::unistd::getpid() == nix::unistd::Pid::from_raw(1) {
-        eprintln!("rustemd: shutdown complete, powering off");
-        crate::platform::boot::poweroff();
-    }
-    0
-}
-
-pub fn parse_version() {
-    println!("rustemd {}", crate::VERSION);
-}
-
 /// Parse argv and run; returns the process exit code. Used by both the
-/// `rustemd` and `systemctl` binaries (symlink drop-in).
+/// `rustemctl` and `systemctl` binaries (symlink drop-in).
 pub fn entry() -> i32 {
     match Cli::try_parse() {
         Ok(cli) => run(cli),

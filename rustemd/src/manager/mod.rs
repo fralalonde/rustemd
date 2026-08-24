@@ -2651,17 +2651,17 @@ impl Manager {
                 DbReply::UnitList(rows)
             }
             DbOp::GetUnit(name) => {
-                DbReply::Unit(self.dbus_entry(&crate::cli::normalize_unit(name)))
+                DbReply::Unit(self.dbus_entry(&crate::names::normalize_unit(name)))
             }
             DbOp::StartUnit(name) => {
-                let n = crate::cli::normalize_unit(name);
+                let n = crate::names::normalize_unit(name);
                 match self.start(&n) {
                     Ok(()) => DbReply::UnitStarted,
                     Err(e) => DbReply::Error(e),
                 }
             }
             DbOp::StopUnit(name) => {
-                let n = crate::cli::normalize_unit(name);
+                let n = crate::names::normalize_unit(name);
                 match self.stop(&n) {
                     Ok(()) => DbReply::UnitStopped,
                     Err(e) => DbReply::Error(e),

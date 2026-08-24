@@ -1,0 +1,24 @@
+[package]
+name = "rustemctl"
+version = "0.1.0"
+edition = "2024"
+description = "The systemctl-compatible control CLI for the rustemd init manager."
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+rustemd = { path = "../rustemd" }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_complete_nushell = "4.6.2"
+serde_json = "1"
+colored = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+nix = { version = "0.31.3", features = ["signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rustemctl"
+path = "src/main.rs"

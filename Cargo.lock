@@ -1167,13 +1167,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustemd"
+name = "rustemctl"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
  "clap_complete",
  "clap_complete_nushell",
+ "colored",
+ "nix",
+ "rustemd",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "rustemd"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
  "colored",
  "libc",
  "nix",
