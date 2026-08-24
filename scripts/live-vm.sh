@@ -71,7 +71,7 @@ cat <<EOF
     rustemctl list-timers
     printf 'hi\n' | nc 127.0.0.1 8080     # socket-activates demo-echo.service
     rustemctl status demo-echo.service
-    rustemd-tui                            # see DEMO.md — TUI over serial is limited
+    rustemd-tui                            # renders over serial (see DEMO.md)
 
   Quit:  rustemctl poweroff   (or Ctrl-A x to force qemu to exit)
 ============================================================

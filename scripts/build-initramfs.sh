@@ -98,6 +98,11 @@ mkdir -p /mnt/demo
 # Bring up loopback so TCP `.socket` demo units (ListenStream=127.0.0.1:…) are
 # reachable from the getty shell; the kernel leaves lo DOWN on a fresh boot.
 ip link set lo up 2>/dev/null
+# Give the serial console a window size so `stty size` reports non-zero and
+# the TUI needs no 0×0 fallback. A bare serial line has no TIOCGWINSZ, so
+# crossterm would otherwise see a 0×0 terminal. Resize it from the getty shell
+# with `stty rows N cols N < /dev/ttyS0` to match the host terminal.
+stty rows 24 cols 80 < /dev/ttyS0 2>/dev/null || true
 exec /usr/bin/rustemd daemon
 EOF
 chmod +x "$STAGE/init"
