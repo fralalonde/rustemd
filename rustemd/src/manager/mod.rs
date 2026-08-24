@@ -810,9 +810,26 @@ impl Manager {
         // while this job's `waiting` list is still uncommitted, so a wait entry
         // pushed for them would never be removed and would block this job
         // forever. Drop any entry whose job is no longer pending.
+        //
+        // But first: a *required* dependency that finished synchronously in a
+        // non-active state has failed (e.g. a `Requires=` mount that hit EPERM).
+        // `on_job_completed` could not propagate that failure — `waiting` was
+        // not yet committed when it ran — so fail this job here to mirror its
+        // required-dependency handling instead of silently treating the dead
+        // dependency as satisfied.
+        let sync_failed = waiting
+            .iter()
+            .find(|w| {
+                w.required && !self.unit_job.contains_key(&w.unit) && !self.unit_active(&w.unit)
+            })
+            .map(|w| w.unit.clone());
         waiting.retain(|w| self.unit_job.contains_key(&w.unit));
 
         if let Some(j) = self.jobs.get_mut(&id) {
+            if let Some(dep) = sync_failed {
+                j.failed = true;
+                j.failed_msg = Some(format!("Dependency failed: {dep}"));
+            }
             j.waiting = waiting;
             j.expanding = false;
         }
@@ -2926,5 +2943,41 @@ mod tests {
         assert_eq!(mgr.units["a.target"].active, ActiveState::Active);
         assert!(!mgr.units.contains_key("graphical.target"));
         assert!(!mgr.units.contains_key("missing.service"));
+    }
+
+    /// A `Requires=` dependency that fails *synchronously* (its job completes
+    /// inside the parent's `expand_start_job`, e.g. a `.mount` whose `mount(2)`
+    /// returns EPERM/ENOENT) must fail the parent — not hang, and not silently
+    /// succeed. Regression test for the `waiting.retain` sync-failure handling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_dependency_that_fails_synchronously_fails_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(
+            units.join("a.target"),
+            "[Unit]\nDescription=parent\nRequires=b.mount\n",
+        )
+        .unwrap();
+        // `Where=` points at a directory we never create, so mount(2) fails
+        // (ENOENT) deterministically — regardless of whether we run as root.
+        let mnt = dir.path().join("mnt");
+        std::fs::write(
+            units.join("b.mount"),
+            format!("[Mount]\nWhat=tmpfs\nWhere={}\nType=tmpfs\n", mnt.display()),
+        )
+        .unwrap();
+
+        let mut mgr = Manager::new(scratch_cfg(&dir)).unwrap();
+        mgr.load_all();
+        mgr.start("a.target").unwrap();
+
+        assert_eq!(mgr.units["b.mount"].active, ActiveState::Failed);
+        assert_eq!(mgr.units["a.target"].active, ActiveState::Inactive);
+        assert!(
+            !mgr.unit_job.contains_key("a.target"),
+            "parent job must resolve (fail), not hang on a dead dependency"
+        );
     }
 }

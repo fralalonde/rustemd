@@ -7,9 +7,10 @@ and dependency-driven lifecycle. Per-service **cgroups** (Linux cgroup v2) with
 available.
 
 > **Status:** functional core, Linux-focused. Unit parsing, service
-> supervision, timers, `enable`/`disable`, a JSON IPC daemon, and a
-> `systemctl`-compatible CLI all work and are tested. No journald,
-> no socket/dbus activation yet.
+> supervision, timers, socket activation, a D-Bus manager interface,
+> udev `.device` units, `.mount` units, `enable`/`disable`, a JSON IPC
+> daemon, and a `systemctl`-compatible CLI all work and are tested. No
+> journald or service sandboxing yet.
 
 ---
 
@@ -101,7 +102,7 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
 ## What's implemented
 
 **Unit files** (`systemd.syntax`-style)
-- `[Unit]` / `[Service]` / `[Install]` / `[Timer]` sections
+- `[Unit]` / `[Service]` / `[Socket]` / `[Mount]` / `[Timer]` / `[Install]` sections
 - `Description`, `After`, `Requires`, `Wants`, `Conflicts`
 - `ExecStart` (multiple, with `-`/`@`/`+` prefixes), `ExecStartPre`,
   `ExecStartPost`, `ExecStop`, `ExecReload`, `ExecStart=-…`
@@ -120,6 +121,17 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
   `Mon..Fri 09:00`, `*:0/15`, `daily`, `weekly`, ranges, steps, lists)
 - `OnBootSec=`, `OnUnitActiveSec=`, `OnUnitInactiveSec=`, `OnStartupSec=`
 - `Persistent=`, `AccuracySec=`
+
+**Socket activation, mounts, & devices**
+- `.socket` units — `ListenStream=`/`ListenDatagram=`, inetd-style activation
+  via `LISTEN_FDS`, `Service=` target (the `socket` feature, default-on)
+- `.mount` units — `[Mount]` `What=`/`Where=`/`Type=`/`Options=`, mount on
+  start / unmount on stop (Linux only)
+- `.device` units — runtime-generated from sysfs + netlink uevents (the
+  `udev` feature, default-on); no unit file, matching systemd
+- D-Bus — `org.fralalonde.rustemd1.Manager` (`ListUnits`/`GetUnit`/`StartUnit`/
+  `StopUnit`/`Version`) plus `Type=dbus`/`BusName=` activation (Linux only;
+  not a `systemd1` drop-in)
 
 **Lifecycle & supervision**
 - Dependency graph (start order from `After`/`Requires`, stop order reversed)
@@ -189,11 +201,12 @@ the `rustemd` daemon, and the `systemctl`-compatible CLI) and
 | --- | --- |
 | `unit` | Unit-file parser + typed unit configuration |
 | `calendar` / `timespan` | systemd calendar expressions & time spans |
-| `manager` | The daemon: unit table, state machine, process supervision, timers |
+| `manager` | The daemon: unit table, state machine, process supervision, timers, socket activation, mounts, udev devices |
 | `manager::ops` | Typed operations shared by IPC and the `Control` API |
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
-| `platform` | OS-specific surface: `process` (spawn/kill/reap), `signals` (signalfd), `net` (unix sockets) |
+| `platform` | OS-specific surface: `process` (spawn/kill/reap), `signals` (signalfd), `net` (unix sockets), `mount` (mount/umount), `udev` (sysfs/netlink devices) |
+| `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
 | `cli` | `systemctl`-compatible command surface |
@@ -211,7 +224,7 @@ a one-line `prctl(PR_SET_CHILD_SUBREAPER)`.
 ## Testing
 
 ```sh
-cargo test            # 50 unit tests + 2 end-to-end daemon tests
+cargo test            # 72 unit tests + 10 end-to-end daemon tests
 cargo clippy -- -D warnings
 cargo fmt --check
 ```
@@ -232,10 +245,13 @@ scratch filesystem via the `RUSTEMD_*` env hooks.
   `/proc`/`/sys`/`/dev`/`/run`/`cgroup2`, early-boot config (hostname, sysctl,
   modules, fstab), template units (`getty@tty1`), and `reboot(2)` power-off.
   Off by default — a container runtime does this for you. Test it with
-  `scripts/ns-boot-test.sh` (unprivileged namespaces, no qemu) or
-  `scripts/vm-test.sh` (qemu + initramfs).
+  `scripts/ns-boot-test.sh` (unprivileged namespaces, no qemu),
+  `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
+  interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
 - **Linux/unix only** — `platform/` is `#[cfg(unix)]`; Windows/Mac are planned.
-- No socket activation, D-Bus, journald, or `systemd-analyze`-style tooling.
+- No journald, service sandboxing (`ProtectSystem=`, `DynamicUser=`, seccomp,
+  capability/device restrictions), or `systemd-analyze`-style tooling. See
+  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
 - `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
   not yet wired.
 

@@ -4,6 +4,12 @@ To drive rustemd interactively as a real PID-1 daemon in qemu (demo units for
 every unit type, getty shell, etc.), see **[DEMO.md](DEMO.md)** and
 `scripts/live-vm.sh`.
 
+## Known issues
+
+Categorized bugs / weaknesses / design holes live in
+**[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — the input for the upcoming security
+inspection.
+
 ## Releasing
 
 ```bash

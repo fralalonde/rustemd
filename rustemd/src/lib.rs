@@ -2,7 +2,8 @@
 //!
 //! A drop-in `systemctl` replacement with a built-in unit manager:
 //! unit files, user services, timers, and dependency-driven lifecycle,
-//! without cgroups (process groups + a subreaper stand in for them).
+//! backed by per-service cgroups (Linux cgroup v2), with process groups and a
+//! subreaper as the fallback where cgroups aren't available.
 //!
 //! Architecture:
 //! - `manager` — the daemon: unit table, state machine, process supervision,
