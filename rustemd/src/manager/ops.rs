@@ -8,7 +8,7 @@
 
 use serde_json::{Value, json};
 
-use crate::control::{CatEntry, TimerInfo, UnitFileInfo, UnitStatus, UnitSummary};
+use crate::control::{CatEntry, RepoInfo, TimerInfo, UnitFileInfo, UnitStatus, UnitSummary};
 use crate::enable;
 use crate::manager::Manager;
 use crate::manager::state::{ActiveState, LoadState};
@@ -197,7 +197,7 @@ impl Manager {
                 .ok_or_else(|| format!("Unit {u} not found."))?;
             match &unit.path {
                 Some(p) => {
-                    let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+                    let text = self.repo.read_file(p).map_err(|e| e.to_string())?;
                     out.push(CatEntry {
                         unit: u.clone(),
                         path: p.display().to_string(),
@@ -275,6 +275,22 @@ impl Manager {
             .ok()
             .and_then(|p| p.file_name().and_then(|f| f.to_str()).map(str::to_string))
             .unwrap_or_else(|| "default.target".to_string())
+    }
+
+    /// `repo`: describe the unit-file repository the manager uses, so a client
+    /// can discover the path and open it itself with `rustemd_repo::Repo`.
+    pub fn repo_info(&self) -> RepoInfo {
+        RepoInfo {
+            root: self.repo.root().display().to_string(),
+            roots: self
+                .repo
+                .roots()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            backend: self.repo.backend_kind().as_str().to_string(),
+            git_head: self.repo.git_head(),
+        }
     }
 
     /// Point `default.target` at `name` and start it.

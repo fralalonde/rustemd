@@ -128,6 +128,11 @@ pub enum Command {
     /// Print the current default target.
     #[command(name = "get-default")]
     GetDefault,
+    /// Show the unit-file repository the manager uses (path, backend, git
+    /// HEAD), then open that repository locally with the shared DAO crate and
+    /// list its unit files.
+    #[command(name = "repo")]
+    Repo,
     /// Set the default target.
     #[command(name = "set-default")]
     SetDefault { target: String },
@@ -240,6 +245,7 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             println!("{}", v.as_str().unwrap_or("default.target"));
             Ok(0)
         }
+        Command::Repo => cmd_repo(cli),
         Command::SetDefault { target } => {
             let client = Client::for_mode(cli.user)?;
             client
@@ -415,6 +421,43 @@ fn cmd_disable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
         let client = client_for(cli)?;
         let norm = normalize_units(units);
         client.units_op("stop", &norm)?;
+    }
+    Ok(0)
+}
+
+fn cmd_repo(cli: &Cli) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let v = client.simple_op("repo")?;
+    let root = v.get("root").and_then(Value::as_str).unwrap_or("");
+    let backend = v.get("backend").and_then(Value::as_str).unwrap_or("dir");
+
+    println!("Repository: {}", root);
+    println!("Backend:    {}", backend);
+    if let Some(h) = v.get("git_head").and_then(Value::as_str) {
+        println!("HEAD:       {}", h);
+    }
+
+    // Open the same repository locally with the shared DAO crate, proving the
+    // client and the daemon agree on what "the unit files" are.
+    let roots: Vec<std::path::PathBuf> = v
+        .get("roots")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(std::path::PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repo = if roots.is_empty() {
+        rustemd_repo::Repo::open(std::path::PathBuf::from(root))
+    } else {
+        rustemd_repo::Repo::open_roots(roots)
+    }
+    .map_err(|e| e.to_string())?;
+    let units = repo.list().map_err(|e| e.to_string())?;
+    println!("Units:      {}", units.len());
+    for uf in units {
+        println!("  {:<24} {}", uf.name, uf.kind.suffix());
     }
     Ok(0)
 }

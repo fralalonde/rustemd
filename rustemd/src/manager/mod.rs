@@ -27,6 +27,7 @@ use crate::platform::signal::Signal;
 use crate::platform::signals::SignalSource;
 use crate::specifier::SpecifierContext;
 use crate::unit::{KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind};
+use rustemd_repo::Repo;
 
 use self::deps as D;
 #[cfg(feature = "socket")]
@@ -167,6 +168,11 @@ struct Job {
 
 pub struct Manager {
     pub cfg: ManagerCfg,
+    /// Unit-file repository (DAO): the disk source of truth for unit files.
+    /// LIST ([`Manager::discover_names`]) and READ ([`Manager::load_unit`])
+    /// go through it, and the `repo` IPC query reports its root/backend so
+    /// clients can open the same repository with `rustemd_repo::Repo`.
+    pub repo: Repo,
     pub units: HashMap<Name, Unit>,
     jobs: HashMap<u64, Job>,
     unit_job: HashMap<Name, u64>,
@@ -215,8 +221,11 @@ pub struct Manager {
 impl Manager {
     pub fn new(cfg: ManagerCfg) -> Result<Manager, String> {
         crate::platform::process::set_subreaper();
+        let repo =
+            Repo::open_roots(cfg.paths.unit_path.clone()).map_err(|e| format!("repo: {e}"))?;
         Ok(Manager {
             cfg,
+            repo,
             units: HashMap::new(),
             jobs: HashMap::new(),
             unit_job: HashMap::new(),
@@ -297,30 +306,19 @@ impl Manager {
 
     pub fn discover_names(&self) -> Vec<String> {
         let mut names: HashSet<String> = HashSet::new();
-        for dir in &self.cfg.paths.unit_path {
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for e in rd.flatten() {
-                let p = e.path();
-                let fname = match p.file_name().and_then(|f| f.to_str()) {
-                    Some(f) => f.to_string(),
-                    None => continue,
-                };
-                if p.is_file() {
-                    for suffix in ["service", "timer", "target"] {
-                        if fname.ends_with(&format!(".{suffix}")) {
-                            names.insert(fname.clone());
-                        }
-                    }
-                    #[cfg(feature = "socket")]
-                    if fname.ends_with(".socket") {
-                        names.insert(fname.clone());
-                    }
-                    #[cfg(target_os = "linux")]
-                    if fname.ends_with(".mount") {
-                        names.insert(fname.clone());
-                    }
+        // Unit files come from the repository DAO (all unit-path directories,
+        // precedence-merged). The manager recognizes only the suffixes its
+        // build supports, preserving the existing feature gates.
+        if let Ok(units) = self.repo.list() {
+            for uf in units {
+                let f = &uf.name;
+                if f.ends_with(".service")
+                    || f.ends_with(".timer")
+                    || f.ends_with(".target")
+                    || (cfg!(feature = "socket") && f.ends_with(".socket"))
+                    || (cfg!(target_os = "linux") && f.ends_with(".mount"))
+                {
+                    names.insert(uf.name);
                 }
             }
         }
@@ -428,11 +426,13 @@ impl Manager {
         let mut path: Option<PathBuf> = None;
         let spec = self.cfg.specifier(name);
 
-        // Load main file if it exists; synthesized builtins have none.
+        // Load main file if it exists; synthesized builtins have none. The
+        // file content is read through the repository DAO.
         let has_main = self.cfg.paths.find_unit(name).is_some();
         if let Some(main) = self.cfg.paths.find_unit(name) {
-            let parsed =
-                crate::unit::parse::parse_file(&main).map_err(|e| format!("parse error: {e}"))?;
+            let parsed = self
+                .read_unit_file(&main)
+                .map_err(|e| format!("parse error: {e}"))?;
             raw.sections.extend(parsed.sections);
             path = Some(main);
         } else if !is_builtin(name) && !kind_unit_needs_file(kind) {
@@ -444,7 +444,7 @@ impl Manager {
         }
 
         for dropin in self.cfg.paths.dropins(name) {
-            match crate::unit::parse::parse_file(&dropin) {
+            match self.read_unit_file(&dropin) {
                 Ok(d) => raw.sections.extend(d.sections),
                 Err(e) => return Err(format!("drop-in error: {e}")),
             }
@@ -479,6 +479,22 @@ impl Manager {
         unit.path = path;
         unit.file = Some(file);
         Ok(Some(unit))
+    }
+
+    /// Read and parse a unit file (or drop-in) by its resolved path, reading
+    /// the raw bytes through the repository DAO. The daemon owns systemd path
+    /// semantics (search precedence and `getty@tty1` -> `getty@.service`
+    /// template instantiation) via [`Paths::find_unit`], so it resolves the
+    /// path and then reads the content through the repository here.
+    fn read_unit_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::unit::parse::RawUnitFile, String> {
+        let text = self
+            .repo
+            .read_file(path)
+            .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        crate::unit::parse::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     // ---- IPC plumbing -------------------------------------------------------

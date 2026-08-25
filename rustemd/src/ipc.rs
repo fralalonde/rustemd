@@ -168,6 +168,7 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
             }
         }
         "get_default" => Ok(json!(mgr.get_default())),
+        "repo" => Ok(json!(mgr.repo_info())),
         "set_default" => {
             let name = req_str(req, "name").ok_or("set_default: missing name")?;
             mgr.set_default(name)?;

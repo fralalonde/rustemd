@@ -117,6 +117,22 @@ pub struct CatEntry {
     pub text: String,
 }
 
+/// Description of the unit-file repository a manager uses, returned by the
+/// `repo` control op. Lets clients discover the repository path and open it
+/// themselves with `rustemd_repo::Repo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoInfo {
+    /// The primary (writable) repository root.
+    pub root: String,
+    /// All roots, highest precedence first (the primary root is first).
+    pub roots: Vec<String>,
+    /// Backend kind: `"dir"` or `"git"`.
+    pub backend: String,
+    /// The git HEAD commit, when git-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+}
+
 // ---- the trait ------------------------------------------------------------------
 
 /// Core control surface of a manager. Implemented in-process by
@@ -147,6 +163,9 @@ pub trait Control {
     fn is_enabled(&self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn is_active(&self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn get_default(&self) -> Result<String, Error>;
+    /// Which unit-file repository the manager uses (path + backend kind + git
+    /// HEAD), so a client can open the same repository with `rustemd_repo`.
+    fn repo(&self) -> Result<RepoInfo, Error>;
 }
 
 // ---- in-process implementation (Manager) ----------------------------------------
@@ -245,6 +264,9 @@ impl Control for Manager {
     }
     fn get_default(&self) -> Result<String, Error> {
         Ok(self.get_default())
+    }
+    fn repo(&self) -> Result<RepoInfo, Error> {
+        Ok(self.repo_info())
     }
 }
 
@@ -385,6 +407,10 @@ impl Control for SocketClient {
     fn get_default(&self) -> Result<String, Error> {
         let v = self.call(serde_json::json!({ "op": "get_default" }))?;
         Ok(v.as_str().unwrap_or("default.target").to_string())
+    }
+    fn repo(&self) -> Result<RepoInfo, Error> {
+        let v = self.call(serde_json::json!({ "op": "repo" }))?;
+        serde_json::from_value(v).map_err(|e| Error(e.to_string()))
     }
 }
 
