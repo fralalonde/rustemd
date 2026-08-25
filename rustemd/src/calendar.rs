@@ -290,14 +290,11 @@ impl CalendarSpec {
                                     from.minute(),
                                     from.second(),
                                     same_day,
-                                ) {
-                                    if let Some(nt) = NaiveDate::from_ymd_opt(y, m, d)
-                                        .and_then(|dt| dt.and_hms_opt(h, mi, s))
-                                    {
-                                        if nt > from {
-                                            return Some(nt);
-                                        }
-                                    }
+                                ) && let Some(nt) = NaiveDate::from_ymd_opt(y, m, d)
+                                    .and_then(|dt| dt.and_hms_opt(h, mi, s))
+                                    && nt > from
+                                {
+                                    return Some(nt);
                                 }
                             }
                             d += 1;

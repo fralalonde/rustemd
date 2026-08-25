@@ -551,7 +551,7 @@ fn build_socket(
     Ok(SocketConfig {
         listen_stream: list_of(raw, "Socket", "ListenStream", exp),
         accept,
-        service: unit_scalar(raw, "Socket", "Service").map(&exp),
+        service: unit_scalar(raw, "Socket", "Service").map(exp),
     })
 }
 
@@ -800,10 +800,10 @@ fn parse_stdio(v: &str) -> Result<StdioTarget, String> {
             }
         }
     };
-    if let Some(e) = path_err {
-        if !ignore {
-            return Err(e);
-        }
+    if let Some(e) = path_err
+        && !ignore
+    {
+        return Err(e);
     }
     Ok(out)
 }
@@ -925,10 +925,10 @@ fn build_mount(
         None => mount_path_from_unit_name(&spec.unit_name),
     };
     Ok(MountConfig {
-        what: unit_scalar(raw, "Mount", "What").map(&exp),
+        what: unit_scalar(raw, "Mount", "What").map(exp),
         where_,
-        fs_type: unit_scalar(raw, "Mount", "Type").map(&exp),
-        options: unit_scalar(raw, "Mount", "Options").map(&exp),
+        fs_type: unit_scalar(raw, "Mount", "Type").map(exp),
+        options: unit_scalar(raw, "Mount", "Options").map(exp),
     })
 }
 

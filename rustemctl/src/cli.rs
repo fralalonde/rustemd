@@ -429,13 +429,7 @@ fn cmd_repo(cli: &Cli) -> Result<i32, String> {
     let client = client_for(cli)?;
     let v = client.simple_op("repo")?;
     let root = v.get("root").and_then(Value::as_str).unwrap_or("");
-    let backend = v.get("backend").and_then(Value::as_str).unwrap_or("dir");
-
     println!("Repository: {}", root);
-    println!("Backend:    {}", backend);
-    if let Some(h) = v.get("git_head").and_then(Value::as_str) {
-        println!("HEAD:       {}", h);
-    }
 
     // Open the same repository locally with the shared DAO crate, proving the
     // client and the daemon agree on what "the unit files" are.

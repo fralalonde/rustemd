@@ -2,7 +2,7 @@
 name = "rustemd-repo"
 version = "0.1.0"
 edition = "2024"
-description = "DAO/CRUD layer for rustemd unit files, backed by a swappable repository (plain directory or git)."
+description = "Typed DAO/CRUD layer for rustemd unit definitions backed by directories."
 license = "MIT"
 rust-version = "1.89"
 

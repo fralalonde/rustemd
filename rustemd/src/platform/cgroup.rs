@@ -29,17 +29,17 @@ const CGROUPFS: &str = "/sys/fs/cgroup";
 /// tests) → our own cgroup from `/proc/self/cgroup` (works both as PID 1 in a
 /// container and as a `--user` manager under a delegated subtree) → `None`.
 pub fn root() -> Option<PathBuf> {
-    if let Ok(r) = std::env::var("RUSTEMD_CGROUP_ROOT") {
-        if !r.is_empty() {
-            let p = PathBuf::from(r);
-            // Must be a real cgroupfs: a plain directory (or a misconfigured
-            // override) would silently break adopt/kill. A real cgroup dir has
-            // the kernel-provided `cgroup.procs`; a plain dir does not.
-            if fs::create_dir_all(&p).is_ok() && p.join("cgroup.procs").exists() {
-                return Some(p);
-            }
-            return None;
+    if let Ok(r) = std::env::var("RUSTEMD_CGROUP_ROOT")
+        && !r.is_empty()
+    {
+        let p = PathBuf::from(r);
+        // Must be a real cgroupfs: a plain directory (or a misconfigured
+        // override) would silently break adopt/kill. A real cgroup dir has
+        // the kernel-provided `cgroup.procs`; a plain dir does not.
+        if fs::create_dir_all(&p).is_ok() && p.join("cgroup.procs").exists() {
+            return Some(p);
         }
+        return None;
     }
 
     let base = Path::new(CGROUPFS);

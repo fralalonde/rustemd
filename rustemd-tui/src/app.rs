@@ -112,12 +112,11 @@ impl App {
             terminal
                 .draw(|f| render::draw(self, f))
                 .map_err(|e| e.to_string())?;
-            if event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())? {
-                if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key)?;
-                    }
-                }
+            if event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())?
+                && let Event::Key(key) = event::read().map_err(|e| e.to_string())?
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key)?;
             }
             if self.last_refresh.elapsed() >= Duration::from_secs(2) {
                 self.refresh()?;

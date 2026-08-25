@@ -225,27 +225,26 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
                     libc::close(fd);
                 }
             }
-            if let Some(dir) = &cwd {
-                if let Err(e) = chdir(dir) {
-                    return Err(std::io::Error::from(e));
-                }
+            if let Some(dir) = &cwd
+                && let Err(e) = chdir(dir)
+            {
+                return Err(std::io::Error::from(e));
             }
-            if !groups.is_empty() {
-                if let Err(e) =
+            if !groups.is_empty()
+                && let Err(e) =
                     setgroups(&groups.iter().map(|&g| Gid::from_raw(g)).collect::<Vec<_>>())
-                {
-                    return Err(std::io::Error::from(e));
-                }
+            {
+                return Err(std::io::Error::from(e));
             }
-            if let Some(g) = gid {
-                if let Err(e) = setgid(Gid::from_raw(g)) {
-                    return Err(std::io::Error::from(e));
-                }
+            if let Some(g) = gid
+                && let Err(e) = setgid(Gid::from_raw(g))
+            {
+                return Err(std::io::Error::from(e));
             }
-            if let Some(u) = uid {
-                if let Err(e) = setuid(Uid::from_raw(u)) {
-                    return Err(std::io::Error::from(e));
-                }
+            if let Some(u) = uid
+                && let Err(e) = setuid(Uid::from_raw(u))
+            {
+                return Err(std::io::Error::from(e));
             }
             if let Some(m) = umaskv {
                 nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(m));

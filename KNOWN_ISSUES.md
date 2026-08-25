@@ -38,14 +38,13 @@ met. Fixed this checkpoint; regression test
 `required_dependency_that_fails_synchronously_fails_parent` in
 `rustemd/src/manager/mod.rs`.
 
-### resume_primary_thread can leave a service stuck in START_PENDING
-Location: `rustemd/src/platform/windows/process.rs:299-334`. The thread-resume
-path walks a system-wide `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`, resumes
-only the FIRST thread whose owner pid matches, and breaks on the first
-`ResumeThread` that does not return `u32::MAX`. If that thread's prior suspend
-count is 0 (it was not actually suspended), `found=true` fires without resuming
-the real suspended primary thread, so a `CREATE_SUSPENDED` newborn hangs forever
-and its service sits in `START_PENDING`.
+### ~~resume_primary_thread can leave a service stuck in START_PENDING~~ — fixed (Windows)
+`ResumeThread` returns the target's previous suspend count, not a boolean. The
+ToolHelp fallback now accepts a resume only when that count is positive; it
+continues past an already-runnable PID-matching thread instead of treating `0`
+as success. The regression test
+`resume_thread_only_accepts_a_positive_previous_suspend_count` covers the
+Win32 return-value contract.
 
 ### ~~Braced `${VAR}` expansion left a trailing `}`~~ — fixed
 The shared `expand_env_token` had an off-by-one (consumed `end + 2` instead of
@@ -106,31 +105,29 @@ because Win32 has no generic POSIX-signal delivery API. `kill_group`
 graceful-stop phase (no `GenerateConsoleCtrlEvent`/`CTRL_BREAK`) and no
 SIGTERM-then-timeout-then-SIGKILL like the Linux path.
 
-### Windows output capture can drop the tail on shutdown and has no backpressure
-Location: `rustemd/src/platform/windows/process.rs:336-355`. `forward_output`
-spawns detached reader threads that are never joined, feeding an unbounded mpsc
-channel; `drain_output` does a non-blocking `try_iter` drain. If the manager
-exits before a reader thread drains its pipe the final lines are lost (the
-Linux path polls fixed-size pipes with owned fds and backpressure), and a
-service that writes faster than the manager drains grows memory without bound.
+### ~~Windows output capture can drop the tail on shutdown and has no backpressure~~ — fixed (Windows)
+Output readers now feed a bounded `sync_channel` (256 chunks), so a noisy child
+is backpressured through its pipe rather than growing manager memory without
+limit. Shutdown stays non-idle while either a reader remains alive or queued
+output remains; it drains final chunks before exit. Regression tests cover queue
+backpressure and the shutdown-pending invariant.
 
 ### Spawned diverges by platform, leaking the platform seam
 Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
 `Spawned { pid, stdout, stderr }` (`platform/process.rs:39-43`); the manager
 carries `#[cfg]` branches for fd-polling vs `drain_output`.
 
-### Declared MSRV (1.85) is wrong; code needs 1.88+
-`rustemd/Cargo.toml` says `rust-version = "1.85"` but
-`rustemd/src/platform/windows/net.rs` uses let-chains (`... && let ...`,
-stabilized in Rust 1.88). Bumping `rust-version` to 1.88 is correct but
-unmasks ~29 `collapsible_if` clippy lints (clippy gates the let-chain collapse
-suggestion on `rust-version`) that would then need collapsing; defer bump +
-`cargo clippy --fix` + retest to a later pass. Note: `rustemd-repo` sets
-`rust-version = "1.89"` (it uses `std::fs::File::lock`), which transitively
-raises the workspace floor to 1.89 regardless.
+### ~~Declared MSRV (1.85) is wrong; code needs 1.88+~~ — fixed
+Every workspace package now declares Rust 1.89, matching the effective floor
+already imposed by `rustemd-repo`'s use of `std::fs::File::lock`. The MSRV-gated
+Clippy diagnostics were resolved with behavior-preserving let-chain rewrites.
 
-### Two windows-sys versions in the tree
-0.61.2 (direct) and 0.59.0 (via crossterm/anstyle). Harmless.
+### Two `windows-sys` versions in the tree — retained
+`windows-sys` 0.61.2 is used directly by rustemd and transitively by current
+terminal dependencies; 0.59.0 is pulled by `colored` 2.2.0. They do not cross
+the rustemd API boundary and are binding-only declarations. Retain both until
+an upstream `colored` upgrade naturally unifies them; forcing Cargo to do so
+would require an incompatible dependency override.
 
 ### macOS build path unverified
 The release workflow builds a macOS artifact, but macOS does not yet have a
@@ -158,7 +155,3 @@ worth revisiting before more unit types are added.
 The CLI bug above is one symptom; the daemon/IPC write paths make the same
 assumption. A single early `signal(SIGPIPE, SIG_DFL)` (unix) would make every
 `| head`-style pipeline behave like `systemctl`.
-
-### No LICENSE file
-`Cargo.toml` declares MIT but no `LICENSE` text ships in the repo or in the
-deb/rpm/msi packages — a gap to close before any public release.

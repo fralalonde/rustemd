@@ -190,16 +190,15 @@ impl Paths {
         // it always compiles — the getty prompt must never silently vanish
         // because of a feature flag. The requested name is still used for
         // specifier expansion, so `%i` = "tty1", `%p` = "getty".
-        if let Some(at) = name.find('@') {
-            if let Some(dot) = name.rfind('.') {
-                if dot > at {
-                    let tmpl = format!("{}.{}", &name[..=at], &name[dot + 1..]);
-                    for dir in &self.unit_path {
-                        let p = dir.join(&tmpl);
-                        if p.is_file() {
-                            return Some(p);
-                        }
-                    }
+        if let Some(at) = name.find('@')
+            && let Some(dot) = name.rfind('.')
+            && dot > at
+        {
+            let tmpl = format!("{}.{}", &name[..=at], &name[dot + 1..]);
+            for dir in &self.unit_path {
+                let p = dir.join(&tmpl);
+                if p.is_file() {
+                    return Some(p);
                 }
             }
         }

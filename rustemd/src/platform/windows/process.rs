@@ -12,6 +12,7 @@ use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use std::os::windows::process::CommandExt;
@@ -82,26 +83,55 @@ struct ChildRecord {
 
 type OutputEvent = (String, Vec<u8>);
 
+/// Chunks waiting for the manager to append them to a unit log. A finite
+/// queue makes a noisy child block in its pipe reader instead of growing the
+/// manager's memory without limit.
+const OUTPUT_QUEUE_CAPACITY: usize = 256;
+
 struct OutputBus {
-    sender: mpsc::Sender<OutputEvent>,
+    sender: mpsc::SyncSender<OutputEvent>,
     receiver: Mutex<mpsc::Receiver<OutputEvent>>,
+}
+
+impl OutputBus {
+    fn with_capacity(capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    }
 }
 
 static CHILDREN: OnceLock<Mutex<HashMap<i32, ChildRecord>>> = OnceLock::new();
 static OUTPUT: OnceLock<OutputBus> = OnceLock::new();
+static OUTPUT_READERS: AtomicUsize = AtomicUsize::new(0);
+static OUTPUT_QUEUED: AtomicUsize = AtomicUsize::new(0);
+
+/// Owns exactly one output-worker liveness count. Moving this guard into the
+/// worker closure makes an OS thread-creation failure roll the count back when
+/// that closure is dropped.
+struct OutputReader;
+
+impl OutputReader {
+    fn start() -> Self {
+        OUTPUT_READERS.fetch_add(1, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for OutputReader {
+    fn drop(&mut self) {
+        OUTPUT_READERS.fetch_sub(1, Ordering::Release);
+    }
+}
 
 fn children() -> &'static Mutex<HashMap<i32, ChildRecord>> {
     CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn output_bus() -> &'static OutputBus {
-    OUTPUT.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel();
-        OutputBus {
-            sender,
-            receiver: Mutex::new(receiver),
-        }
-    })
+    OUTPUT.get_or_init(|| OutputBus::with_capacity(OUTPUT_QUEUE_CAPACITY))
 }
 
 pub fn resolve_user(_name: &str) -> Option<(u32, u32, Vec<u32>)> {
@@ -248,6 +278,13 @@ fn create_job(limits: &CgroupLimits) -> std::io::Result<Job> {
     Ok(Job(handle))
 }
 
+/// `ResumeThread` returns the target's previous suspend count.  A value of
+/// zero means the selected thread was already runnable and cannot prove that
+/// the CREATE_SUSPENDED primary thread was released.
+fn resume_result_released_suspended_thread(previous_suspend_count: u32) -> bool {
+    previous_suspend_count != u32::MAX && previous_suspend_count > 0
+}
+
 fn resume_primary_thread(pid: u32) -> std::io::Result<()> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
@@ -267,7 +304,7 @@ fn resume_primary_thread(pid: u32) -> std::io::Result<()> {
                 unsafe {
                     CloseHandle(thread);
                 }
-                if resumed != u32::MAX {
+                if resume_result_released_suspended_thread(resumed) {
                     found = true;
                     break;
                 }
@@ -287,13 +324,24 @@ fn resume_primary_thread(pid: u32) -> std::io::Result<()> {
 
 fn forward_output(unit_name: String, mut reader: impl Read + Send + 'static) {
     let tx = output_bus().sender.clone();
-    std::thread::spawn(move || {
+    let output_reader = OutputReader::start();
+    // A failed Builder::spawn drops the closure and therefore the guard,
+    // avoiding a permanently non-idle manager during shutdown.
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _output_reader = output_reader;
         let mut buffer = [0u8; 4096];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = tx.send((unit_name.clone(), buffer[..n].to_vec()));
+                    // Count before send: a blocked sender is still work that
+                    // shutdown must wait for, and a successfully queued final
+                    // chunk must keep the manager alive until it is drained.
+                    OUTPUT_QUEUED.fetch_add(1, Ordering::Release);
+                    if tx.send((unit_name.clone(), buffer[..n].to_vec())).is_err() {
+                        OUTPUT_QUEUED.fetch_sub(1, Ordering::Release);
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -301,9 +349,27 @@ fn forward_output(unit_name: String, mut reader: impl Read + Send + 'static) {
     });
 }
 
+fn output_is_pending(readers: usize, queued: usize) -> bool {
+    readers != 0 || queued != 0
+}
+
+/// True while pipe-reader workers may still enqueue output or the manager has
+/// queued bytes left to append. The manager uses this during shutdown to drain
+/// a child's final bytes before exiting.
+pub fn output_pending() -> bool {
+    output_is_pending(
+        OUTPUT_READERS.load(Ordering::Acquire),
+        OUTPUT_QUEUED.load(Ordering::Acquire),
+    )
+}
+
 pub fn drain_output() -> Vec<(String, Vec<u8>)> {
     let receiver = output_bus().receiver.lock().unwrap();
-    receiver.try_iter().collect()
+    let output: Vec<_> = receiver.try_iter().collect();
+    if !output.is_empty() {
+        OUTPUT_QUEUED.fetch_sub(output.len(), Ordering::AcqRel);
+    }
+    output
 }
 
 pub fn kill_group(group_pid: i32, signal: Signal) -> std::io::Result<()> {
@@ -351,3 +417,52 @@ pub fn reap_children() -> Vec<(i32, ChildExit)> {
 }
 
 pub fn set_subreaper() {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        OUTPUT_READERS, OutputBus, OutputReader, output_is_pending,
+        resume_result_released_suspended_thread,
+    };
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn output_reader_guard_rolls_back_when_worker_startup_is_abandoned() {
+        let before = OUTPUT_READERS.load(Ordering::Acquire);
+        {
+            let _reader = OutputReader::start();
+            assert_eq!(OUTPUT_READERS.load(Ordering::Acquire), before + 1);
+        }
+        assert_eq!(OUTPUT_READERS.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn output_remains_pending_until_workers_and_queued_chunks_are_both_gone() {
+        assert!(output_is_pending(1, 0));
+        assert!(output_is_pending(0, 1));
+        assert!(!output_is_pending(0, 0));
+    }
+
+    #[test]
+    fn output_bus_applies_backpressure_at_its_configured_capacity() {
+        let bus = OutputBus::with_capacity(1);
+        bus.sender.send(("unit.service".into(), vec![1])).unwrap();
+        assert!(
+            bus.sender
+                .try_send(("unit.service".into(), vec![2]))
+                .is_err()
+        );
+        assert_eq!(bus.receiver.lock().unwrap().try_recv().unwrap().1, vec![1]);
+        bus.sender
+            .try_send(("unit.service".into(), vec![2]))
+            .unwrap();
+    }
+
+    #[test]
+    fn resume_thread_only_accepts_a_positive_previous_suspend_count() {
+        assert!(!resume_result_released_suspended_thread(0));
+        assert!(resume_result_released_suspended_thread(1));
+        assert!(resume_result_released_suspended_thread(2));
+        assert!(!resume_result_released_suspended_thread(u32::MAX));
+    }
+}

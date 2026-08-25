@@ -105,11 +105,12 @@ fn daemon_lists_and_reads_units_through_repo_dao() {
 
     // Write the unit through the repository crate, exactly as a client would.
     let repo = rustemd_repo::Repo::open_roots(vec![scratch.units()]).unwrap();
-    repo.write(
+    let definition = rustemd_repo::UnitDefinition::parse(
         "dao.service",
         "[Unit]\nDescription=DAO unit\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
     )
     .unwrap();
+    repo.write(&definition).unwrap();
 
     let daemon = Daemon::start();
     assert!(wait_for(Duration::from_secs(3), || {
@@ -121,9 +122,7 @@ fn daemon_lists_and_reads_units_through_repo_dao() {
     // The daemon reports its repository over IPC.
     let info = ctl.repo().unwrap();
     assert_eq!(info.root, scratch.units().display().to_string());
-    assert_eq!(info.backend, "dir");
     assert_eq!(info.roots, vec![scratch.units().display().to_string()]);
-    assert_eq!(info.git_head, None);
 
     // The daemon LISTED the unit (discovery goes through the DAO).
     let units = ctl.list_units(&[], None).unwrap();
@@ -139,13 +138,7 @@ fn daemon_lists_and_reads_units_through_repo_dao() {
 
     // A client can reopen the reported repository with the same crate.
     let client_repo = rustemd_repo::Repo::open(std::path::PathBuf::from(&info.root)).unwrap();
-    assert_eq!(
-        client_repo.read("dao.service").unwrap(),
-        Some(
-            "[Unit]\nDescription=DAO unit\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
-                .to_string()
-        )
-    );
+    assert_eq!(client_repo.read("dao.service").unwrap(), Some(definition));
     assert!(
         client_repo
             .list()
