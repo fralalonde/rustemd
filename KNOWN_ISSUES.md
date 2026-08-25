@@ -9,7 +9,7 @@ A categorized inventory for checkpointing and as the input to the upcoming
 - **Design holes** — structural risks that need an architectural decision, not
   a point fix.
 
-Updated with the load-fix + `.mount` + live-env work (`main` at `9ddced3`).
+Updated with the Windows code-review pass.
 Nothing here blocks the current dogfood scope; it is triage material.
 
 ## Bugs
@@ -37,6 +37,22 @@ engine's `waiting.retain`, so the parent proceeded as if the dependency were
 met. Fixed this checkpoint; regression test
 `required_dependency_that_fails_synchronously_fails_parent` in
 `rustemd/src/manager/mod.rs`.
+
+### resume_primary_thread can leave a service stuck in START_PENDING
+Location: `rustemd/src/platform/windows/process.rs:299-334`. The thread-resume
+path walks a system-wide `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`, resumes
+only the FIRST thread whose owner pid matches, and breaks on the first
+`ResumeThread` that does not return `u32::MAX`. If that thread's prior suspend
+count is 0 (it was not actually suspended), `found=true` fires without resuming
+the real suspended primary thread, so a `CREATE_SUSPENDED` newborn hangs forever
+and its service sits in `START_PENDING`.
+
+### ~~Braced `${VAR}` expansion left a trailing `}`~~ — fixed
+The shared `expand_env_token` had an off-by-one (consumed `end + 2` instead of
+`end + 3`) so `${HOME}` expanded to `/home/me}`. Found and fixed while
+deduplicating the two platform copies into `rustemd/src/expand.rs` (with
+tests); the Unix and Windows impls previously diverged here (Windows consumed
+the brace correctly).
 
 ## Weaknesses
 
@@ -72,14 +88,49 @@ access control.
 Windows `.socket` units support TCP launch-on-connection, but do not transfer
 the listening Winsock handle to the child. Services that require systemd-style
 `LISTEN_FDS` inheritance are not portable to the Windows MVP. Unix-domain
-listeners are rejected.
+listeners are rejected. `take_trigger()` (`rustemd/src/manager/socket.rs:36-48`)
+does `accept()` then `drop(stream)`, and the Windows `process::spawn` never
+reads `opts.listen_fds`, so the triggering connection is accepted and closed
+before the service sees it (no `WSADuplicateSocket`/fd-passing equivalent). The
+two Windows socket tests pass only because their services never touch the
+socket.
 
 ### Windows directive subset
 The Win32 manager supports foreground and oneshot services. `Type=forking`,
 `notify`, and `dbus`; account switching (`User=`/`Group=`); `MemoryHigh=`; and
 `CPUWeight=` fail explicitly. Job Objects implement tree lifetime,
 `MemoryMax=`, and `TasksMax=`. Windows stop signals terminate the Job Object
-because Win32 has no generic POSIX-signal delivery API.
+because Win32 has no generic POSIX-signal delivery API. `kill_group`
+(`windows/process.rs:357-372`) calls `TerminateJobObject` for both `SIGTERM` and
+`SIGKILL` — the 137/143 exit codes are bookkeeping only — so there is no
+graceful-stop phase (no `GenerateConsoleCtrlEvent`/`CTRL_BREAK`) and no
+SIGTERM-then-timeout-then-SIGKILL like the Linux path.
+
+### Windows output capture can drop the tail on shutdown and has no backpressure
+Location: `rustemd/src/platform/windows/process.rs:336-355`. `forward_output`
+spawns detached reader threads that are never joined, feeding an unbounded mpsc
+channel; `drain_output` does a non-blocking `try_iter` drain. If the manager
+exits before a reader thread drains its pipe the final lines are lost (the
+Linux path polls fixed-size pipes with owned fds and backpressure), and a
+service that writes faster than the manager drains grows memory without bound.
+
+### Spawned diverges by platform, leaking the platform seam
+Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
+`Spawned { pid, stdout, stderr }` (`platform/process.rs:39-43`); the manager
+carries `#[cfg]` branches for fd-polling vs `drain_output`.
+
+### Declared MSRV (1.85) is wrong; code needs 1.88+
+`rustemd/Cargo.toml` says `rust-version = "1.85"` but
+`rustemd/src/platform/windows/net.rs` uses let-chains (`... && let ...`,
+stabilized in Rust 1.88). Bumping `rust-version` to 1.88 is correct but
+unmasks ~29 `collapsible_if` clippy lints (clippy gates the let-chain collapse
+suggestion on `rust-version`) that would then need collapsing; defer bump +
+`cargo clippy --fix` + retest to a later pass. Note: `rustemd-repo` sets
+`rust-version = "1.89"` (it uses `std::fs::File::lock`), which transitively
+raises the workspace floor to 1.89 regardless.
+
+### Two windows-sys versions in the tree
+0.61.2 (direct) and 0.59.0 (via crossterm/anstyle). Harmless.
 
 ### macOS build path unverified
 The release workflow builds a macOS artifact, but macOS does not yet have a
