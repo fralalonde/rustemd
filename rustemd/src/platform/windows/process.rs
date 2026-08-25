@@ -111,55 +111,7 @@ pub fn resolve_group(_name: &str) -> Option<u32> {
     None
 }
 
-pub fn expand_env_argv(argv: &[String], env: &HashMap<String, String>) -> Vec<String> {
-    argv.iter()
-        .map(|token| expand_env_token(token, env))
-        .collect()
-}
-
-pub fn expand_env_token(token: &str, env: &HashMap<String, String>) -> String {
-    let mut out = String::with_capacity(token.len());
-    let mut chars = token.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch != '$' {
-            out.push(ch);
-            continue;
-        }
-        if chars.peek().is_some_and(|(_, c)| *c == '{') {
-            chars.next();
-            let mut name = String::new();
-            let mut closed = false;
-            for (_, c) in chars.by_ref() {
-                if c == '}' {
-                    closed = true;
-                    break;
-                }
-                name.push(c);
-            }
-            if !closed {
-                out.push_str("${");
-                out.push_str(&name);
-                break;
-            }
-            out.push_str(env.get(&name).map(String::as_str).unwrap_or(""));
-        } else {
-            let mut name = String::new();
-            while let Some((_, c)) = chars.peek() {
-                if !(c.is_ascii_alphanumeric() || *c == '_') {
-                    break;
-                }
-                name.push(*c);
-                chars.next();
-            }
-            if name.is_empty() {
-                out.push('$');
-            } else {
-                out.push_str(env.get(&name).map(String::as_str).unwrap_or(""));
-            }
-        }
-    }
-    out
-}
+pub use crate::expand::{expand_env_argv, expand_env_token};
 
 pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
     if opts.argv.is_empty() {

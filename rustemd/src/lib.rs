@@ -31,6 +31,7 @@ pub mod daemon;
 #[cfg(all(target_os = "linux", feature = "dbus"))]
 pub mod dbus;
 pub mod enable;
+pub mod expand;
 pub mod ipc;
 pub mod log;
 pub mod manager;

@@ -16,7 +16,6 @@
 //! close). User/group *name* lookups (NSS) happen in the parent before
 //! spawn and are passed in as uid/gid numbers.
 
-use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -90,60 +89,7 @@ pub fn resolve_group(name: &str) -> Option<u32> {
     Some(nix::unistd::Group::from_name(name).ok()??.gid.as_raw())
 }
 
-/// Expand `$VAR`/`${VAR}` in each argv token against `env`.
-pub fn expand_env_argv(argv: &[String], env: &HashMap<String, String>) -> Vec<String> {
-    argv.iter().map(|t| expand_env_token(t, env)).collect()
-}
-
-/// Expand `$VAR` and `${VAR}` in a single argv token against `env`.
-/// Unset variables expand to the empty string.
-pub fn expand_env_token(tok: &str, env: &HashMap<String, String>) -> String {
-    let mut out = String::with_capacity(tok.len());
-    let bytes = tok.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            let rest = &tok[i + 1..];
-            let (name, consumed) = if let Some(braced) = rest.strip_prefix('{') {
-                match braced.find('}') {
-                    Some(end) => (&braced[..end], end + 2),
-                    None => ("", rest.len() + 1),
-                }
-            } else {
-                let end = rest
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .unwrap_or(rest.len());
-                (&rest[..end], end + 1)
-            };
-            if name.is_empty() {
-                out.push('$');
-                out.push_str(rest);
-                break;
-            }
-            out.push_str(env.get(name).map(String::as_str).unwrap_or(""));
-            i += consumed;
-            continue;
-        }
-        let ch_len = utf8_len(bytes[i]);
-        out.push_str(&tok[i..i + ch_len]);
-        i += ch_len;
-    }
-    out
-}
-
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else if b >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
-}
+pub use crate::expand::{expand_env_argv, expand_env_token};
 
 /// Format a non-negative integer as a NUL-terminated C string in `buf`
 /// (async-signal-safe — no allocation). Returns a pointer to the digits.
