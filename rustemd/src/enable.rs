@@ -107,7 +107,7 @@ pub fn enable(paths: &Paths, name: &str) -> Result<Vec<String>, String> {
         // Create symlink relative or absolute to the unit file.
         let target_path = absolute_of(&path);
         fs::remove_file(&link).ok();
-        std::os::unix::fs::symlink(&target_path, &link).map_err(|e| e.to_string())?;
+        crate::platform::fs::link_file(&target_path, &link).map_err(|e| e.to_string())?;
         messages.push(format!(
             "Created symlink {} -> {}",
             link.display(),
@@ -119,7 +119,7 @@ pub fn enable(paths: &Paths, name: &str) -> Result<Vec<String>, String> {
         let target_path = absolute_of(&path);
         fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
         fs::remove_file(&link).ok();
-        std::os::unix::fs::symlink(&target_path, &link).map_err(|e| e.to_string())?;
+        crate::platform::fs::link_file(&target_path, &link).map_err(|e| e.to_string())?;
         messages.push(format!(
             "Created alias {} -> {}",
             link.display(),

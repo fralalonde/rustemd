@@ -25,6 +25,25 @@ udev = []
 # is free of the zbus/zvariant/async-executor dependency tree. Linux-only.
 dbus = ["dep:zbus"]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "resource", "socket", "poll", "hostname", "mount"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # D-Bus (Linux only): pure-Rust, no C dependency. `blocking-api` runs the
 # async machinery on internal threads, so the synchronous poll loop never
@@ -38,8 +57,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 colored = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-libc = "0.2"
-nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "resource", "socket", "poll", "hostname", "mount"] }
 
 [dev-dependencies]
 tempfile = "3"

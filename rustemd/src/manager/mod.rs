@@ -11,25 +11,26 @@ pub mod timer;
 pub mod unit_type;
 
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use nix::sys::signal::Signal;
-use nix::unistd::Pid;
-
 use crate::log::mgr_log;
 use crate::paths::Paths;
+#[cfg(unix)]
 use crate::platform::cgroup;
 use crate::platform::process as spawn;
+use crate::platform::signal::Signal;
 use crate::platform::signals::SignalSource;
 use crate::specifier::SpecifierContext;
 use crate::unit::{KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind};
 
 use self::deps as D;
 #[cfg(feature = "socket")]
-use self::socket::{SocketListener, bind_listen_stream};
+use self::socket::{SocketId, SocketListener, bind_listen_stream};
 use self::state::ControlCommand as UnitControlCommand;
 use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult};
 use self::timer::{TimerKind, TimerWheel};
@@ -68,28 +69,41 @@ impl ManagerCfg {
         } else {
             Paths::system()
         };
-        let uid = nix::unistd::geteuid().as_raw();
-        let user_entry = nix::unistd::User::from_uid(uid.into()).ok().flatten();
-        let username = user_entry
-            .as_ref()
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| "unknown".into());
-        let home = user_entry
-            .as_ref()
-            .map(|u| u.dir.to_string_lossy().to_string())
-            .or_else(|| std::env::var("HOME").ok())
-            .unwrap_or_else(|| "/".into());
-        let hostname = nix::unistd::gethostname()
-            .ok()
-            .map(|os| os.to_string_lossy().to_string())
-            .unwrap_or_else(|| "localhost".into());
-        let machine_id = std::fs::read_to_string("/etc/machine-id")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                std::env::var("RUSTEMD_MACHINE_ID").unwrap_or_else(|_| "unknown".into())
-            });
+        #[cfg(unix)]
+        let (uid, username, home, hostname, machine_id) = {
+            let uid = nix::unistd::geteuid().as_raw();
+            let user_entry = nix::unistd::User::from_uid(uid.into()).ok().flatten();
+            let username = user_entry
+                .as_ref()
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let home = user_entry
+                .as_ref()
+                .map(|entry| entry.dir.to_string_lossy().to_string())
+                .or_else(|| std::env::var("HOME").ok())
+                .unwrap_or_else(|| "/".into());
+            let hostname = nix::unistd::gethostname()
+                .ok()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "localhost".into());
+            let machine_id = std::fs::read_to_string("/etc/machine-id")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    std::env::var("RUSTEMD_MACHINE_ID").unwrap_or_else(|_| "unknown".into())
+                });
+            (uid, username, home, hostname, machine_id)
+        };
+        #[cfg(windows)]
+        let (uid, username, home, hostname, machine_id) = {
+            let username = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into());
+            let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+            let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into());
+            let machine_id =
+                std::env::var("RUSTEMD_MACHINE_ID").unwrap_or_else(|_| hostname.clone());
+            (0, username, home, hostname, machine_id)
+        };
         let base_env = std::env::vars().collect();
         Ok(ManagerCfg {
             user,
@@ -159,17 +173,21 @@ pub struct Manager {
     next_job: u64,
     pub wheel: TimerWheel,
     pid_unit: HashMap<i32, Name>,
-    /// (stdout/stderr raw fd) -> unit name
+    /// Unix child-output pipes are polled directly. Windows reader threads
+    /// forward output through `platform::process::drain_output`.
+    #[cfg(unix)]
     pub out_fds: HashMap<RawFd, Name>,
-    /// Owned handles backing `out_fds`: holding these keeps each child's
-    /// stdout/stderr pipe open across reads; dropping one (on EOF/error/stop)
-    /// closes that pipe.
+    #[cfg(unix)]
     pub owned_fds: HashMap<RawFd, OwnedFd>,
     #[cfg(feature = "socket")]
-    pub socket_listeners: HashMap<RawFd, SocketListener>,
+    pub socket_listeners: HashMap<SocketId, SocketListener>,
     #[cfg(feature = "socket")]
-    pub socket_triggers: HashMap<RawFd, (Name, Name)>,
+    pub socket_triggers: HashMap<SocketId, (Name, Name)>,
+    #[cfg(unix)]
     listener: Option<UnixListener>,
+    #[cfg(windows)]
+    listener: Option<crate::platform::net::ControlListener>,
+    #[cfg(unix)]
     notify: Option<UnixDatagram>,
     signalfd: Option<SignalSource>,
     pub shutting_down: bool,
@@ -205,19 +223,31 @@ impl Manager {
             next_job: 0,
             wheel: TimerWheel::default(),
             pid_unit: HashMap::new(),
+            #[cfg(unix)]
             out_fds: HashMap::new(),
+            #[cfg(unix)]
             owned_fds: HashMap::new(),
             #[cfg(feature = "socket")]
             socket_listeners: HashMap::new(),
             #[cfg(feature = "socket")]
             socket_triggers: HashMap::new(),
             listener: None,
+            #[cfg(unix)]
             notify: None,
             signalfd: None,
             shutting_down: false,
             boot: SystemTime::now(),
             boot_instant: Instant::now(),
-            as_pid1: nix::unistd::getpid() == Pid::from_raw(1),
+            as_pid1: {
+                #[cfg(unix)]
+                {
+                    nix::unistd::getpid() == nix::unistd::Pid::from_raw(1)
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            },
             #[cfg(all(target_os = "linux", feature = "dbus"))]
             dbus: None,
             #[cfg(all(target_os = "linux", feature = "dbus"))]
@@ -465,11 +495,15 @@ impl Manager {
     }
 
     pub fn bind_notify(&mut self) -> Result<(), String> {
-        let path = self.cfg.paths.notify_socket();
-        self.notify = Some(crate::platform::net::bind_notify(&path)?);
+        #[cfg(unix)]
+        {
+            let path = self.cfg.paths.notify_socket();
+            self.notify = Some(crate::platform::net::bind_notify(&path)?);
+        }
         Ok(())
     }
 
+    #[cfg(unix)]
     fn handle_connection(&mut self, stream: UnixStream) {
         use std::io::{BufRead, BufReader, BufWriter, Write};
         let mut reader = BufReader::new(stream);
@@ -593,47 +627,67 @@ impl Manager {
     /// lingering empty cgroup (oneshot that already exited) does not.
     pub(crate) fn unit_has_processes(&self, name: &str) -> bool {
         let u = &self.units[name];
-        u.main_pid.is_some()
-            || u.group_pid.is_some()
-            || u.cgroup
-                .as_ref()
-                .map(|d| !cgroup::is_empty(d))
-                .unwrap_or(false)
+        u.main_pid.is_some() || u.group_pid.is_some() || {
+            #[cfg(unix)]
+            {
+                u.cgroup
+                    .as_ref()
+                    .map(|dir| !cgroup::is_empty(dir))
+                    .unwrap_or(false)
+            }
+            #[cfg(windows)]
+            {
+                false
+            }
+        }
     }
 
     /// Create (or reuse) the unit's cgroup and apply its resource limits.
     /// Returns `None` when cgroup v2 is unavailable; callers fall back to
     /// process groups.
     fn ensure_cgroup(&mut self, name: &str) -> Option<PathBuf> {
-        if let Some(dir) = self.units[name].cgroup.clone() {
-            return Some(dir);
+        #[cfg(unix)]
+        {
+            if let Some(dir) = self.units[name].cgroup.clone() {
+                return Some(dir);
+            }
+            let root = cgroup::root()?;
+            let dir = cgroup::create(&root, name).ok()?;
+            if let Some(service) = self.units[name].service_cfg() {
+                cgroup::apply_limits(&dir, &service.cgroup_limits);
+            }
+            self.units.get_mut(name).unwrap().cgroup = Some(dir.clone());
+            Some(dir)
         }
-        let root = cgroup::root()?;
-        let dir = cgroup::create(&root, name).ok()?;
-        if let Some(sc) = self.units[name].service_cfg() {
-            let limits = sc.cgroup_limits;
-            cgroup::apply_limits(&dir, &limits);
+        #[cfg(windows)]
+        {
+            let _ = name;
+            None
         }
-        self.units.get_mut(name).unwrap().cgroup = Some(dir.clone());
-        Some(dir)
     }
 
     /// Signal the whole process tree of a unit: the cgroup when present,
     /// else the process group.
     pub(crate) fn kill_tree(&self, name: &str, sig: Signal) {
-        if let Some(dir) = self.units.get(name).and_then(|u| u.cgroup.clone()) {
+        #[cfg(unix)]
+        if let Some(dir) = self.units.get(name).and_then(|unit| unit.cgroup.clone()) {
             cgroup::kill(&dir, sig);
-        } else if let Some(gp) = self.units.get(name).and_then(|u| u.group_pid) {
-            spawn::kill_group(gp, sig).ok();
+            return;
+        }
+        if let Some(group) = self.units.get(name).and_then(|unit| unit.group_pid) {
+            spawn::kill_group(group, sig).ok();
         }
     }
 
     /// SIGKILL the whole process tree (cgroup.kill when available).
     fn kill_tree_kill(&self, name: &str) {
-        if let Some(dir) = self.units.get(name).and_then(|u| u.cgroup.clone()) {
+        #[cfg(unix)]
+        if let Some(dir) = self.units.get(name).and_then(|unit| unit.cgroup.clone()) {
             cgroup::kill_all(&dir);
-        } else if let Some(gp) = self.units.get(name).and_then(|u| u.group_pid) {
-            spawn::kill_group(gp, Signal::SIGKILL).ok();
+            return;
+        }
+        if let Some(group) = self.units.get(name).and_then(|unit| unit.group_pid) {
+            spawn::kill_group(group, Signal::SIGKILL).ok();
         }
     }
 
@@ -1182,6 +1236,32 @@ impl Manager {
                 return;
             }
         };
+        #[cfg(windows)]
+        {
+            let unsupported = match sc.service_type {
+                ServiceType::Forking => Some("Type=forking is not supported on Windows"),
+                ServiceType::Notify => Some("Type=notify is not supported on Windows"),
+                ServiceType::Dbus => Some("Type=dbus is not supported on Windows"),
+                _ if sc.user.is_some() || sc.group.is_some() => {
+                    Some("User=/Group= are not supported on Windows")
+                }
+                _ if sc.kill_mode == KillMode::Process => {
+                    Some("KillMode=process is not supported on Windows; use the Job Object default")
+                }
+                _ if sc.cgroup_limits.memory_high.is_some() => {
+                    Some("MemoryHigh= is not supported by Win32 Job Objects")
+                }
+                _ if sc.cgroup_limits.cpu_weight.is_some() => {
+                    Some("CPUWeight= is not supported by the Windows manager MVP")
+                }
+                _ => None,
+            };
+            if let Some(reason) = unsupported {
+                self.units.get_mut(name).unwrap().result = UnitResult::Protocol;
+                self.fail_unit(name, reason.to_string());
+                return;
+            }
+        }
         let list_ref: &Vec<crate::unit::ExecCommand> = match cmd {
             UnitControlCommand::StartPre => self.exec_slice(&sc, cmd),
             UnitControlCommand::Start => self.exec_slice(&sc, cmd),
@@ -1248,19 +1328,26 @@ impl Manager {
                 }
             },
             cgroup,
+            #[cfg(windows)]
+            limits: sc.cgroup_limits,
+            #[cfg(windows)]
+            unit_name: name.to_string(),
         };
 
         match spawn::spawn(&opts) {
             Ok(sp) => {
-                if let Some(fd) = sp.stdout {
-                    let raw = fd.as_raw_fd();
-                    self.out_fds.insert(raw, name.to_string());
-                    self.owned_fds.insert(raw, fd);
-                }
-                if let Some(fd) = sp.stderr {
-                    let raw = fd.as_raw_fd();
-                    self.out_fds.insert(raw, name.to_string());
-                    self.owned_fds.insert(raw, fd);
+                #[cfg(unix)]
+                {
+                    if let Some(fd) = sp.stdout {
+                        let raw = fd.as_raw_fd();
+                        self.out_fds.insert(raw, name.to_string());
+                        self.owned_fds.insert(raw, fd);
+                    }
+                    if let Some(fd) = sp.stderr {
+                        let raw = fd.as_raw_fd();
+                        self.out_fds.insert(raw, name.to_string());
+                        self.owned_fds.insert(raw, fd);
+                    }
                 }
                 let pid = sp.pid;
                 self.pid_unit.insert(pid, name.to_string());
@@ -1604,8 +1691,8 @@ impl Manager {
     }
 
     /// Probe whether a process group still has live members (null signal).
-    fn group_alive(pgid: i32) -> bool {
-        nix::sys::signal::kill(Pid::from_raw(-pgid), None).is_ok()
+    fn group_alive(group: i32) -> bool {
+        spawn::group_alive(group)
     }
 
     /// Detect and clean up a self-daemonizing service: after a foreground main
@@ -1756,6 +1843,9 @@ impl Manager {
 
     fn fail_unit(&mut self, name: &str, msg: String) {
         self.mgr(name, &format!("failed: {msg}"));
+        if let Some(unit) = self.units.get_mut(name) {
+            unit.log.push_chunk(&format!("rustemd: failed: {msg}\n"));
+        }
         let res = self.units[name].result;
         self.units
             .get_mut(name)
@@ -1820,7 +1910,7 @@ impl Manager {
         for spec in &scfg.listen_stream {
             match bind_listen_stream(spec) {
                 Ok(listener) => {
-                    let fd = listener.as_raw_fd();
+                    let fd = listener.id();
                     self.socket_listeners.insert(fd, listener);
                     self.socket_triggers
                         .insert(fd, (name.to_string(), service.clone()));
@@ -1846,7 +1936,7 @@ impl Manager {
     /// `.socket` stop: close the bound listeners and drop their triggers.
     #[cfg(feature = "socket")]
     pub(crate) fn stop_socket(&mut self, name: &str) {
-        let fds: Vec<RawFd> = self
+        let fds: Vec<SocketId> = self
             .socket_triggers
             .iter()
             .filter(|(_, (unit, _))| unit == name)
@@ -1931,8 +2021,8 @@ impl Manager {
 
     /// Listening fds to pass to a service being socket-activated.
     #[cfg(feature = "socket")]
-    fn socket_fds_for(&self, service: &str) -> Vec<RawFd> {
-        let mut fds: Vec<RawFd> = self
+    fn socket_fds_for(&self, service: &str) -> Vec<spawn::ListenHandle> {
+        let mut fds: Vec<spawn::ListenHandle> = self
             .socket_triggers
             .iter()
             .filter(|(_, (_, svc))| svc == service)
@@ -1968,16 +2058,20 @@ impl Manager {
     }
 
     pub(crate) fn finalize_stop(&mut self, name: &str) {
-        // Drain stdout fds for this unit.
-        let fds: Vec<RawFd> = self
-            .out_fds
-            .iter()
-            .filter(|(_, n)| *n == name)
-            .map(|(fd, _)| *fd)
-            .collect();
-        for fd in fds {
-            self.out_fds.remove(&fd);
-            self.owned_fds.remove(&fd);
+        // Drain stdout fds for this unit on Unix. Windows reader threads
+        // terminate when the Job Object closes.
+        #[cfg(unix)]
+        {
+            let fds: Vec<RawFd> = self
+                .out_fds
+                .iter()
+                .filter(|(_, unit)| *unit == name)
+                .map(|(fd, _)| *fd)
+                .collect();
+            for fd in fds {
+                self.out_fds.remove(&fd);
+                self.owned_fds.remove(&fd);
+            }
         }
         // A Type=dbus unit that is stopped before acquiring its BusName= must
         // drop its pending name watch.
@@ -1986,8 +2080,13 @@ impl Manager {
         let u = self.units.get_mut(name).unwrap();
         u.main_pid = None;
         u.group_pid = None;
+        #[cfg(unix)]
         if let Some(dir) = u.cgroup.take() {
             cgroup::release(&dir);
+        }
+        #[cfg(windows)]
+        {
+            u.cgroup = None;
         }
         u.control_pid = None;
         u.control_command = None;
@@ -2259,6 +2358,7 @@ impl Manager {
 
     // ---- event loop -----------------------------------------------------------
 
+    #[cfg(unix)]
     pub fn run(&mut self) {
         self.process_jobs();
         loop {
@@ -2453,6 +2553,78 @@ impl Manager {
         }
     }
 
+    #[cfg(windows)]
+    pub fn run(&mut self) {
+        self.process_jobs();
+        loop {
+            self.tick(Instant::now());
+            self.reap();
+            self.read_signalfd();
+            self.drain_windows_output();
+            self.drain_windows_ipc();
+
+            #[cfg(feature = "socket")]
+            {
+                let ready: Vec<SocketId> = self
+                    .socket_triggers
+                    .iter()
+                    .filter(|(_, (_, service))| {
+                        self.units
+                            .get(service)
+                            .map(|unit| unit.active == ActiveState::Inactive)
+                            .unwrap_or(true)
+                    })
+                    .filter_map(|(id, _)| {
+                        self.socket_listeners
+                            .get(id)
+                            .is_some_and(SocketListener::take_trigger)
+                            .then_some(*id)
+                    })
+                    .collect();
+                for id in ready {
+                    if let Some((_, service)) = self.socket_triggers.get(&id).cloned() {
+                        let _ = self.start(&service);
+                    }
+                }
+            }
+
+            if self.shutting_down && self.idle() {
+                break;
+            }
+            let sleep = self
+                .wheel
+                .next_deadline()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(50))
+                .min(Duration::from_millis(50));
+            std::thread::sleep(sleep.max(Duration::from_millis(1)));
+        }
+    }
+
+    #[cfg(windows)]
+    fn drain_windows_ipc(&mut self) {
+        let requests = self
+            .listener
+            .as_ref()
+            .map(|listener| listener.drain())
+            .unwrap_or_default();
+        for request in requests {
+            let response = crate::ipc::dispatch(self, &request.line);
+            let mut line = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
+            line.push('\n');
+            request.respond(line);
+        }
+    }
+
+    #[cfg(windows)]
+    fn drain_windows_output(&mut self) {
+        for (name, bytes) in spawn::drain_output() {
+            if let Some(unit) = self.units.get_mut(&name) {
+                unit.log.push_chunk(&String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
+
     fn read_signalfd(&mut self) {
         let Some(sfd) = &self.signalfd else { return };
         let signals = sfd.read();
@@ -2461,6 +2633,7 @@ impl Manager {
         }
     }
 
+    #[cfg(unix)]
     fn accept_connections(&mut self) {
         let accepted: Vec<UnixStream> = if let Some(listener) = &self.listener {
             let mut v = Vec::new();
@@ -2476,6 +2649,7 @@ impl Manager {
         }
     }
 
+    #[cfg(unix)]
     fn read_notify(&mut self) {
         let datagrams: Vec<Vec<u8>> = {
             let Some(sock) = &self.notify else {
@@ -2496,6 +2670,7 @@ impl Manager {
         }
     }
 
+    #[cfg(unix)]
     fn handle_notify_datagram(&mut self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
         let mut ready = false;
@@ -2539,6 +2714,7 @@ impl Manager {
         }
     }
 
+    #[cfg(unix)]
     fn read_stdout(&mut self, fd: RawFd) {
         let name = match self.out_fds.get(&fd) {
             Some(n) => n.clone(),
@@ -2816,6 +2992,7 @@ fn signal_name(sig: i32) -> String {
 /// pipe tracked in `out_fds`, or a bound socket). It stays open for the
 /// whole event-loop iteration; we never poll an fd after removing it from
 /// `out_fds`.
+#[cfg(unix)]
 fn borrowed_fd(fd: RawFd) -> BorrowedFd<'static> {
     // SAFETY: the fd is valid and stays open through the poll/read; see above.
     unsafe { BorrowedFd::borrow_raw(fd) }
@@ -2905,6 +3082,7 @@ mod tests {
     /// A dangling `.wants`-dir reference (e.g. `podman.socket` on a host
     /// without podman) must not be a load error — systemd silently ignores a
     /// dependency on a unit that has no backing file.
+    #[cfg(unix)]
     #[test]
     fn missing_wants_reference_is_silent() {
         let dir = tempfile::tempdir().unwrap();
@@ -2946,6 +3124,26 @@ mod tests {
         assert_eq!(mgr.units["a.target"].active, ActiveState::Active);
         assert!(!mgr.units.contains_key("graphical.target"));
         assert!(!mgr.units.contains_key("missing.service"));
+    }
+
+    #[cfg(feature = "socket")]
+    #[test]
+    fn list_unit_files_includes_socket_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(
+            units.join("api.socket"),
+            "[Socket]\nListenStream=127.0.0.1:0\n",
+        )
+        .unwrap();
+        let mut mgr = Manager::new(scratch_cfg(&dir)).unwrap();
+        mgr.load_all();
+        assert!(
+            mgr.list_unit_file_info()
+                .iter()
+                .any(|entry| entry.file == "api.socket")
+        );
     }
 
     /// A `Requires=` dependency that fails *synchronously* (its job completes

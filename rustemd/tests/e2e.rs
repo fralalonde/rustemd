@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end test: run the real manager daemon in a thread and drive it over
 //! the socket with the programmatic `Control` API (the library alternative to
 //! `systemctl`/D-Bus). Exercises loading, the full process lifecycle, and
@@ -256,7 +258,7 @@ fn daemonizing_service_orphans_are_swept() {
 
 /// A `.socket` unit binds a unix socket; the first connection activates its
 /// matching `.service` on demand (inetd-style socket activation).
-#[cfg(feature = "socket")]
+#[cfg(all(unix, feature = "socket"))]
 #[test]
 fn socket_activates_service_on_connection() {
     use std::os::unix::net::UnixStream;

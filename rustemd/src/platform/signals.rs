@@ -6,7 +6,8 @@
 
 use std::os::fd::{AsFd, BorrowedFd};
 
-use nix::sys::signal::{self, SigSet, Signal};
+use crate::platform::signal::Signal;
+use nix::sys::signal::{self, SigSet};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 
 /// The signals the manager acts on.
@@ -27,13 +28,19 @@ impl SignalSource {
     pub fn new() -> Option<SignalSource> {
         let mut set = SigSet::empty();
         for s in MANAGED_SIGNALS {
-            set.add(s);
+            if let Some(signal) = s.to_nix() {
+                set.add(signal);
+            }
         }
         signal::sigprocmask(signal::SigmaskHow::SIG_BLOCK, Some(&set), None).ok()?;
         // SAFETY: installing SIG_IGN for SIGPIPE is a process-global but
         // idempotent disposition change done exactly once at startup.
         unsafe {
-            signal::signal(Signal::SIGPIPE, signal::SigHandler::SigIgn).ok()?;
+            signal::signal(
+                nix::sys::signal::Signal::SIGPIPE,
+                signal::SigHandler::SigIgn,
+            )
+            .ok()?;
         }
         // Non-blocking so `read()` below drains pending signals without
         // stalling the event loop on a second read.

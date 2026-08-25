@@ -10,12 +10,11 @@
 //! the only type that runs processes; *target*/*timer*/*socket* are marker or
 //! trigger types with no process of their own.
 
-use nix::sys::signal::Signal;
-
 use crate::manager::Manager;
 use crate::manager::state::{
     ActiveState, ControlCommand as UnitControlCommand, SubState, UnitResult,
 };
+use crate::platform::signal::Signal;
 
 pub trait UnitType {
     /// Begin the start sequence for a unit already cleared as operational.

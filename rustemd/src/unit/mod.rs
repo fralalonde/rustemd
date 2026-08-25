@@ -9,8 +9,7 @@ pub mod parse;
 
 use std::path::PathBuf;
 
-use nix::sys::resource::Resource;
-use nix::sys::signal::Signal;
+use crate::platform::signal::Signal;
 
 use crate::calendar::CalendarSpec;
 use crate::specifier::SpecifierContext;
@@ -156,7 +155,7 @@ pub fn parse_exit_status(value: &str) -> Result<ExitCodeSet, String> {
         } else if let Ok(n) = tok.parse::<u32>() {
             out.codes.push((n, n));
         } else if let Some(sig) = sig_from_name(tok) {
-            out.signals.push(sig as i32);
+            out.signals.push(sig.as_raw());
         } else if let Some(code) = sysexit_from_name(tok) {
             out.codes.push((code, code));
         } else {
@@ -200,6 +199,9 @@ pub fn sysexit_from_name(s: &str) -> Option<u32> {
 /// Parse a signal by name, accepting `SIGTERM`, `TERM`, or a bare number.
 pub fn sig_from_name(s: &str) -> Option<Signal> {
     let s = s.strip_prefix("SIG").unwrap_or(s);
+    if let Ok(number) = s.parse::<i32>() {
+        return Signal::try_from(number).ok();
+    }
     let s = s.to_ascii_uppercase();
     let n = match s.as_str() {
         "HUP" => 1,
@@ -237,9 +239,17 @@ pub fn sig_from_name(s: &str) -> Option<Signal> {
     Signal::try_from(n).ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RlimitResource {
+    NoFile,
+    NProc,
+    Core,
+    AddressSpace,
+}
+
 #[derive(Debug, Clone)]
 pub struct Rlimit {
-    pub resource: Resource,
+    pub resource: RlimitResource,
     pub soft: u64,
     pub hard: u64,
 }
@@ -664,19 +674,19 @@ fn build_service(
     }
     for v in raw.list("Service", "LimitNOFILE") {
         cfg.rlimits
-            .push(parse_rlimit(Resource::RLIMIT_NOFILE, &exp(v))?);
+            .push(parse_rlimit(RlimitResource::NoFile, &exp(v))?);
     }
     for v in raw.list("Service", "LimitNPROC") {
         cfg.rlimits
-            .push(parse_rlimit(Resource::RLIMIT_NPROC, &exp(v))?);
+            .push(parse_rlimit(RlimitResource::NProc, &exp(v))?);
     }
     for v in raw.list("Service", "LimitCORE") {
         cfg.rlimits
-            .push(parse_rlimit(Resource::RLIMIT_CORE, &exp(v))?);
+            .push(parse_rlimit(RlimitResource::Core, &exp(v))?);
     }
     for v in raw.list("Service", "LimitAS") {
         cfg.rlimits
-            .push(parse_rlimit(Resource::RLIMIT_AS, &exp(v))?);
+            .push(parse_rlimit(RlimitResource::AddressSpace, &exp(v))?);
     }
     if let Some(v) = unit_scalar(raw, "Service", "MemoryMax") {
         cfg.cgroup_limits.memory_max = Some(parse_bytes(&exp(v))?);
@@ -724,7 +734,7 @@ fn parse_octal(v: &str) -> Result<u32, String> {
     u32::from_str_radix(v, 8).map_err(|_| format!("invalid octal `{v}`"))
 }
 
-fn parse_rlimit(resource: Resource, v: &str) -> Result<Rlimit, String> {
+fn parse_rlimit(resource: RlimitResource, v: &str) -> Result<Rlimit, String> {
     let (soft, hard) = match v.split_once(':') {
         Some((s, h)) => (s.trim(), h.trim()),
         None => (v.trim(), v.trim()),
@@ -1000,6 +1010,12 @@ mod tests {
         assert!(!set.matches(Some(5), None));
         assert!(set.matches(None, Some(15)));
         assert!(!set.matches(None, Some(9)));
+    }
+
+    #[test]
+    fn signal_parser_accepts_numeric_wire_values() {
+        assert_eq!(sig_from_name("9"), Some(Signal::SIGKILL));
+        assert_eq!(sig_from_name("15"), Some(Signal::SIGTERM));
     }
 
     #[test]

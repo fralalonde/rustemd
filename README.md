@@ -1,16 +1,14 @@
 # rustemd
 
-A **systemd init reimplementation in Rust** — a drop-in `systemctl`
-replacement with a built-in unit manager: unit files, user services, timers,
-and dependency-driven lifecycle. Per-service **cgroups** (Linux cgroup v2) with
-**process groups** + a **subreaper** as the fallback where cgroups aren't
-available.
+A **systemd unit-manager reimplementation in Rust** — a `systemctl`-compatible
+CLI with a built-in manager for unit files, user services, timers, socket
+triggers, and dependency-driven lifecycle. Linux uses cgroups v2 with process
+groups as a fallback; Windows uses native Win32 Job Objects.
 
-> **Status:** functional core, Linux-focused. Unit parsing, service
-> supervision, timers, socket activation, a D-Bus manager interface
-> (opt-in `dbus` feature),
-> udev `.device` units, `.mount` units, `enable`/`disable`, a JSON IPC
-> daemon, and a `systemctl`-compatible CLI all work and are tested. No
+> **Status:** functional core on Linux and Windows. Linux additionally supports
+> PID-1 boot, D-Bus (opt-in), udev `.device` units, and `.mount` units. Windows
+> supports `.service`, `.socket` (TCP trigger activation), `.timer`, and
+> `.target` units in SCM system mode or interactive `--user` mode. There is no
 > journald or service sandboxing yet.
 
 ---
@@ -20,13 +18,13 @@ available.
 ```sh
 cargo build --release
 
-# Run the manager (user mode — no root needed):
+# Linux/macOS user manager:
 ./target/release/rustemd daemon --user
-
-# In another terminal, control it with the systemctl-compatible CLI:
 ./target/release/rustemctl --user list-units
-./target/release/rustemctl --user start myapp.service
-./target/release/rustemctl --user status myapp.service
+
+# Windows user manager (PowerShell):
+.\target\release\rustemd.exe daemon --user
+.\target\release\rustemctl.exe --user list-units
 ```
 
 Two binaries split the work: `rustemd` is the PID-1 manager daemon, and
@@ -39,6 +37,46 @@ ln -s /path/to/rustemctl /usr/local/bin/systemctl
 ```
 
 `rustemctl` (optionally invoked via the symlink) is a drop-in `systemctl`.
+
+### Windows service and user modes
+
+Run an interactive manager for the signed-in user without elevation:
+
+```powershell
+.\target\release\rustemd.exe daemon --user
+.\target\release\rustemctl.exe --user status myapp.service
+```
+
+User units are read from `%LOCALAPPDATA%\rustemd\config` and
+`%LOCALAPPDATA%\rustemd\units`. The user control endpoint is a named pipe,
+`\\.\pipe\rustemd-user-<identity-hash>`.
+
+To host the system manager in the Windows Service Control Manager, use an
+elevated PowerShell or Command Prompt:
+
+```powershell
+rustemd.exe service install                   # automatic start
+rustemd.exe service install --manual          # demand start
+sc.exe start rustemd
+rustemctl.exe list-units
+sc.exe stop rustemd
+rustemd.exe service uninstall
+```
+
+`--name` and `--display-name` can customize registration. System units live
+under `%ProgramData%\rustemd\config` and `%ProgramData%\rustemd\units`; the
+control pipe is `\\.\pipe\rustemd-system`.
+
+Windows `.service` support covers `Type=simple`, `exec`, `idle`, and `oneshot`.
+Each process tree is placed in a kill-on-close Job Object before its primary
+thread is resumed. `MemoryMax=` and `TasksMax=` map to Job Object limits.
+`Type=forking`, `notify`, and `dbus`, plus `User=`/`Group=`, fail explicitly.
+
+Windows `.socket` units support TCP `ListenStream=host:port` and consume one pending connection and start the
+matching service. The MVP does **not** pass
+the listening socket into the child; it is a launch trigger rather than full
+`LISTEN_FDS` handoff. Unix-domain `ListenStream=` values are rejected on
+Windows.
 
 ### Shell completions
 
@@ -136,16 +174,16 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
 
 **Lifecycle & supervision**
 - Dependency graph (start order from `After`/`Requires`, stop order reversed)
-- Process groups as the supervision boundary; `kill(-pgid, …)` reaches the
-  whole tree, SIGTERM then SIGKILL
-- Subreaper for daemonizing (`forking`) services
+- Linux: cgroups/process groups plus subreaper supervision
+- Windows: Win32 Job Objects assigned before process resume; stop terminates
+  the complete job tree
 - `systemctl start/stop/restart/reload/kill/status/is-active/is-failed`
 - `enable` / `disable` / `is-enabled` via `[Install]` symlinks
   (`WantedBy=`, `RequiredBy=`, `Alias=`, `Also=`)
 
 **Control surfaces**
 1. `systemctl`-compatible CLI
-2. JSON-over-unix-socket IPC (the `rustemd daemon` listens here)
+2. JSON-line IPC over Unix sockets (Linux) or named pipes (Windows)
 3. A **programmatic `Control` API** (library alternative to the CLI/D-Bus) —
    see below
 
@@ -206,7 +244,7 @@ which depends on the library's `Control` API).
 | `manager::ops` | Typed operations shared by IPC and the `Control` API |
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
-| `platform` | OS-specific surface: `process` (spawn/kill/reap), `signals` (signalfd), `net` (unix sockets), `mount` (mount/umount), `udev` (sysfs/netlink devices) |
+| `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
 | `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux, opt-in `dbus` feature) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
@@ -218,20 +256,22 @@ The `systemctl`-compatible CLI lives in the separate `rustemctl` crate (its
 `cli` module), which consumes the library's `client`/`paths`/`enable`/
 `cli_style`/`names` modules.
 
-**Portability.** All raw Linux/unix syscalls live in `platform/` behind small,
-documented functions. Porting to a new OS means reimplementing those three
-submodules, not auditing the manager. `unsafe` is confined to two justified
-sites: the `pre_exec` closure in `platform::process` (the API requires it) and
-a one-line `prctl(PR_SET_CHILD_SUBREAPER)`.
+**Portability.** Raw OS operations live under `platform/`: Unix uses `nix`,
+while Windows uses direct `windows-sys` bindings for named pipes, Job Objects,
+console controls, Winsock polling, and SCM hosting. The manager retains one
+state machine with platform-specific event-loop adapters.
 
 ---
 
 ## Testing
 
 ```sh
-cargo test            # 72 unit tests + 10 e2e daemon tests + 1 rustemctl CLI test
-cargo clippy -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
+
+# From Windows, run the Linux suite too when WSL is available:
+wsl.exe -e bash -lc 'cd /mnt/d/path/to/rustemd && cargo test --workspace'
 ```
 
 Integration tests boot the real manager and drive it over the socket —
@@ -258,7 +298,13 @@ daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
   control interface. Off by default to keep the default build free of the
   zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
   `--features dbus` to enable it.
-- **Linux/unix only** — `platform/` is `#[cfg(unix)]`; Windows/Mac are planned.
+- **Windows socket activation is trigger-only** — TCP listeners activate the
+  service but are not inherited by it. Unix sockets and `LISTEN_FDS` handoff
+  remain Unix-only.
+- **Windows service-type subset** — `forking`, `notify`, `dbus`, `User=`,
+  `Group=`, `MemoryHigh=`, `CPUWeight=`, and `KillMode=process` fail explicitly. Windows has no
+  generic POSIX-signal equivalent; stop/kill terminate the unit Job Object.
+- **macOS is not yet a supported manager target.**
 - No journald, service sandboxing (`ProtectSystem=`, `DynamicUser=`, seccomp,
   capability/device restrictions), or `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.

@@ -18,6 +18,7 @@ pub struct Paths {
 }
 
 impl Paths {
+    #[cfg(unix)]
     pub fn system() -> Self {
         let runtime = env::var_os("RUSTEMD_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -42,6 +43,30 @@ impl Paths {
         }
     }
 
+    #[cfg(windows)]
+    pub fn system() -> Self {
+        let root = env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("rustemd");
+        let runtime_dir = env::var_os("RUSTEMD_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("runtime"));
+        let unit_path = env::var_os("RUSTEMD_UNIT_PATH")
+            .map(|paths| env::split_paths(&paths).collect())
+            .unwrap_or_else(|| vec![root.join("config"), root.join("units")]);
+        let config_dir = env::var_os("RUSTEMD_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("config"));
+        Paths {
+            user: false,
+            unit_path,
+            config_dir,
+            runtime_dir,
+        }
+    }
+
+    #[cfg(unix)]
     pub fn user() -> Result<Self, String> {
         let runtime = if let Some(p) = env::var_os("RUSTEMD_RUNTIME_DIR") {
             PathBuf::from(p)
@@ -73,17 +98,68 @@ impl Paths {
         })
     }
 
+    #[cfg(windows)]
+    pub fn user() -> Result<Self, String> {
+        let local = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("USERPROFILE")
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })
+            .ok_or_else(|| {
+                "LOCALAPPDATA and USERPROFILE are not set (needed for user mode)".to_string()
+            })?;
+        let root = local.join("rustemd");
+        let runtime_dir = env::var_os("RUSTEMD_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("runtime"));
+        let unit_path = env::var_os("RUSTEMD_UNIT_PATH")
+            .map(|paths| env::split_paths(&paths).collect())
+            .unwrap_or_else(|| vec![root.join("config"), root.join("units")]);
+        let config_dir = env::var_os("RUSTEMD_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("config"));
+        Ok(Paths {
+            user: true,
+            unit_path,
+            config_dir,
+            runtime_dir,
+        })
+    }
+
     /// Override for tests: full path to the control socket.
     pub fn socket_override() -> Option<PathBuf> {
         env::var_os("RUSTEMD_SOCKET").map(PathBuf::from)
     }
 
-    /// Path to the manager's control unix socket.
+    /// Endpoint for the manager control transport (path on Unix, named pipe on Windows).
     pub fn control_socket(&self) -> PathBuf {
         if let Some(s) = Self::socket_override() {
             return s;
         }
-        self.runtime_dir.join("rustemd").join("control")
+        #[cfg(unix)]
+        {
+            self.runtime_dir.join("rustemd").join("control")
+        }
+        #[cfg(windows)]
+        {
+            if self.user {
+                // Include domain and profile path so simultaneous sessions with
+                // the same leaf username do not contend for one global pipe.
+                let identity = format!(
+                    "{}\\{}|{}",
+                    env::var("USERDOMAIN").unwrap_or_default(),
+                    env::var("USERNAME").unwrap_or_else(|_| "unknown".into()),
+                    env::var("USERPROFILE").unwrap_or_default(),
+                );
+                PathBuf::from(format!(
+                    r"\\.\pipe\rustemd-user-{:016x}",
+                    stable_hash(&identity)
+                ))
+            } else {
+                PathBuf::from(r"\\.\pipe\rustemd-system")
+            }
+        }
     }
 
     /// Path to the sd_notify-compatible datagram socket.
@@ -182,6 +258,17 @@ impl Paths {
     }
 }
 
+#[cfg(windows)]
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(unix)]
 fn user_config_dir() -> PathBuf {
     if let Some(c) = env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(c).join("systemd").join("user")
@@ -199,12 +286,25 @@ fn user_config_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn system_defaults() {
         let p = Paths::system();
         assert!(!p.user);
         assert_eq!(p.runtime_dir, PathBuf::from("/run"));
         assert_eq!(p.control_socket(), PathBuf::from("/run/rustemd/control"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_defaults_use_program_data_and_named_pipe() {
+        let p = Paths::system();
+        assert!(!p.user);
+        assert!(p.runtime_dir.ends_with(r"rustemd\runtime"));
+        assert_eq!(
+            p.control_socket(),
+            PathBuf::from(r"\\.\pipe\rustemd-system")
+        );
     }
 
     #[test]

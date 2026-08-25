@@ -25,12 +25,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use nix::sys::resource::setrlimit;
-use nix::sys::signal::{SigSet, SigmaskHow, Signal};
+use nix::sys::signal::{SigSet, SigmaskHow};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Gid, Pid, Uid};
 use nix::unistd::{chdir, setgid, setgroups, setsid, setuid};
 
-use crate::unit::{Rlimit, StdioTarget};
+use crate::platform::signal::Signal;
+use crate::unit::{Rlimit, RlimitResource, StdioTarget};
+
+pub type ListenHandle = RawFd;
 
 /// A spawned service process and any captured output pipes.
 pub struct Spawned {
@@ -305,7 +308,13 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
                 libc::setpriority(libc::PRIO_PROCESS, 0, n);
             }
             for rl in &rlimits {
-                if let Err(e) = setrlimit(rl.resource, rl.soft, rl.hard) {
+                let resource = match rl.resource {
+                    RlimitResource::NoFile => nix::sys::resource::Resource::RLIMIT_NOFILE,
+                    RlimitResource::NProc => nix::sys::resource::Resource::RLIMIT_NPROC,
+                    RlimitResource::Core => nix::sys::resource::Resource::RLIMIT_CORE,
+                    RlimitResource::AddressSpace => nix::sys::resource::Resource::RLIMIT_AS,
+                };
+                if let Err(e) = setrlimit(resource, rl.soft, rl.hard) {
                     return Err(std::io::Error::from(e));
                 }
             }
@@ -372,8 +381,18 @@ fn open_file_stdio(path: &Path) -> Option<Stdio> {
 
 /// Signal the whole process group led by `group_pid`. A negative pid passed
 /// to `kill(2)` addresses the group.
-pub fn kill_group(group_pid: i32, sig: Signal) -> nix::Result<()> {
-    nix::sys::signal::kill(Pid::from_raw(-group_pid), sig)
+pub fn kill_group(group_pid: i32, sig: Signal) -> std::io::Result<()> {
+    let signal = sig.to_nix().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported signal {sig}"),
+        )
+    })?;
+    nix::sys::signal::kill(Pid::from_raw(-group_pid), signal).map_err(std::io::Error::from)
+}
+
+pub fn group_alive(group_pid: i32) -> bool {
+    nix::sys::signal::kill(Pid::from_raw(-group_pid), None).is_ok()
 }
 
 /// Reap every exited direct child (non-blocking). Returns `(pid, exit)`

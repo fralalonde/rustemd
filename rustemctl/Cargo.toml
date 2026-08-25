@@ -14,8 +14,9 @@ clap_complete_nushell = "4.6.2"
 serde_json = "1"
 colored = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31.3", features = ["signal"] }
 
 [dev-dependencies]
 tempfile = "3"

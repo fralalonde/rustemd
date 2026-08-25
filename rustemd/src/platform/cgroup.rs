@@ -15,7 +15,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nix::sys::signal::Signal;
+use crate::platform::signal::Signal;
 use nix::unistd::Pid;
 
 use crate::unit::CgroupLimits;
@@ -78,7 +78,9 @@ pub fn create(root: &Path, name: &str) -> io::Result<PathBuf> {
 /// and signal) is closed by the follow-up `kill_all`.
 pub fn kill(dir: &Path, sig: Signal) {
     for pid in procs(dir) {
-        let _ = nix::sys::signal::kill(Pid::from_raw(pid), sig);
+        if let Some(signal) = sig.to_nix() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(pid), signal);
+        }
     }
 }
 
@@ -90,7 +92,7 @@ pub fn kill_all(dir: &Path) {
         return;
     }
     for pid in procs(dir) {
-        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), nix::sys::signal::Signal::SIGKILL);
     }
 }
 

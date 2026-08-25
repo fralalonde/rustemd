@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::paths::Paths;
 
-/// Send one request over the manager's unix socket and return the response
+/// Send one request over the manager's platform control transport and return the response
 /// `data` (or an error message). Thin wrapper over [`crate::platform::net::request`].
 pub fn request_json(socket: &std::path::Path, req: &Value) -> Result<Value, String> {
     crate::platform::net::request(socket, req)

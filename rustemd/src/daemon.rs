@@ -1,4 +1,4 @@
-//! The PID-1 manager daemon entry point. `rustemd` is the init/manager
+//! The manager daemon and Windows SCM entry points. `rustemd` is the init/manager
 //! binary; the `systemctl`-compatible control CLI lives in the separate
 //! `rustemctl` crate. This module only exposes the `daemon` subcommand
 //! (plus `--version`), which is what `/init` execs at boot.
@@ -11,7 +11,7 @@ use crate::cli_style as style;
 #[command(
     name = "rustemd",
     version = crate::VERSION,
-    about = "A systemd init reimplementation: the PID-1 unit manager"
+    about = "A systemd-compatible unit manager"
 )]
 pub struct Cli {
     /// Talk to the per-user manager instead of the system one.
@@ -31,8 +31,39 @@ pub enum Command {
         #[arg(long)]
         no_socket_activation: bool,
     },
+    /// Install, remove, or run the native Windows Service Control Manager host.
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
     /// Show version.
     Version,
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+pub enum ServiceCommand {
+    /// Enter the Service Control Dispatcher. Invoked by SCM, not interactively.
+    Run {
+        #[arg(long, default_value = "rustemd")]
+        name: String,
+    },
+    /// Register rustemd as a Windows service. Requires an elevated terminal.
+    Install {
+        #[arg(long, default_value = "rustemd")]
+        name: String,
+        #[arg(long, default_value = "rustemd unit manager")]
+        display_name: String,
+        /// Use demand start instead of automatic start.
+        #[arg(long)]
+        manual: bool,
+    },
+    /// Remove the Windows service registration. Requires an elevated terminal.
+    Uninstall {
+        #[arg(long, default_value = "rustemd")]
+        name: String,
+    },
 }
 
 pub fn run(cli: Cli) -> i32 {
@@ -40,6 +71,24 @@ pub fn run(cli: Cli) -> i32 {
         Command::Daemon {
             no_socket_activation,
         } => run_daemon(cli.user, *no_socket_activation),
+        #[cfg(windows)]
+        Command::Service { action } => match action {
+            ServiceCommand::Run { name } => {
+                service_result(crate::platform::service::run_dispatcher(name))
+            }
+            ServiceCommand::Install {
+                name,
+                display_name,
+                manual,
+            } => service_result(crate::platform::service::install(
+                name,
+                display_name,
+                *manual,
+            )),
+            ServiceCommand::Uninstall { name } => {
+                service_result(crate::platform::service::uninstall(name))
+            }
+        },
         Command::Version => {
             println!("rustemd {}", crate::VERSION);
             0
@@ -47,12 +96,31 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
+#[cfg(windows)]
+fn service_result(result: Result<(), String>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("rustemd: {error}");
+            1
+        }
+    }
+}
+
 pub fn run_daemon(user: bool, no_socket_activation: bool) -> i32 {
+    run_daemon_with_ready(user, no_socket_activation, || {})
+}
+
+pub(crate) fn run_daemon_with_ready(
+    user: bool,
+    no_socket_activation: bool,
+    ready: impl FnOnce(),
+) -> i32 {
     // PID 1 boot: mount the API/virtual filesystems and run early-boot
     // configuration *before* reading the manager config, so the manager sees
     // the real hostname and a mounted /run (needed to bind its control
     // socket). Only compiled with the `boot` feature.
-    #[cfg(feature = "boot")]
+    #[cfg(all(unix, feature = "boot"))]
     if nix::unistd::getpid() == nix::unistd::Pid::from_raw(1) {
         if let Err(e) = crate::platform::boot::mount_api_filesystems() {
             eprintln!("rustemd: mount API filesystems failed: {e}");
@@ -117,10 +185,11 @@ pub fn run_daemon(user: bool, no_socket_activation: bool) -> i32 {
     } else {
         let _ = mgr.start("default.target");
     }
+    ready();
     eprintln!("rustemd {} manager started", crate::VERSION);
     mgr.run();
     // Shutdown complete. As PID 1, power the machine off; elsewhere just exit.
-    #[cfg(feature = "boot")]
+    #[cfg(all(unix, feature = "boot"))]
     if nix::unistd::getpid() == nix::unistd::Pid::from_raw(1) {
         eprintln!("rustemd: shutdown complete, powering off");
         crate::platform::boot::poweroff();
@@ -136,5 +205,46 @@ pub fn entry() -> i32 {
             let _ = e.print();
             e.exit_code()
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn parses_windows_service_install_and_uninstall_commands() {
+        let install = Cli::try_parse_from([
+            "rustemd",
+            "service",
+            "install",
+            "--name",
+            "rustemd-test",
+            "--manual",
+        ])
+        .unwrap();
+        assert!(matches!(
+            install.cmd,
+            Command::Service { action: ServiceCommand::Install { ref name, manual: true, .. } }
+                if name == "rustemd-test"
+        ));
+
+        let uninstall =
+            Cli::try_parse_from(["rustemd", "service", "uninstall", "--name", "rustemd-test"])
+                .unwrap();
+        assert!(matches!(
+            uninstall.cmd,
+            Command::Service { action: ServiceCommand::Uninstall { ref name } }
+                if name == "rustemd-test"
+        ));
+    }
+
+    #[test]
+    fn service_image_path_quotes_executable() {
+        let path = std::path::Path::new(r"C:\\Program Files\\rustemd\\rustemd.exe");
+        assert_eq!(
+            crate::platform::service::service_image_path(path),
+            r#""C:\\Program Files\\rustemd\\rustemd.exe" service run"#
+        );
     }
 }

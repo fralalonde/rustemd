@@ -196,7 +196,7 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             let sig = signal
                 .as_deref()
                 .and_then(rustemd::unit::sig_from_name)
-                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
+                .unwrap_or(rustemd::platform::signal::Signal::SIGTERM);
             client
                 .op_with(
                     "kill",

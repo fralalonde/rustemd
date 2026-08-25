@@ -8,7 +8,7 @@
 //! Architecture:
 //! - `manager` — the daemon: unit table, state machine, process supervision,
 //!   timer engine, all behind a single-threaded poll loop.
-//! - `ipc` + `client` — JSON-over-unix-socket control channel.
+//! - `ipc` + `client` — JSON-line control over Unix sockets or Win32 named pipes.
 //! - `daemon` — the PID-1 manager entry point (`rustemd daemon`).
 //! - `unit` — unit-file parsing and typed unit configuration.
 //! - `calendar` / `timespan` — systemd calendar expressions and time spans.
@@ -19,9 +19,9 @@
 //! The `systemctl`-compatible CLI lives in the sibling `rustemctl` crate,
 //! which uses this library's `client`/`paths`/`enable`/`cli_style` modules.
 //!
-//! Platform note: Linux is fully supported (signalfd, subreaper, process
-//! groups, D-Bus). The non-Linux build paths exist but are not yet exercised;
-//! the code keeps Linux-specific bits behind `cfg(target_os = "linux")`.
+//! Platform note: Linux uses signalfd, cgroups/process groups, and optional
+//! D-Bus. Windows uses named pipes, Job Objects, console controls, Winsock, and
+//! the Service Control Manager. Boot, mounts, devices, and D-Bus remain Linux-only.
 
 pub mod calendar;
 pub mod cli_style;

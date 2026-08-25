@@ -8,7 +8,7 @@
 //! - [`Manager`](crate::manager::Manager) — control an in-process manager
 //!   directly (no IPC, no subprocess, no D-Bus).
 //! - [`SocketClient`] — control a running manager daemon over the same
-//!   JSON-over-unix-socket protocol the `systemctl` CLI uses.
+//!   JSON-line platform transport protocol the `systemctl` CLI uses.
 //!
 //! ```no_run
 //! use rustemd::control::Control;
@@ -251,7 +251,7 @@ impl Control for Manager {
 // ---- remote implementation (SocketClient) ---------------------------------------
 
 /// A [`Control`] handle that talks to a running manager daemon over the
-/// JSON-line unix socket (the same channel the `systemctl` CLI uses).
+/// JSON-line platform transport (the same channel the `systemctl` CLI uses).
 ///
 /// Each call opens a short-lived connection, sends one request, and reads one
 /// response, so no persistent state is held and the handle is cheap to create.

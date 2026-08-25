@@ -68,10 +68,22 @@ access control.
 `NOTIFY_SOCKET` is set and `READY=1` honored, but the sd_notify watchdog and
 `NotifyAccess=` enforcement are not wired.
 
-### Windows/macOS build paths unverified
-`release.yml` builds zip/msi (Windows) and tar.gz/dmg (macOS) from this repo,
-but those jobs have never run — the first CI run will exercise untested
-`cfg`-gated paths.
+### Windows socket activation is trigger-only
+Windows `.socket` units support TCP launch-on-connection, but do not transfer
+the listening Winsock handle to the child. Services that require systemd-style
+`LISTEN_FDS` inheritance are not portable to the Windows MVP. Unix-domain
+listeners are rejected.
+
+### Windows directive subset
+The Win32 manager supports foreground and oneshot services. `Type=forking`,
+`notify`, and `dbus`; account switching (`User=`/`Group=`); `MemoryHigh=`; and
+`CPUWeight=` fail explicitly. Job Objects implement tree lifetime,
+`MemoryMax=`, and `TasksMax=`. Windows stop signals terminate the Job Object
+because Win32 has no generic POSIX-signal delivery API.
+
+### macOS build path unverified
+The release workflow builds a macOS artifact, but macOS does not yet have a
+supported manager platform implementation.
 
 ### Live VM has no standard shutdown commands
 Inside the live env, `shutdown` / `halt` / `poweroff` / `init 0` don't exist

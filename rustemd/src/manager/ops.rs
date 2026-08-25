@@ -170,7 +170,10 @@ impl Manager {
                 };
                 let f = f.to_string();
                 if p.is_file()
-                    && (f.ends_with(".service") || f.ends_with(".timer") || f.ends_with(".target"))
+                    && (f.ends_with(".service")
+                        || f.ends_with(".timer")
+                        || f.ends_with(".target")
+                        || cfg!(feature = "socket") && f.ends_with(".socket"))
                 {
                     rows.push(UnitFileInfo {
                         state: enable::enabled_state(&self.cfg.paths, &f),
@@ -286,7 +289,7 @@ impl Manager {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
         let _ = std::fs::remove_file(&target);
-        std::os::unix::fs::symlink(&link, &target).map_err(|e| e.to_string())?;
+        crate::platform::fs::link_file(&link, &target).map_err(|e| e.to_string())?;
         self.start(name).ok();
         Ok(())
     }

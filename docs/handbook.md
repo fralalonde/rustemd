@@ -1,11 +1,11 @@
 # Handbook
 
-Worked examples for writing units and driving the manager with `rustemd`.
-The `systemctl` binary in these examples is the `rustemd` binary invoked as a
-drop-in — every example works with either.
+Worked examples for writing units and driving the manager with `rustemctl`.
+On Linux, `rustemctl` may be symlinked as `systemctl`; the examples use that
+compatibility name.
 
-All examples assume you've built the project (`cargo build --release`) and are
-running `./target/release/rustemd daemon --user` (or `--system` as root).
+Linux examples assume `./target/release/rustemd daemon --user` is running.
+Windows examples use either `rustemd.exe daemon --user` or the native SCM host.
 
 ---
 
@@ -206,3 +206,101 @@ Every path is overridable for tests via `RUSTEMD_UNIT_PATH`,
 - **Completions** — `rustemctl completions <bash|fish|zsh|powershell|nushell>`
   emits a completion script for that shell, named after the invoked binary.
 
+
+
+---
+
+## Windows manager
+
+### Per-user mode
+
+Build and start the manager from PowerShell:
+
+```powershell
+cargo build --release
+.\target\release\rustemd.exe daemon --user
+```
+
+Place units in either of these directories (higher precedence first):
+
+- `%LOCALAPPDATA%\rustemd\config`
+- `%LOCALAPPDATA%\rustemd\units`
+
+Then use the normal client from another terminal:
+
+```powershell
+.\target\release\rustemctl.exe --user daemon-reload
+.\target\release\rustemctl.exe --user start hello.service
+.\target\release\rustemctl.exe --user status hello.service
+```
+
+A minimal Windows service unit uses native Windows command-line programs:
+
+```ini
+[Unit]
+Description=Windows worker
+
+[Service]
+Type=simple
+ExecStart=C:\Tools\worker.exe --serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+The process and all descendants run in a Win32 Job Object. `stop` terminates
+the Job Object, and manager exit closes every remaining job.
+
+### SCM system mode
+
+From an elevated terminal:
+
+```powershell
+rustemd.exe service install
+sc.exe start rustemd
+rustemctl.exe list-units
+sc.exe stop rustemd
+rustemd.exe service uninstall
+```
+
+Use `service install --manual` for demand start, or `--name` and
+`--display-name` for a custom registration. System units are searched in:
+
+- `%ProgramData%\rustemd\config`
+- `%ProgramData%\rustemd\units`
+
+SCM stop and system-shutdown controls request an orderly manager shutdown;
+the control callback itself does not run unit lifecycle work.
+
+### TCP socket trigger
+
+```ini
+# api.socket
+[Socket]
+ListenStream=127.0.0.1:8080
+Service=api.service
+
+# api.service
+[Service]
+Type=simple
+ExecStart=C:\Tools\api.exe
+```
+
+Starting `api.socket` binds the TCP listener. A pending connection is accepted as the trigger and activates `api.service`.
+For this MVP the listener remains owned by rustemd and is not
+passed to the child, so this is launch-on-connection rather than full systemd
+`LISTEN_FDS` handoff. Unix-domain listeners are not supported on Windows.
+
+### Windows compatibility table
+
+| Capability | Windows MVP |
+| --- | --- |
+| `Type=simple`, `exec`, `idle`, `oneshot` | Supported |
+| `.timer`, `.target` | Supported |
+| TCP `.socket` trigger | Supported; no child socket handoff |
+| `MemoryMax=`, `TasksMax=` | Win32 Job Object limits |
+| `Type=forking`, `notify`, `dbus` | Explicit error |
+| `User=`, `Group=` | Explicit error |
+| `MemoryHigh=`, `CPUWeight=`, `KillMode=process` | Explicit error |
+| Unix sockets, cgroups, mounts, devices, boot | Linux only |

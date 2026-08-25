@@ -1,4 +1,4 @@
-//! JSON-over-unix-socket control protocol between the `systemctl`-style CLI
+//! JSON-line control protocol between the `systemctl`-style CLI
 //! (and [`crate::control::SocketClient`]) and the manager.
 //!
 //! Each request is one JSON object per line; each response is one JSON object
@@ -78,7 +78,7 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
             let u = u.first().ok_or("kill: no unit")?.clone();
             let sig = req_str(req, "signal")
                 .and_then(crate::unit::sig_from_name)
-                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
+                .unwrap_or(crate::platform::signal::Signal::SIGTERM);
             mgr.kill(&u, sig)?;
             Ok(Value::Null)
         }

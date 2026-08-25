@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end test: run the real manager daemon, then drive it with the
 //! compiled `rustemctl` binary (the extracted `systemctl`-compatible CLI) over
 //! the socket. This proves the extraction kept the CLI talking to the daemon
