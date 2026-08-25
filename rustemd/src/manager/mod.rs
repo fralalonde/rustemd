@@ -346,10 +346,10 @@ impl Manager {
         names.insert("basic.target".into());
         names.insert("multi-user.target".into());
         names.insert("default.target".into());
-        if let Ok(md) = std::fs::read_link(self.cfg.paths.default_target()) {
-            if let Some(n) = md.file_name().and_then(|f| f.to_str()) {
-                names.insert(n.to_string());
-            }
+        if let Ok(md) = std::fs::read_link(self.cfg.paths.default_target())
+            && let Some(n) = md.file_name().and_then(|f| f.to_str())
+        {
+            names.insert(n.to_string());
         }
         let mut v: Vec<String> = names.into_iter().collect();
         v.sort();
@@ -364,17 +364,17 @@ impl Manager {
             match self.load_unit(&name) {
                 Ok(Some(mut unit)) => {
                     // Preserve runtime state for still-active units.
-                    if let Some(old) = self.units.get(&name) {
-                        if old.active != ActiveState::Inactive {
-                            unit.main_pid = old.main_pid;
-                            unit.group_pid = old.group_pid;
-                            unit.cgroup = old.cgroup.clone();
-                            unit.control_pid = old.control_pid;
-                            unit.control_command = old.control_command;
-                            unit.active = old.active;
-                            unit.sub = old.sub;
-                            unit.log = old.log.clone();
-                        }
+                    if let Some(old) = self.units.get(&name)
+                        && old.active != ActiveState::Inactive
+                    {
+                        unit.main_pid = old.main_pid;
+                        unit.group_pid = old.group_pid;
+                        unit.cgroup = old.cgroup.clone();
+                        unit.control_pid = old.control_pid;
+                        unit.control_command = old.control_command;
+                        unit.active = old.active;
+                        unit.sub = old.sub;
+                        unit.log = old.log.clone();
                     }
                     next.insert(name, unit);
                 }
@@ -550,15 +550,14 @@ impl Manager {
         if self.unit_active(name) {
             return Ok(());
         }
-        if let Some(jid) = self.unit_job.get(name).copied() {
-            if self
+        if let Some(jid) = self.unit_job.get(name).copied()
+            && self
                 .jobs
                 .get(&jid)
                 .map(|j| j.kind == JobKind::Start)
                 .unwrap_or(false)
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         self.enqueue_start_job(name);
         self.process_jobs();
@@ -788,14 +787,14 @@ impl Manager {
             if self.unit_active(&r) {
                 continue;
             }
-            if let Some(jid) = self.unit_job.get(&r) {
-                if self.jobs[jid].kind == JobKind::Start {
-                    waiting.push(WaitEntry {
-                        unit: r,
-                        required: true,
-                    });
-                    continue;
-                }
+            if let Some(jid) = self.unit_job.get(&r)
+                && self.jobs[jid].kind == JobKind::Start
+            {
+                waiting.push(WaitEntry {
+                    unit: r,
+                    required: true,
+                });
+                continue;
             }
             self.jobs.get_mut(&id).unwrap().failed = true;
             self.jobs.get_mut(&id).unwrap().failed_msg =
@@ -842,11 +841,11 @@ impl Manager {
                 }
                 continue;
             }
-            if let Some(jid) = self.unit_job.get(&d) {
-                if self.jobs[jid].kind == JobKind::Start {
-                    waiting.push(WaitEntry { unit: d, required });
-                    continue;
-                }
+            if let Some(jid) = self.unit_job.get(&d)
+                && self.jobs[jid].kind == JobKind::Start
+            {
+                waiting.push(WaitEntry { unit: d, required });
+                continue;
             }
             self.enqueue_start_job(&d);
             waiting.push(WaitEntry { unit: d, required });
@@ -865,13 +864,14 @@ impl Manager {
             if self.unit_active(a) {
                 continue;
             }
-            if let Some(jid) = self.unit_job.get(a) {
-                if self.jobs[jid].kind == JobKind::Start && !waiting.iter().any(|w| w.unit == *a) {
-                    waiting.push(WaitEntry {
-                        unit: a.clone(),
-                        required: false,
-                    });
-                }
+            if let Some(jid) = self.unit_job.get(a)
+                && self.jobs[jid].kind == JobKind::Start
+                && !waiting.iter().any(|w| w.unit == *a)
+            {
+                waiting.push(WaitEntry {
+                    unit: a.clone(),
+                    required: false,
+                });
             }
         }
 
@@ -1031,12 +1031,12 @@ impl Manager {
                 continue;
             }
             let mut remove_required = false;
-            if let Some(j) = self.jobs.get(&id) {
-                if let Some(pos) = j.waiting.iter().position(|w| w.unit == unit) {
-                    if !ok && j.waiting[pos].required {
-                        remove_required = true;
-                    }
-                }
+            if let Some(j) = self.jobs.get(&id)
+                && let Some(pos) = j.waiting.iter().position(|w| w.unit == unit)
+                && !ok
+                && j.waiting[pos].required
+            {
+                remove_required = true;
             }
             if remove_required {
                 self.jobs.get_mut(&id).unwrap().failed = true;
@@ -1059,16 +1059,16 @@ impl Manager {
             return;
         };
         let unit = job.unit.clone();
-        if job.kind == JobKind::Stop {
-            if let Some(next) = job.start_after_stop.clone() {
-                self.jobs.remove(&id);
-                if self.unit_job.get(&unit) == Some(&id) {
-                    self.unit_job.remove(&unit);
-                }
-                self.on_job_completed(&unit, true);
-                self.enqueue_start_job(&next);
-                return;
+        if job.kind == JobKind::Stop
+            && let Some(next) = job.start_after_stop.clone()
+        {
+            self.jobs.remove(&id);
+            if self.unit_job.get(&unit) == Some(&id) {
+                self.unit_job.remove(&unit);
             }
+            self.on_job_completed(&unit, true);
+            self.enqueue_start_job(&next);
+            return;
         }
         self.jobs.remove(&id);
         if self.unit_job.get(&unit) == Some(&id) {
@@ -1823,12 +1823,11 @@ impl Manager {
                 continue;
             }
             let mut required = false;
-            if let Some(j) = self.jobs.get(&id) {
-                if let Some(w) = j.waiting.iter().find(|w| w.unit == name) {
-                    if w.required {
-                        required = true;
-                    }
-                }
+            if let Some(j) = self.jobs.get(&id)
+                && let Some(w) = j.waiting.iter().find(|w| w.unit == name)
+                && w.required
+            {
+                required = true;
             }
             if required {
                 self.jobs.get_mut(&id).unwrap().failed = true;
@@ -2050,21 +2049,21 @@ impl Manager {
 
     fn arm_start_timeout(&mut self, name: &str) {
         let lim = self.units[name].service_cfg().map(|s| s.timeout_start_sec);
-        if let Some(ts) = lim {
-            if let Some(d) = ts.as_duration() {
-                self.wheel
-                    .schedule(Instant::now() + d, TimerKind::StartTimeout, name);
-            }
+        if let Some(ts) = lim
+            && let Some(d) = ts.as_duration()
+        {
+            self.wheel
+                .schedule(Instant::now() + d, TimerKind::StartTimeout, name);
         }
     }
 
     pub(crate) fn arm_stop_timeout(&mut self, name: &str) {
         let lim = self.units[name].service_cfg().map(|s| s.timeout_stop_sec);
-        if let Some(ts) = lim {
-            if let Some(d) = ts.as_duration() {
-                self.wheel
-                    .schedule(Instant::now() + d, TimerKind::StopTimeout, name);
-            }
+        if let Some(ts) = lim
+            && let Some(d) = ts.as_duration()
+        {
+            self.wheel
+                .schedule(Instant::now() + d, TimerKind::StopTimeout, name);
         }
     }
 
@@ -2250,15 +2249,15 @@ impl Manager {
                 name,
             );
         }
-        if let Some(when) = next_mono {
-            if when >= Instant::now() {
-                let sys_when = SystemTime::now() + when.duration_since(Instant::now());
-                next_display = Some(match next_display {
-                    Some(cur) if cur <= sys_when => cur,
-                    _ => sys_when,
-                });
-                self.wheel.schedule(when, TimerKind::MonotonicElapse, name);
-            }
+        if let Some(when) = next_mono
+            && when >= Instant::now()
+        {
+            let sys_when = SystemTime::now() + when.duration_since(Instant::now());
+            next_display = Some(match next_display {
+                Some(cur) if cur <= sys_when => cur,
+                _ => sys_when,
+            });
+            self.wheel.schedule(when, TimerKind::MonotonicElapse, name);
         }
 
         st.next_display = next_display;
@@ -2287,18 +2286,18 @@ impl Manager {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if let Some(t) = self.units.get_mut(unit) {
-            if let Some(ts) = t.timer.as_mut() {
-                ts.last_trigger = Some(SystemTime::now());
-                match kind {
-                    TimerKind::CalendarElapse(idx) => {
-                        ts.last_trigger_calendar = Some((now_epoch, idx));
-                    }
-                    TimerKind::MonotonicElapse => {
-                        ts.last_trigger_monotonic = Some(Instant::now());
-                    }
-                    _ => {}
+        if let Some(t) = self.units.get_mut(unit)
+            && let Some(ts) = t.timer.as_mut()
+        {
+            ts.last_trigger = Some(SystemTime::now());
+            match kind {
+                TimerKind::CalendarElapse(idx) => {
+                    ts.last_trigger_calendar = Some((now_epoch, idx));
                 }
+                TimerKind::MonotonicElapse => {
+                    ts.last_trigger_monotonic = Some(Instant::now());
+                }
+                _ => {}
             }
         }
         self.mgr(unit, &format!("triggered {target}"));

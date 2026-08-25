@@ -205,10 +205,10 @@ impl Unit {
 
     /// The unit that a timer activates (default: same prefix, `.service`).
     pub fn activated_unit(&self) -> String {
-        if let Some(t) = self.timer_cfg() {
-            if let Some(u) = &t.unit {
-                return u.clone();
-            }
+        if let Some(t) = self.timer_cfg()
+            && let Some(u) = &t.unit
+        {
+            return u.clone();
         }
         let dot = self.name.rfind('.').unwrap_or(self.name.len());
         format!("{}.service", &self.name[..dot])
@@ -217,10 +217,10 @@ impl Unit {
     /// The service a socket unit activates (default: same prefix, `.service`).
     #[cfg(feature = "socket")]
     pub fn activated_service(&self) -> String {
-        if let Some(s) = self.socket_cfg() {
-            if let Some(u) = &s.service {
-                return u.clone();
-            }
+        if let Some(s) = self.socket_cfg()
+            && let Some(u) = &s.service
+        {
+            return u.clone();
         }
         let dot = self.name.rfind('.').unwrap_or(self.name.len());
         format!("{}.service", &self.name[..dot])

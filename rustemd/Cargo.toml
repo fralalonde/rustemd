@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A systemd init reimplementation in Rust: a drop-in systemctl replacement with unit files, user services, and timers."
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [features]
 default = ["socket", "udev"]

@@ -119,15 +119,12 @@ Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
 `Spawned { pid, stdout, stderr }` (`platform/process.rs:39-43`); the manager
 carries `#[cfg]` branches for fd-polling vs `drain_output`.
 
-### Declared MSRV (1.85) is wrong; code needs 1.88+
-`rustemd/Cargo.toml` says `rust-version = "1.85"` but
-`rustemd/src/platform/windows/net.rs` uses let-chains (`... && let ...`,
-stabilized in Rust 1.88). Bumping `rust-version` to 1.88 is correct but
-unmasks ~29 `collapsible_if` clippy lints (clippy gates the let-chain collapse
-suggestion on `rust-version`) that would then need collapsing; defer bump +
-`cargo clippy --fix` + retest to a later pass. Note: `rustemd-repo` sets
-`rust-version = "1.89"` (it uses `std::fs::File::lock`), which transitively
-raises the workspace floor to 1.89 regardless.
+### ~~MSRV under-declared (1.85 vs actual 1.89)~~ — fixed
+`rustemd`, `rustemctl`, and `rustemd-tui` all declared `rust-version = "1.85"`
+while the code used let-chains (stabilized in Rust 1.88) and depends on
+`rustemd-repo` (declared `1.89`, uses `std::fs::File::lock`) transitively. Bumped
+all three crates to `1.89` (matching `rustemd-repo`) and collapsed the ~31
+`collapsible_if` clippy lints the higher MSRV unmasked, via `cargo clippy --fix`.
 
 ### Two windows-sys versions in the tree
 0.61.2 (direct) and 0.59.0 (via crossterm/anstyle). Harmless.

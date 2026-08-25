@@ -800,10 +800,10 @@ fn parse_stdio(v: &str) -> Result<StdioTarget, String> {
             }
         }
     };
-    if let Some(e) = path_err {
-        if !ignore {
-            return Err(e);
-        }
+    if let Some(e) = path_err
+        && !ignore
+    {
+        return Err(e);
     }
     Ok(out)
 }

@@ -192,13 +192,13 @@ fn link_existing(paths: &Paths, name: &str) {
             };
             let d = paths.config_dir.join(format!("{base}.{suffix}"));
             // Only descend into dirs whose `base` is a target-style name.
-            if base.contains(".") {
-                if let Ok(rd2) = fs::read_dir(&d) {
-                    for l in rd2.flatten() {
-                        let link_name = l.file_name().to_string_lossy().to_string();
-                        if link_name == name {
-                            fs::remove_file(l.path()).ok();
-                        }
+            if base.contains(".")
+                && let Ok(rd2) = fs::read_dir(&d)
+            {
+                for l in rd2.flatten() {
+                    let link_name = l.file_name().to_string_lossy().to_string();
+                    if link_name == name {
+                        fs::remove_file(l.path()).ok();
                     }
                 }
             }

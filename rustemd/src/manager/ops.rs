@@ -98,10 +98,10 @@ impl Manager {
             if !types.is_empty() && !types.iter().any(|t| n.ends_with(&format!(".{t}"))) {
                 continue;
             }
-            if let Some(st) = state {
-                if active_str(u.active) != st {
-                    continue;
-                }
+            if let Some(st) = state
+                && active_str(u.active) != st
+            {
+                continue;
             }
             rows.push(UnitSummary {
                 unit: n,

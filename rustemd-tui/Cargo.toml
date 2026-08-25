@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Terminal UI client for a running rustemd unit manager."
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 rustemd = { path = "../rustemd" }
