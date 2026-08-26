@@ -779,3 +779,72 @@ fn failing_assert_fails_unit() {
         "an unsatisfied Assert* must fail the unit's start job (state failed)"
     );
 }
+
+/// `RuntimeDirectory=` / `StateDirectory=` are created+owned at start and
+/// cleaned up on stop: the runtime dir is removed unconditionally, while the
+/// state dir is removed only when empty — so a state dir the service wrote to
+/// persists.
+#[test]
+fn runtime_and_state_directories_created_and_cleaned() {
+    let s = Scratch::new();
+    let state_root = s.dir.path().join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    // SAFETY: we hold the env lock (via Scratch) for the whole test, so no
+    // other test in this process touches the environment while we set this.
+    unsafe {
+        std::env::set_var("RUSTEMD_STATE_DIR", &state_root);
+    }
+    // The service writes into its state dir so it is non-empty on stop.
+    let marker = state_root.join("mysvc").join("marker");
+    let unit = format!(
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\n\
+         RuntimeDirectory=mysvc\nStateDirectory=mysvc\n\
+         ExecStart=/bin/sh -c 'echo x > {}'\n",
+        marker.display()
+    );
+    s.write_unit("dirs.service", &unit);
+
+    let d = Daemon::start();
+    let mut c = d.client();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&d.socket).exists()
+    }));
+
+    c.start(&["dirs.service"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        c.status(&["dirs.service"])
+            .map(|v| v.first().is_some_and(|x| x.active == "active"))
+            .unwrap_or(false)
+    }));
+
+    // Both directories exist after start...
+    let run_dir = s.dir.path().join("run").join("mysvc");
+    let state_dir = state_root.join("mysvc");
+    assert!(run_dir.is_dir(), "runtime dir should be created on start");
+    assert!(state_dir.is_dir(), "state dir should be created on start");
+    assert!(
+        marker.exists(),
+        "service should be able to write into its state dir"
+    );
+    // ...with the default 0755 access mode.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "runtime dir should default to access mode 0755"
+    );
+
+    c.stop(&["dirs.service"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        c.status(&["dirs.service"])
+            .map(|v| v.first().is_some_and(|x| x.active == "inactive"))
+            .unwrap_or(false)
+    }));
+
+    // The runtime dir is removed on stop; the non-empty state dir persists.
+    assert!(!run_dir.exists(), "runtime dir should be removed on stop");
+    assert!(
+        state_dir.is_dir(),
+        "non-empty state dir should persist after stop"
+    );
+}

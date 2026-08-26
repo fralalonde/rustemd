@@ -474,6 +474,33 @@ impl Condition {
     }
 }
 
+/// Which root a `*Directory=` directive lives under (`<root>/<name>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryKind {
+    /// `RuntimeDirectory=` — the manager's runtime dir.
+    Runtime,
+    /// `StateDirectory=` — the state dir.
+    State,
+    /// `CacheDirectory=` — the cache dir.
+    Cache,
+    /// `LogsDirectory=` — the log dir.
+    Logs,
+    /// `ConfigurationDirectory=` — the config dir.
+    Configuration,
+}
+
+/// One parsed `*Directory=` entry, carrying its base [`DirectoryKind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectorySpec {
+    pub kind: DirectoryKind,
+    /// Directory name (joined onto the kind's root as `<root>/<name>`).
+    pub name: String,
+    /// Explicit mode from `name:0755`; `None` means the default (`0755`).
+    pub mode: Option<u32>,
+    /// `name:recursive` — create intermediate components with `create_dir_all`.
+    pub recursive: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ServiceConfig {
     pub service_type: ServiceType,
@@ -510,6 +537,8 @@ pub struct ServiceConfig {
     pub std_output: StdioTarget,
     pub std_error: StdioTarget,
     pub std_input: bool, // false = /dev/null
+    /// `*Directory=` directives (`RuntimeDirectory=` & co.), in file order.
+    pub directories: Vec<DirectorySpec>,
 }
 
 impl ServiceConfig {
@@ -999,12 +1028,58 @@ fn build_service(
             other => return Err(format!("unsupported StandardInput `{other}`")),
         };
     }
+    // `*Directory=` directives are repeatable and whitespace-split; each entry
+    // can carry a `:0755` mode or `:recursive` marker.
+    for (dir, kind) in [
+        ("RuntimeDirectory", DirectoryKind::Runtime),
+        ("StateDirectory", DirectoryKind::State),
+        ("CacheDirectory", DirectoryKind::Cache),
+        ("LogsDirectory", DirectoryKind::Logs),
+        ("ConfigurationDirectory", DirectoryKind::Configuration),
+    ] {
+        for v in raw.list("Service", dir) {
+            for tok in exp(v).split_whitespace() {
+                cfg.directories.push(parse_directory(kind, tok)?);
+            }
+        }
+    }
     parse_sandbox(raw, exp, &mut cfg)?;
     Ok(cfg)
 }
 
 fn parse_octal(v: &str) -> Result<u32, String> {
     u32::from_str_radix(v, 8).map_err(|_| format!("invalid octal `{v}`"))
+}
+
+/// Parse one `*Directory=` entry: `name`, `name:` (default mode), `name:0755`,
+/// or `name:recursive`.
+fn parse_directory(kind: DirectoryKind, value: &str) -> Result<DirectorySpec, String> {
+    let (name, suffix) = match value.split_once(':') {
+        Some((n, s)) => (n, Some(s)),
+        None => (value, None),
+    };
+    if name.trim().is_empty() {
+        return Err(format!("empty directory name in `{value}`"));
+    }
+    let mut spec = DirectorySpec {
+        kind,
+        name: name.trim().to_string(),
+        mode: None,
+        recursive: false,
+    };
+    if let Some(s) = suffix {
+        let s = s.trim();
+        if s.is_empty() {
+            // `name:` — default mode.
+        } else if s == "recursive" {
+            spec.recursive = true;
+        } else if let Ok(mode) = u32::from_str_radix(s, 8) {
+            spec.mode = Some(mode);
+        } else {
+            return Err(format!("invalid directory mode/option `{value}`"));
+        }
+    }
+    Ok(spec)
 }
 
 fn parse_rlimit(resource: RlimitResource, v: &str) -> Result<Rlimit, String> {
@@ -1767,5 +1842,90 @@ mod tests {
         assert!(cond(ConditionKind::PathIsReadWrite, full_file.to_str().unwrap()).evaluate(&ctx));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_every_directory_directive() {
+        let f = build_str(
+            "[Service]\n\
+             RuntimeDirectory=myrun\n\
+             StateDirectory=mystate\n\
+             CacheDirectory=mycache\n\
+             LogsDirectory=mylog\n\
+             ConfigurationDirectory=myconf\n\
+             ExecStart=/bin/true\n",
+            "d.service",
+        )
+        .unwrap();
+        let dirs = &f.service.as_ref().unwrap().directories;
+        assert_eq!(dirs.len(), 5);
+        assert_eq!(
+            dirs[0],
+            DirectorySpec {
+                kind: DirectoryKind::Runtime,
+                name: "myrun".into(),
+                mode: None,
+                recursive: false,
+            }
+        );
+        assert_eq!(dirs[1].kind, DirectoryKind::State);
+        assert_eq!(dirs[1].name, "mystate");
+        assert_eq!(dirs[2].kind, DirectoryKind::Cache);
+        assert_eq!(dirs[3].kind, DirectoryKind::Logs);
+        assert_eq!(dirs[4].kind, DirectoryKind::Configuration);
+    }
+
+    #[test]
+    fn directory_mode_and_recursive() {
+        let f = build_str(
+            "[Service]\nRuntimeDirectory=a b:0750 c:recursive d:\nExecStart=/bin/true\n",
+            "m.service",
+        )
+        .unwrap();
+        let dirs = &f.service.as_ref().unwrap().directories;
+        assert_eq!(dirs.len(), 4);
+        // Bare name → default mode, not recursive.
+        assert_eq!(
+            dirs[0],
+            DirectorySpec {
+                kind: DirectoryKind::Runtime,
+                name: "a".into(),
+                mode: None,
+                recursive: false,
+            }
+        );
+        // `name:0750` → explicit octal mode.
+        assert_eq!(dirs[1].mode, Some(0o750));
+        assert!(!dirs[1].recursive);
+        // `name:recursive` → recursive flag, no explicit mode.
+        assert!(dirs[2].recursive);
+        assert_eq!(dirs[2].mode, None);
+        // Trailing `:` → default mode.
+        assert_eq!(
+            dirs[3],
+            DirectorySpec {
+                kind: DirectoryKind::Runtime,
+                name: "d".into(),
+                mode: None,
+                recursive: false,
+            }
+        );
+        // Every entry in one line shares the Runtime kind.
+        assert!(dirs.iter().all(|d| d.kind == DirectoryKind::Runtime));
+    }
+
+    #[test]
+    fn rejects_invalid_directory_mode() {
+        let err = build_str(
+            "[Service]\nRuntimeDirectory=foo:bogus\nExecStart=/bin/true\n",
+            "x.service",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("invalid directory mode/option"),
+            "unexpected error: {err}"
+        );
+        // Empty name is rejected.
+        assert!(build_str("[Service]\nStateDirectory=:0755\n", "x.service").is_err());
     }
 }

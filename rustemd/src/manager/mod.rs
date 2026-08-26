@@ -26,7 +26,9 @@ use crate::platform::process as spawn;
 use crate::platform::signal::Signal;
 use crate::platform::signals::SignalSource;
 use crate::specifier::SpecifierContext;
-use crate::unit::{KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind};
+use crate::unit::{
+    DirectoryKind, KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind,
+};
 use rustemd_repo::Repo;
 
 use self::deps as D;
@@ -351,6 +353,107 @@ impl Manager {
             env.insert("UNIT_NAME".into(), u.name.clone());
         }
         env
+    }
+
+    /// Base directory for a `*Directory=` directive's root. System manager
+    /// roots mirror systemd (`/run`, `/var/lib`, `/var/cache`, `/var/log`,
+    /// `/etc`); the user manager follows XDG. `RUSTEMD_*` env hooks override
+    /// each (matching the `paths.rs` convention) so tests can use scratch dirs.
+    fn base_dir(&self, kind: DirectoryKind) -> PathBuf {
+        let env_or = |key: &str, default: PathBuf| -> PathBuf {
+            std::env::var_os(key).map(PathBuf::from).unwrap_or(default)
+        };
+        let home = PathBuf::from(&self.cfg.home);
+        match kind {
+            DirectoryKind::Runtime => {
+                env_or("RUSTEMD_RUNTIME_DIR", self.cfg.paths.runtime_dir.clone())
+            }
+            DirectoryKind::State => env_or("RUSTEMD_STATE_DIR", {
+                if self.cfg.user {
+                    env_or("XDG_STATE_HOME", home.join(".local").join("state"))
+                } else {
+                    PathBuf::from("/var/lib")
+                }
+            }),
+            DirectoryKind::Cache => env_or("RUSTEMD_CACHE_DIR", {
+                if self.cfg.user {
+                    env_or("XDG_CACHE_HOME", home.join(".cache"))
+                } else {
+                    PathBuf::from("/var/cache")
+                }
+            }),
+            DirectoryKind::Logs => env_or("RUSTEMD_LOG_DIR", {
+                if self.cfg.user {
+                    env_or("XDG_STATE_HOME", home.join(".local").join("state")).join("log")
+                } else {
+                    PathBuf::from("/var/log")
+                }
+            }),
+            DirectoryKind::Configuration => env_or("RUSTEMD_CONFIG_ROOT", {
+                if self.cfg.user {
+                    env_or("XDG_CONFIG_HOME", home.join(".config"))
+                } else {
+                    PathBuf::from("/etc")
+                }
+            }),
+        }
+    }
+
+    /// Create and own the unit's `*Directory=` directories (`<root>/<name>`)
+    /// before the process turns up: create (recursively if requested), chmod
+    /// to the explicit mode or `0755`, then chown to `User=`/`Group=` if set.
+    fn apply_directories(&self, sc: &ServiceConfig) -> Result<(), String> {
+        for d in &sc.directories {
+            let path = self.base_dir(d.kind).join(&d.name);
+            if d.recursive {
+                std::fs::create_dir_all(&path)
+                    .map_err(|e| format!("create {}: {e}", path.display()))?;
+            } else if !path.is_dir() {
+                std::fs::create_dir(&path)
+                    .map_err(|e| format!("create {}: {e}", path.display()))?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = d.mode.unwrap_or(0o755) & 0o7777;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+                if let Some(user) = &sc.user
+                    && let Some((uid, primary_gid, _)) = spawn::resolve_user(user)
+                {
+                    let gid = sc
+                        .group
+                        .as_deref()
+                        .and_then(spawn::resolve_group)
+                        .unwrap_or(primary_gid);
+                    nix::unistd::chown(
+                        std::path::Path::new(&path),
+                        Some(nix::unistd::Uid::from_raw(uid)),
+                        Some(nix::unistd::Gid::from_raw(gid)),
+                    )
+                    .map_err(|e| format!("chown {}: {e}", path.display()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove runtime directories on stop; remove state directories only when
+    /// empty (matching systemd). Cache/log/config directories persist.
+    fn cleanup_directories(&self, dirs: &[crate::unit::DirectorySpec]) {
+        for d in dirs {
+            let path = self.base_dir(d.kind).join(&d.name);
+            match d.kind {
+                DirectoryKind::Runtime => {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                DirectoryKind::State => {
+                    // remove_dir only works on an empty directory.
+                    let _ = std::fs::remove_dir(&path);
+                }
+                DirectoryKind::Cache | DirectoryKind::Logs | DirectoryKind::Configuration => {}
+            }
+        }
     }
 
     // ---- unit loading -------------------------------------------------------
@@ -1428,6 +1531,16 @@ impl Manager {
             .and_then(|u| spawn::resolve_user(&u).map(|t| t.2))
             .unwrap_or_default();
 
+        // Create/own the unit's `*Directory=` directories before the process
+        // turns up (on the Start command, which is the process spawn).
+        if cmd == UnitControlCommand::Start
+            && let Err(e) = self.apply_directories(&sc)
+        {
+            self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+            self.fail_unit(name, e);
+            return;
+        }
+
         let cgroup = self.ensure_cgroup(name);
 
         let opts = spawn::SpawnOptions {
@@ -2190,6 +2303,12 @@ impl Manager {
     }
 
     pub(crate) fn finalize_stop(&mut self, name: &str) {
+        // Snap the *Directory= directives before the mutable unit borrow, so
+        // the cleanup can remove runtime/empty-state dirs on stop.
+        let dirs = self.units[name]
+            .service_cfg()
+            .map(|s| s.directories.clone())
+            .unwrap_or_default();
         // Drain stdout fds for this unit on Unix. Windows reader threads
         // terminate when the Job Object closes.
         #[cfg(unix)]
@@ -2233,6 +2352,9 @@ impl Manager {
                 self.finish_job(jid);
             }
         }
+        // Remove the runtime (and empty state) directories; cache/log/config
+        // directories persist by design.
+        self.cleanup_directories(&dirs);
         self.timer_dep_check(name);
     }
 
