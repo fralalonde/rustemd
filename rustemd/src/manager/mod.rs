@@ -3129,6 +3129,63 @@ impl Manager {
                     Err(e) => DbReply::Error(e),
                 }
             }
+            DbOp::ListUnits1 => {
+                let mut rows = Vec::new();
+                let mut names: Vec<String> = self.units.keys().cloned().collect();
+                names.sort();
+                for n in names {
+                    if let Some(e) = self.dbus_entry(&n) {
+                        rows.push(self.unit_info1(&n, e));
+                    }
+                }
+                DbReply::UnitList1(rows)
+            }
+            DbOp::GetUnit1(name) => {
+                let n = crate::names::normalize_unit(name);
+                DbReply::Unit1(self.dbus_entry(&n).map(|e| self.unit_info1(&n, e)))
+            }
+            DbOp::LoadUnit(name) => {
+                let n = crate::names::normalize_unit(name);
+                if self.units.contains_key(&n) {
+                    DbReply::UnitPath(crate::dbus::unit_dbus_path(&n))
+                } else {
+                    match self.load_unit(&n) {
+                        Ok(Some(unit)) => {
+                            // Fresh load inserts the unit into the table.
+                            self.units.insert(n.clone(), unit);
+                            DbReply::UnitPath(crate::dbus::unit_dbus_path(&n))
+                        }
+                        Ok(None) => DbReply::Error(format!("No such unit '{n}'")),
+                        Err(e) => DbReply::Error(e),
+                    }
+                }
+            }
+            DbOp::ListJobs => {
+                let mut jobs = Vec::new();
+                let mut ids: Vec<u64> = self.jobs.keys().cloned().collect();
+                ids.sort();
+                for id in ids {
+                    if let Some(job) = self.jobs.get(&id) {
+                        jobs.push(crate::dbus::JobInfo {
+                            id: id as u32,
+                            unit: job.unit.clone(),
+                            job_type: job_kind_str(job.kind).to_string(),
+                            state: if job.waiting.is_empty() {
+                                "running".to_string()
+                            } else {
+                                "waiting".to_string()
+                            },
+                            unit_path: crate::dbus::unit_dbus_path(&job.unit),
+                            job_path: format!("/org/freedesktop/systemd1/job/{id}"),
+                        });
+                    }
+                }
+                DbReply::JobList(jobs)
+            }
+            DbOp::GetUnitProcesses(name) => {
+                let n = crate::names::normalize_unit(name);
+                DbReply::ProcessList(self.unit_processes(&n))
+            }
         }
     }
 
@@ -3178,6 +3235,70 @@ impl Manager {
         })
     }
 
+    /// Expand a native [`crate::dbus::UnitEntry`] into the systemd1 `UnitInfo`
+    /// struct fields, resolving the unit's object path and the job currently
+    /// targeting it (if any).
+    fn unit_info1(&self, name: &str, e: crate::dbus::UnitEntry) -> crate::dbus::UnitInfo1 {
+        let (job_id, job_type, job_object_path) = match self
+            .jobs
+            .iter()
+            .find(|(_, j)| j.unit == name)
+            .map(|(&id, j)| (id, job_kind_str(j.kind)))
+        {
+            Some((id, kind)) => (
+                id as u32,
+                kind.to_string(),
+                format!("/org/freedesktop/systemd1/job/{id}"),
+            ),
+            None => (0, String::new(), "/".to_string()),
+        };
+        crate::dbus::UnitInfo1 {
+            name: e.name,
+            description: e.description,
+            load: e.load,
+            active: e.active,
+            sub: e.sub,
+            following: String::new(),
+            object_path: crate::dbus::unit_dbus_path(name),
+            job_id,
+            job_type,
+            job_object_path,
+        }
+    }
+
+    /// The processes of a unit as systemd1 `GetUnitProcesses` entries. Reads
+    /// the unit's cgroup `cgroup.procs` when it has a cgroup; otherwise falls
+    /// back to the main pid. Returns an empty list when the unit is not
+    /// running.
+    fn unit_processes(&self, name: &str) -> Vec<crate::dbus::ProcessInfo> {
+        let Some(u) = self.units.get(name) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(dir) = &u.cgroup {
+            let cgroup = dir.display().to_string();
+            if let Ok(text) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+                for line in text.lines() {
+                    let Ok(pid) = line.trim().parse::<u32>() else {
+                        continue;
+                    };
+                    out.push(crate::dbus::ProcessInfo {
+                        cgroup: cgroup.clone(),
+                        pid,
+                        cmdline: read_cmdline(pid),
+                    });
+                }
+            }
+        } else if let Some(pid) = u.main_pid {
+            out.push(crate::dbus::ProcessInfo {
+                cgroup: String::new(),
+                pid: pid as u32,
+                cmdline: read_cmdline(pid as u32),
+            });
+        }
+        out
+    }
+
     /// Register `unit` as waiting on `bus_name` and ask the monitor thread to
     /// watch for it.
     fn watch_bus_name(&mut self, unit: &str, bus_name: &str) {
@@ -3217,6 +3338,30 @@ impl Default for ManagerCfg {
 
 fn unit_kind_of(name: &str) -> UnitKind {
     UnitKind::from_unit_name(name).unwrap_or(UnitKind::Service)
+}
+
+/// The systemd1 wire string for a [`JobKind`] (`start`/`stop`/`restart`).
+#[cfg(all(target_os = "linux", feature = "dbus"))]
+fn job_kind_str(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Start => "start",
+        JobKind::Stop => "stop",
+        JobKind::Restart => "restart",
+    }
+}
+
+/// Read a pid's `/proc/<pid>/cmdline` (NUL-separated args) as a single
+/// space-joined string. Empty string when the process is gone or unreadable.
+#[cfg(all(target_os = "linux", feature = "dbus"))]
+fn read_cmdline(pid: u32) -> String {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    let spaced: Vec<u8> = bytes
+        .iter()
+        .map(|&b| if b == 0 { b' ' } else { b })
+        .collect();
+    String::from_utf8_lossy(&spaced).trim().to_string()
 }
 
 fn is_builtin(name: &str) -> bool {

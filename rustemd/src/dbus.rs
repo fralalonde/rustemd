@@ -55,6 +55,42 @@ pub struct UnitEntry {
 /// A unit's `(name, load, active, sub, description)` tuple on the wire.
 pub type UnitRow = (String, String, String, String, String);
 
+/// One row of the systemd1-compatible `ListUnits` reply: the `UnitInfo`
+/// struct array members in wire order, as plain fields the manager fills in.
+#[derive(Debug, Clone)]
+pub struct UnitInfo1 {
+    pub name: String,
+    pub description: String,
+    pub load: String,
+    pub active: String,
+    pub sub: String,
+    pub following: String,
+    pub object_path: String,
+    pub job_id: u32,
+    pub job_type: String,
+    pub job_object_path: String,
+}
+
+/// One row of the systemd1-compatible `ListJobs` reply: the `JobInfo`
+/// struct array members in wire order.
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub id: u32,
+    pub unit: String,
+    pub job_type: String,
+    pub state: String,
+    pub unit_path: String,
+    pub job_path: String,
+}
+
+/// One entry of the systemd1-compatible `GetUnitProcesses` reply.
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub cgroup: String,
+    pub pid: u32,
+    pub cmdline: String,
+}
+
 /// Build the object path under which a unit's `org.freedesktop.systemd1.Unit`
 /// interface is served, escaping `name` per systemd's `bus_label_escape`:
 /// ASCII alphanumerics are emitted unchanged, and every other byte as `_`
@@ -107,6 +143,11 @@ pub enum DbOp {
     GetUnit(String),
     StartUnit(String),
     StopUnit(String),
+    ListUnits1,
+    GetUnit1(String),
+    LoadUnit(String),
+    ListJobs,
+    GetUnitProcesses(String),
 }
 
 /// A request from a D-Bus method handler to the manager. Carries its own
@@ -124,6 +165,11 @@ pub enum DbReply {
     UnitStarted,
     UnitStopped,
     Error(String),
+    UnitList1(Vec<UnitInfo1>),
+    Unit1(Option<UnitInfo1>),
+    UnitPath(String),
+    JobList(Vec<JobInfo>),
+    ProcessList(Vec<ProcessInfo>),
 }
 
 /// Name-ownership events forwarded from the monitor thread to the manager.
@@ -239,28 +285,44 @@ impl ManagerIface {
 }
 
 impl ManagerIface {
-    /// Send a request to the manager and block for its reply (with a timeout,
-    /// so a wedged manager can't hang a D-Bus worker thread forever).
+    /// Send a request to the manager and block for its reply.
     fn call(&self, op: DbOp) -> Result<DbReply, String> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.cmd_tx
-            .send(DbRequest {
-                reply: reply_tx,
-                op,
-            })
-            .map_err(|_| "manager channel closed".to_string())?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "manager did not reply (timeout)".to_string())
+        bridge_call(&self.cmd_tx, op)
     }
 }
 
-/// The systemd1-compatible `org.freedesktop.systemd1.Manager` interface. In
-/// this phase it only exposes the `Version` property; the systemd1 control
-/// methods (`ListUnits`/`StartUnit`/…) and the `UnitNew`/`UnitRemoved` signals
-/// arrive in later phases — those signals are emitted by the monitor thread,
-/// not declared here.
-struct Systemd1ManagerIface;
+/// Send a request to the manager and block for its reply (with a timeout,
+/// so a wedged manager can't hang a D-Bus worker thread forever). Shared by
+/// both the native `org.rustemd.Manager1` interface and the systemd1
+/// `org.freedesktop.systemd1.Manager` surface.
+fn bridge_call(cmd_tx: &Sender<DbRequest>, op: DbOp) -> Result<DbReply, String> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    cmd_tx
+        .send(DbRequest {
+            reply: reply_tx,
+            op,
+        })
+        .map_err(|_| "manager channel closed".to_string())?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "manager did not reply (timeout)".to_string())
+}
+
+/// The systemd1-compatible `org.freedesktop.systemd1.Manager` interface. It
+/// serves the `Version` property plus the systemd1 read methods
+/// (`ListUnits`/`GetUnit`/`LoadUnit`/`ListJobs`/`GetUnitProcesses`), each
+/// bridged to the manager over `cmd_tx`. The `UnitNew`/`UnitRemoved` signals
+/// are emitted by the monitor thread, not declared here.
+struct Systemd1ManagerIface {
+    cmd_tx: Sender<DbRequest>,
+}
+
+impl Systemd1ManagerIface {
+    /// Send a request to the manager and block for its reply.
+    fn call(&self, op: DbOp) -> Result<DbReply, String> {
+        bridge_call(&self.cmd_tx, op)
+    }
+}
 
 #[interface(name = "org.freedesktop.systemd1.Manager")]
 impl Systemd1ManagerIface {
@@ -268,6 +330,120 @@ impl Systemd1ManagerIface {
     #[zbus(property)]
     fn version(&self) -> String {
         crate::VERSION.to_string()
+    }
+
+    /// List loaded units. Returns the systemd1 `UnitInfo` struct array:
+    /// `(name, description, load_state, active_state, sub_state, following,
+    /// unit_path, job_id, job_type, job_path)`.
+    #[allow(clippy::type_complexity)]
+    fn list_units(
+        &self,
+    ) -> zbus::fdo::Result<
+        Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            ObjectPath<'static>,
+            u32,
+            String,
+            ObjectPath<'static>,
+        )>,
+    > {
+        match self.call(DbOp::ListUnits1) {
+            Ok(DbReply::UnitList1(rows)) => Ok(rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.name,
+                        r.description,
+                        r.load,
+                        r.active,
+                        r.sub,
+                        r.following,
+                        ObjectPath::try_from(r.object_path).unwrap(),
+                        r.job_id,
+                        r.job_type,
+                        ObjectPath::try_from(r.job_object_path).unwrap(),
+                    )
+                })
+                .collect()),
+            Ok(_) => Err(zbus::fdo::Error::Failed("unexpected reply".into())),
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
+
+    /// Return the object path of a named unit, loading it first.
+    fn get_unit(&self, name: String) -> zbus::fdo::Result<ObjectPath<'static>> {
+        match self.call(DbOp::GetUnit1(name.clone())) {
+            Ok(DbReply::Unit1(Some(r))) => ObjectPath::try_from(r.object_path)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string())),
+            Ok(DbReply::Unit1(None)) => {
+                Err(zbus::fdo::Error::Failed(format!("No such unit '{name}'")))
+            }
+            Ok(_) => Err(zbus::fdo::Error::Failed("unexpected reply".into())),
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
+
+    /// Load a unit file from disk and return the unit's object path.
+    fn load_unit(&self, name: String) -> zbus::fdo::Result<ObjectPath<'static>> {
+        match self.call(DbOp::LoadUnit(name)) {
+            Ok(DbReply::UnitPath(p)) => {
+                ObjectPath::try_from(p).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+            }
+            Ok(DbReply::Error(e)) => Err(zbus::fdo::Error::Failed(e)),
+            Ok(_) => Err(zbus::fdo::Error::Failed("unexpected reply".into())),
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
+
+    /// List queued jobs. Returns the systemd1 `JobInfo` struct array:
+    /// `(id, unit, job_type, state, unit_path, job_path)`.
+    #[allow(clippy::type_complexity)]
+    fn list_jobs(
+        &self,
+    ) -> zbus::fdo::Result<
+        Vec<(
+            u32,
+            String,
+            String,
+            String,
+            ObjectPath<'static>,
+            ObjectPath<'static>,
+        )>,
+    > {
+        match self.call(DbOp::ListJobs) {
+            Ok(DbReply::JobList(jobs)) => Ok(jobs
+                .into_iter()
+                .map(|j| {
+                    (
+                        j.id,
+                        j.unit,
+                        j.job_type,
+                        j.state,
+                        ObjectPath::try_from(j.unit_path).unwrap(),
+                        ObjectPath::try_from(j.job_path).unwrap(),
+                    )
+                })
+                .collect()),
+            Ok(_) => Err(zbus::fdo::Error::Failed("unexpected reply".into())),
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
+    }
+
+    /// Return the processes of one unit: `(cgroup, pid, cmdline)` tuples.
+    fn get_unit_processes(&self, name: String) -> zbus::fdo::Result<Vec<(String, u32, String)>> {
+        match self.call(DbOp::GetUnitProcesses(name)) {
+            Ok(DbReply::ProcessList(procs)) => Ok(procs
+                .into_iter()
+                .map(|p| (p.cgroup, p.pid, p.cmdline))
+                .collect()),
+            Ok(_) => Err(zbus::fdo::Error::Failed("unexpected reply".into())),
+            Err(e) => Err(zbus::fdo::Error::Failed(e)),
+        }
     }
 }
 
@@ -377,10 +553,12 @@ fn run_thread(
     let mut systemd1_ready = false;
     match conn.request_name_with_flags(SYSTEMD1_BUS_NAME, RequestNameFlags::DoNotQueue.into()) {
         Ok(zbus::fdo::RequestNameReply::PrimaryOwner) => {
-            match conn
-                .object_server()
-                .at(SYSTEMD1_OBJECT_PATH, Systemd1ManagerIface)
-            {
+            match conn.object_server().at(
+                SYSTEMD1_OBJECT_PATH,
+                Systemd1ManagerIface {
+                    cmd_tx: cmd_tx.clone(),
+                },
+            ) {
                 Ok(_) => {
                     mgr_log(&format!(
                         "D-Bus: systemd1-compatible surface live at {SYSTEMD1_BUS_NAME} ({bus} bus)"
