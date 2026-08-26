@@ -1,4 +1,4 @@
-use rustemd_repo::{Repo, UnitDefinition, UnitEntry, UnitSection};
+use rustemd::repo::{Repo, UnitDefinition, UnitEntry, UnitSection};
 
 #[test]
 fn typed_crud_round_trip_preserves_the_structured_unit_definition() {

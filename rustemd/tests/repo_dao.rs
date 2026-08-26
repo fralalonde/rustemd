@@ -1,10 +1,10 @@
 #![cfg(unix)]
 
 //! Integration test: prove the daemon LISTS and READS units through the
-//! `rustemd-repo` DAO, and that the `repo` control op lets a client discover
+//! `rustemd::repo` DAO, and that the `repo` control op lets a client discover
 //! and reopen the same repository.
 //!
-//! The unit file is written with `rustemd_repo::Repo` (the same way a client
+//! The unit file is written with `rustemd::repo::Repo` (the same way a client
 //! would edit it); the daemon then discovers and loads it, and reports the
 //! repository path over IPC.
 
@@ -104,8 +104,8 @@ fn daemon_lists_and_reads_units_through_repo_dao() {
     let scratch = Scratch::new();
 
     // Write the unit through the repository crate, exactly as a client would.
-    let repo = rustemd_repo::Repo::open_roots(vec![scratch.units()]).unwrap();
-    let definition = rustemd_repo::UnitDefinition::parse(
+    let repo = rustemd::repo::Repo::open_roots(vec![scratch.units()]).unwrap();
+    let definition = rustemd::repo::UnitDefinition::parse(
         "dao.service",
         "[Unit]\nDescription=DAO unit\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
     )
@@ -137,7 +137,7 @@ fn daemon_lists_and_reads_units_through_repo_dao() {
     assert_eq!(status[0].description, "DAO unit");
 
     // A client can reopen the reported repository with the same crate.
-    let client_repo = rustemd_repo::Repo::open(std::path::PathBuf::from(&info.root)).unwrap();
+    let client_repo = rustemd::repo::Repo::open(std::path::PathBuf::from(&info.root)).unwrap();
     assert_eq!(client_repo.read("dao.service").unwrap(), Some(definition));
     assert!(
         client_repo

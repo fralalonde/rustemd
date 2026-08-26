@@ -1,6 +1,6 @@
 //! Directory persistence for typed unit definitions. Other stores may implement
 //! the same typed DAO contract later; Git is intentionally not a repository backend.
-use crate::{Error, UnitDefinition, UnitType};
+use crate::repo::{Error, UnitDefinition, UnitType};
 use std::{
     io,
     path::Path,

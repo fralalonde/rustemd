@@ -1,4 +1,4 @@
-//! Typed unit-definition repository. `rustemd-repo` owns the systemd document
+//! Typed unit-definition repository. This module owns the systemd document
 //! schema and its parser/writer; callers exchange [`UnitDefinition`] values,
 //! never unit-file text. Directory persistence is deliberately the only backend.
 mod backend;

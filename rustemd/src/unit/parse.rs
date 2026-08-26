@@ -41,7 +41,7 @@ pub struct RawUnitFile {
 
 /// Convert the repository-owned parsed document into the semantic builder's
 /// existing structural input without reading or parsing unit text again.
-pub fn from_repository_document(document: rustemd_repo::UnitDocument) -> RawUnitFile {
+pub fn from_repository_document(document: crate::repo::UnitDocument) -> RawUnitFile {
     RawUnitFile {
         sections: document
             .sections
@@ -337,10 +337,10 @@ mod tests {
 
     #[test]
     fn accepts_repository_document_without_reparsing_text() {
-        let document = rustemd_repo::UnitDocument {
-            sections: vec![rustemd_repo::UnitSection {
+        let document = crate::repo::UnitDocument {
+            sections: vec![crate::repo::UnitSection {
                 name: "Unit".into(),
-                entries: vec![rustemd_repo::UnitEntry {
+                entries: vec![crate::repo::UnitEntry {
                     key: "Description".into(),
                     value: "typed".into(),
                 }],

@@ -39,6 +39,7 @@ pub mod manager;
 pub mod names;
 pub mod paths;
 pub mod platform;
+pub mod repo;
 pub mod specifier;
 pub mod timespan;
 pub mod unit;

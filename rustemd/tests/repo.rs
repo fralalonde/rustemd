@@ -1,4 +1,4 @@
-use rustemd_repo::{Error, Repo, UnitDefinition};
+use rustemd::repo::{Error, Repo, UnitDefinition};
 
 fn definition(name: &str, description: &str) -> UnitDefinition {
     UnitDefinition::parse(

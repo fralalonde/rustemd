@@ -1177,7 +1177,6 @@ dependencies = [
  "colored",
  "libc",
  "rustemd",
- "rustemd-repo",
  "serde_json",
  "tempfile",
 ]
@@ -1191,19 +1190,11 @@ dependencies = [
  "colored",
  "libc",
  "nix",
- "rustemd-repo",
  "serde",
  "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
  "zbus",
-]
-
-[[package]]
-name = "rustemd-repo"
-version = "0.1.0"
-dependencies = [
- "tempfile",
 ]
 
 [[package]]

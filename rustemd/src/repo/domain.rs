@@ -1,6 +1,6 @@
 //! Typed unit values and a small systemd-style text codec.
 
-use crate::Error;
+use crate::repo::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnitType {

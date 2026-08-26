@@ -8,7 +8,6 @@ rust-version = "1.89"
 
 [dependencies]
 rustemd = { path = "../rustemd" }
-rustemd-repo = { path = "../rustemd-repo" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_complete_nushell = "4.6.2"

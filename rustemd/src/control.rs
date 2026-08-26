@@ -120,7 +120,7 @@ pub struct CatEntry {
 
 /// Description of the unit-file repository a manager uses, returned by the
 /// `repo` control op. Lets clients discover the repository path and open it
-/// themselves with `rustemd_repo::Repo`.
+/// themselves with `crate::repo::Repo`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
     /// The primary (writable) repository root.
@@ -175,7 +175,7 @@ pub trait Control {
     fn is_active(&self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn get_default(&self) -> Result<String, Error>;
     /// Which unit-file repository roots the manager uses so a local client can
-    /// open the same typed directory repository with `rustemd_repo`.
+    /// open the same typed directory repository with `crate::repo`.
     fn repo(&self) -> Result<RepoInfo, Error>;
 
     /// Read entries from the manager's persistent journal. `unit` filters to

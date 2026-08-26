@@ -628,9 +628,9 @@ fn cmd_repo(cli: &Cli) -> Result<i32, String> {
         })
         .unwrap_or_default();
     let repo = if roots.is_empty() {
-        rustemd_repo::Repo::open(std::path::PathBuf::from(root))
+        rustemd::repo::Repo::open(std::path::PathBuf::from(root))
     } else {
-        rustemd_repo::Repo::open_roots(roots)
+        rustemd::repo::Repo::open_roots(roots)
     }
     .map_err(|e| e.to_string())?;
     let units = repo.list().map_err(|e| e.to_string())?;

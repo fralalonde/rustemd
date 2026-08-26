@@ -25,11 +25,11 @@ use crate::platform::cgroup;
 use crate::platform::process as spawn;
 use crate::platform::signal::Signal;
 use crate::platform::signals::SignalSource;
+use crate::repo::Repo;
 use crate::specifier::SpecifierContext;
 use crate::unit::{
     DirectoryKind, KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind,
 };
-use rustemd_repo::Repo;
 
 use self::deps as D;
 #[cfg(feature = "socket")]
@@ -192,7 +192,7 @@ pub struct Manager {
     /// Unit-file repository (DAO): the disk source of truth for unit files.
     /// LIST ([`Manager::discover_names`]) and READ ([`Manager::load_unit`])
     /// go through it, and the `repo` IPC query reports its root/backend so
-    /// clients can open the same repository with `rustemd_repo::Repo`.
+    /// clients can open the same repository with `crate::repo::Repo`.
     pub repo: Repo,
     pub units: HashMap<Name, Unit>,
     jobs: HashMap<u64, Job>,

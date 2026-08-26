@@ -280,7 +280,7 @@ impl Manager {
     }
 
     /// `repo`: describe the unit-file repository the manager uses, so a client
-    /// can discover the path and open it itself with `rustemd_repo::Repo`.
+    /// can discover the path and open it itself with `crate::repo::Repo`.
     pub fn repo_info(&self) -> RepoInfo {
         RepoInfo {
             root: self.repo.root().display().to_string(),

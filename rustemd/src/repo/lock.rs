@@ -8,7 +8,7 @@
 //! The lock has two layers, which together cover every contention case:
 //!
 //! 1. A process-local [`std::sync::Mutex`] serializes threads sharing one
-//!    [`Repo`](crate::Repo) handle.
+//!    [`Repo`](crate::repo::Repo) handle.
 //! 2. An OS advisory lock ([`std::fs::File::lock`], which is `flock(2)` on
 //!    Unix and `LockFileEx` on Windows) on a lock file inside the repository
 //!    root serializes *independent* handles and *independent processes*.
