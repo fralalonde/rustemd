@@ -41,15 +41,20 @@ and its service sits in `START_PENDING`.
 
 - The release URLs still use the `fralalonde` org name until the repository is relocated; the Homebrew formula now lives in a dedicated `homebrew-rustemd` tap (`brew tap fralalonde/rustemd` resolves to `github.com/fralalonde/homebrew-rustemd`).
 
-### D-Bus is not a `systemd1` drop-in
-Only a rustemd-specific `org.rustemd.Manager1.Manager` interface
-(`ListUnits`/`GetUnit`/`StartUnit`/`StopUnit`/`Version`). No per-unit object
-graph, no `org.freedesktop.DBus.Properties`, no job objects or signals. This is
-the single largest desktop blocker: real D-Bus consumers — `logind`/seat
-management, desktop portals, `systemctl --user` over the bus — will not work,
-so a modern desktop session cannot be managed drop-in. D-Bus is also opt-in
-(the `dbus` cargo feature, off by default): builds without it omit the zbus
-dependency tree entirely.
+### D-Bus is a partial `systemd1` drop-in
+The `org.freedesktop.systemd1` surface (runtime-gated: only served when the
+well-known name is free, i.e. no real systemd on the bus) now has a per-unit
+object graph (`/org/freedesktop/systemd1/unit/<escaped>` with `Id`/`Description`/
+`LoadState`/`ActiveState`/`SubState`/`Following` properties, via zbus's built-in
+`org.freedesktop.DBus.Properties`), the read methods (`ListUnits`/`GetUnit`/
+`LoadUnit`/`ListJobs`/`GetUnitProcesses`), and the `UnitNew`/`UnitRemoved`
+signals. Still missing: the **control methods** (`StartUnit`/`StopUnit`/
+`RestartUnit`/`ReloadUnit` returning job object paths), the **job object model**
+and `JobNew`/`JobRemoved` signals, and `PropertiesChanged` emission. Until the
+control surface lands, real D-Bus consumers — `logind`/seat management, desktop
+portals, `systemctl --user` over the bus — cannot be driven drop-in. D-Bus is
+opt-in (the `dbus` cargo feature, off by default): builds without it omit the
+zbus dependency tree entirely.
 
 ### journald drop-in is incomplete
 Service stdout/stderr are captured to a per-unit in-memory ring (`status`) and
