@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "rustemctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "rustemd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "rustemd-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "crossterm",

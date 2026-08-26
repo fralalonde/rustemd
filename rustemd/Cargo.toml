@@ -1,6 +1,6 @@
 [package]
 name = "rustemd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A systemd init reimplementation in Rust: a drop-in systemctl replacement with unit files, user services, and timers."
 license = "MIT"
