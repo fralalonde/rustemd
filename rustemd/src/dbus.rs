@@ -113,7 +113,8 @@ pub fn unit_dbus_path(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unit_dbus_path;
+    use super::{DbOp, DbReply, DbRequest, bridge_call, unit_dbus_path};
+    use std::sync::mpsc;
 
     #[test]
     fn test_unit_dbus_path_escape() {
@@ -132,6 +133,34 @@ mod tests {
         assert_eq!(
             unit_dbus_path("session-1.scope"),
             "/org/freedesktop/systemd1/unit/session_2d1_2escope"
+        );
+    }
+
+    /// `bridge_call` forwards an op over the manager channel and returns the
+    /// manager's reply — the mechanism every D-Bus method handler routes
+    /// through. Testable without a live bus because it is a pure channel hop.
+    #[test]
+    fn bridge_call_returns_manager_reply() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DbRequest>();
+        let server = std::thread::spawn(move || {
+            let req = cmd_rx.recv().unwrap();
+            assert!(matches!(req.op, DbOp::ListUnits));
+            req.reply.send(DbReply::UnitList(vec![])).unwrap();
+        });
+        let got = bridge_call(&cmd_tx, DbOp::ListUnits).unwrap();
+        assert!(matches!(got, DbReply::UnitList(v) if v.is_empty()));
+        server.join().unwrap();
+    }
+
+    /// A wedged/shut-down manager (dropped receiver) must surface as a clean
+    /// error, not a panic or hang.
+    #[test]
+    fn bridge_call_errors_when_manager_channel_closed() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<DbRequest>();
+        drop(cmd_rx);
+        assert_eq!(
+            bridge_call(&cmd_tx, DbOp::ListUnits).unwrap_err(),
+            "manager channel closed"
         );
     }
 }

@@ -389,3 +389,38 @@ pub fn set_subreaper() {
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    /// `itoa_cstr` formats the `LISTEN_FDS`/`LISTEN_PID` env values used for
+    /// socket activation; it must be exact across the full `i32` range and
+    /// NUL-terminate into the caller's fixed buffer.
+    #[test]
+    fn itoa_formats_integers_into_fixed_buffer() {
+        let mut buf = [0u8; 16];
+        for &(v, want) in &[
+            (0, "0"),
+            (7, "7"),
+            (42, "42"),
+            (123_456_789, "123456789"),
+            (2_147_483_647, "2147483647"),
+        ] {
+            let p = itoa_cstr(&mut buf, v);
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
+            assert_eq!(s, want, "itoa_cstr({v})");
+        }
+    }
+
+    /// User/group resolution is the foundation of `User=`/`Group=` privilege
+    /// dropping; `root` must resolve to uid/gid 0 on every Unix.
+    #[test]
+    fn resolve_root_user_and_group() {
+        let (uid, gid, _supp) = resolve_user("root").expect("root must exist");
+        assert_eq!(uid, 0);
+        assert_eq!(gid, 0);
+        assert_eq!(resolve_group("root"), Some(0));
+    }
+}

@@ -215,6 +215,73 @@ fn stop_terminates_running_service() {
     );
 }
 
+/// `Restart=on-failure` auto-restarts a service that exits non-zero (up to the
+/// start-limit burst). This is the mechanism most real services lean on to
+/// survive crashes, and it had zero coverage before this test.
+#[test]
+fn restart_on_failure_restarts_until_start_limit() {
+    let scratch = Scratch::new();
+    let marker = scratch.dir.path().join("flaky.count");
+    let marker_s = marker.to_string_lossy().to_string();
+    scratch.write_unit(
+        "flaky.service",
+        &format!(
+            "[Unit]\nDescription=flaky\n[Service]\nType=simple\nRestart=on-failure\nRestartSec=100ms\nExecStart=/bin/sh -c 'echo x >> {marker_s}; exit 1'\n"
+        ),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+    ctl.start(&["flaky.service"]).unwrap();
+
+    // Each spawn writes one line then exits 1; on-failure re-spawns it, so the
+    // marker grows past the single initial spawn. Assert at least one restart.
+    let restarted = wait_for(Duration::from_secs(5), || {
+        std::fs::read_to_string(&marker)
+            .map(|c| c.lines().count() >= 2)
+            .unwrap_or(false)
+    });
+    assert!(
+        restarted,
+        "Restart=on-failure should re-spawn a service that exits non-zero"
+    );
+}
+
+/// `Restart=no` (the default) leaves a failing service where it landed —
+/// no re-spawn, no start-limit churn.
+#[test]
+fn no_restart_leaves_failed_service_inactive() {
+    let scratch = Scratch::new();
+    let marker = scratch.dir.path().join("doomed.count");
+    let marker_s = marker.to_string_lossy().to_string();
+    scratch.write_unit(
+        "doomed.service",
+        &format!("[Service]\nType=simple\nExecStart=/bin/sh -c 'echo x >> {marker_s}; exit 1'\n"),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+    ctl.start(&["doomed.service"]).unwrap();
+
+    // Wait for the single spawn, then give it time to (incorrectly) restart.
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::fs::read_to_string(&marker)
+            .map(|c| c.lines().count() >= 1)
+            .unwrap_or(false)
+    }));
+    std::thread::sleep(Duration::from_secs(1));
+    let count = std::fs::read_to_string(&marker)
+        .map(|c| c.lines().count())
+        .unwrap_or(0);
+    assert_eq!(count, 1, "Restart=no must not re-spawn a failing service");
+}
+
 /// A `Type=simple` service that self-daemonizes (forks a child, then the main
 /// process exits) must have its orphaned process group swept and SIGKILLed so
 /// nothing escapes process-group tracking.
