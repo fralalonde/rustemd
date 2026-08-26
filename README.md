@@ -6,10 +6,14 @@ triggers, and dependency-driven lifecycle. Linux uses cgroups v2 with process
 groups as a fallback; Windows uses native Win32 Job Objects.
 
 > **Status:** functional core on Linux and Windows. Linux additionally supports
-> PID-1 boot, D-Bus (opt-in), udev `.device` units, and `.mount` units. Windows
-> supports `.service`, `.socket` (TCP trigger activation), `.timer`, and
-> `.target` units in SCM system mode or interactive `--user` mode. There is no
-> journald or service sandboxing yet.
+> PID-1 boot, D-Bus (opt-in), udev `.device` units, `.mount` units, an
+> on-disk journal (`rustemctl journal`), and Phase-1 service sandboxing
+> (`PrivateTmp=`, `ProtectHome=`/`ProtectSystem=`, `ReadOnlyPaths=`,
+> `NoNewPrivileges=`). Windows supports `.service`, `.socket` (TCP trigger
+> activation), `.timer`, and `.target` units in SCM system mode or interactive
+> `--user` mode. There is no journald/syslog forwarding or `journalctl`
+> drop-in, no seccomp/`DynamicUser=`/`DevicePolicy=` hardening, and no
+> `systemd1` D-Bus interface yet.
 
 ---
 
@@ -284,8 +288,9 @@ daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
 ## Limitations (intentional, for now)
 
 - **cgroup v2 (Linux)** — one cgroup per unit for reliable tree cleanup and
-  `MemoryMax`/`MemoryHigh`/`CPUWeight`/`TasksMax`; falls back to process groups
-  + a subreaper where cgroups aren't available.
+  `MemoryMax`/`MemoryHigh`/`CPUWeight`/`CPUQuota`/`IOWeight`/`IODeviceWeight`/
+  `TasksMax`; falls back to process groups + a subreaper where cgroups aren't
+  available.
 - **PID-1 boot is opt-in** — the `boot` cargo feature adds mounting
   `/proc`/`/sys`/`/dev`/`/run`/`cgroup2`, early-boot config (hostname, sysctl,
   modules, fstab), template units (`getty@tty1`), and `reboot(2)` power-off.
@@ -305,8 +310,12 @@ daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
   `Group=`, `MemoryHigh=`, `CPUWeight=`, and `KillMode=process` fail explicitly. Windows has no
   generic POSIX-signal equivalent; stop/kill terminate the unit Job Object.
 - **macOS is not yet a supported manager target.**
-- No journald, service sandboxing (`ProtectSystem=`, `DynamicUser=`, seccomp,
-  capability/device restrictions), or `systemd-analyze`-style tooling. See
+- **Journaling is a plain store, not journald** — per-unit on-disk journal
+  under `/var/log/rustemd/` with `rustemctl journal`; no `journalctl` binary,
+  no journald wire format, no syslog/journald forwarding. **Service sandboxing
+  is Phase-1 only** — no `CapabilityBoundingSet=`/`AmbientCapabilities=`,
+  seccomp (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
+  (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
 - `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
   not yet wired.
