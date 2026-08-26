@@ -20,9 +20,20 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # dbus-daemon, for the D-Bus integration test (tests/dbus.rs).
+      - run: sudo apt-get update && sudo apt-get install -y dbus
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace
+      # Privileged tests (User= privilege dropping, PrivateTmp= mount
+      # namespaces) self-skip when not root. Build them, then run the prebuilt
+      # binary as real root: setuid to an unmapped uid needs real root — an
+      # unprivileged `unshare -U -r` maps only uid 0, so `sudo`, not a user
+      # namespace, is what can exercise both paths. Running the binary directly
+      # (not `sudo cargo`) avoids root-owned build artifacts and sudo's
+      # secure_path resetting the cargo/rustup locations.
+      - run: cargo test -p rustemd --test privileged --no-run
+      - run: sudo "$(find target/debug/deps -maxdepth 1 -name 'privileged-*' -type f -executable -print -quit)"
 
   linux:
     strategy:
