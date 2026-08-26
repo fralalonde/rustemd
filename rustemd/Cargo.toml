@@ -9,7 +9,7 @@ homepage = "https://github.com/fralalonde/rustemd"
 rust-version = "1.89"
 
 [features]
-default = ["socket", "udev"]
+default = ["socket", "udev", "dbus"]
 # Linux PID-1 boot support: mount the API/virtual filesystems, run early-boot
 # configuration (hostname, machine-id, sysctl, modules, tmpfiles, fstab), and
 # power the machine off on shutdown.
@@ -23,8 +23,9 @@ socket = []
 # non-Linux builds that don't need device ordering.
 udev = []
 # D-Bus integration: `Type=dbus`/`BusName=` service activation plus a manager
-# control interface over zbus. Opt-in (NOT in `default`) so the default build
-# is free of the zbus/zvariant/async-executor dependency tree. Linux-only.
+# control interface over zbus. On by default for Linux builds; the `dbus` code
+# is `#[cfg(all(target_os = "linux", feature = "dbus"))]`-gated and zbus is a
+# Linux-only dependency, so it compiles out on Windows/macOS.
 dbus = ["dep:zbus"]
 
 [target.'cfg(unix)'.dependencies]
