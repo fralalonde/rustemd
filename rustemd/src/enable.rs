@@ -151,14 +151,18 @@ fn absolute_of(p: &PathBuf) -> PathBuf {
 /// inspected directly (not via [`Paths::find_unit`], whose `is_file` check
 /// excludes a link to the `/dev/null` character device).
 pub fn is_masked(paths: &Paths, name: &str) -> bool {
-    let name = normalize_file_name(name);
-    for dir in &paths.unit_path {
-        let p = dir.join(&name);
-        #[cfg(unix)]
-        if let Ok(target) = std::fs::read_link(&p) {
-            return target.as_path() == std::path::Path::new("/dev/null");
+    #[cfg(unix)]
+    {
+        let name = normalize_file_name(name);
+        for dir in &paths.unit_path {
+            let p = dir.join(&name);
+            if let Ok(target) = std::fs::read_link(&p) {
+                return target.as_path() == std::path::Path::new("/dev/null");
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = (paths, name);
     false
 }
 
