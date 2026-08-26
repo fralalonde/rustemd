@@ -33,7 +33,10 @@ use crate::unit::{
 
 use self::deps as D;
 #[cfg(feature = "socket")]
-use self::socket::{SocketId, SocketListener, bind_listen_stream};
+use self::socket::{
+    SocketId, SocketListener, bind_listen_datagram, bind_listen_netlink,
+    bind_listen_sequential_packet, bind_listen_stream,
+};
 use self::state::ControlCommand as UnitControlCommand;
 use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult};
 use self::timer::{TimerKind, TimerWheel};
@@ -2154,6 +2157,51 @@ impl Manager {
         let service = self.units[name].activated_service();
         for spec in &scfg.listen_stream {
             match bind_listen_stream(spec) {
+                Ok(listener) => {
+                    let fd = listener.id();
+                    self.socket_listeners.insert(fd, listener);
+                    self.socket_triggers
+                        .insert(fd, (name.to_string(), service.clone()));
+                }
+                Err(e) => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                    self.fail_unit(name, format!("Failed to bind socket {spec}: {e}"));
+                    return;
+                }
+            }
+        }
+        for spec in &scfg.listen_datagram {
+            match bind_listen_datagram(spec) {
+                Ok(listener) => {
+                    let fd = listener.id();
+                    self.socket_listeners.insert(fd, listener);
+                    self.socket_triggers
+                        .insert(fd, (name.to_string(), service.clone()));
+                }
+                Err(e) => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                    self.fail_unit(name, format!("Failed to bind socket {spec}: {e}"));
+                    return;
+                }
+            }
+        }
+        for spec in &scfg.listen_netlink {
+            match bind_listen_netlink(spec) {
+                Ok(listener) => {
+                    let fd = listener.id();
+                    self.socket_listeners.insert(fd, listener);
+                    self.socket_triggers
+                        .insert(fd, (name.to_string(), service.clone()));
+                }
+                Err(e) => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Resources;
+                    self.fail_unit(name, format!("Failed to bind socket {spec}: {e}"));
+                    return;
+                }
+            }
+        }
+        for spec in &scfg.listen_sequential_packet {
+            match bind_listen_sequential_packet(spec) {
                 Ok(listener) => {
                     let fd = listener.id();
                     self.socket_listeners.insert(fd, listener);

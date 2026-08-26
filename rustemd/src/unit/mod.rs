@@ -576,6 +576,9 @@ pub struct TimerConfig {
 #[derive(Debug, Clone, Default)]
 pub struct SocketConfig {
     pub listen_stream: Vec<String>,
+    pub listen_datagram: Vec<String>,
+    pub listen_netlink: Vec<String>,
+    pub listen_sequential_packet: Vec<String>,
     /// `Accept=yes`: pass the *connected* socket per connection instead of the
     /// listening socket. Default (false) is the inetd/systemd `Accept=no` case.
     pub accept: bool,
@@ -820,6 +823,9 @@ fn build_socket(
     };
     Ok(SocketConfig {
         listen_stream: list_of(raw, "Socket", "ListenStream", exp),
+        listen_datagram: list_of(raw, "Socket", "ListenDatagram", exp),
+        listen_netlink: list_of(raw, "Socket", "ListenNetlink", exp),
+        listen_sequential_packet: list_of(raw, "Socket", "ListenSequentialPacket", exp),
         accept,
         service: unit_scalar(raw, "Socket", "Service").map(exp),
     })
@@ -1927,5 +1933,28 @@ mod tests {
         );
         // Empty name is rejected.
         assert!(build_str("[Service]\nStateDirectory=:0755\n", "x.service").is_err());
+    }
+
+    #[cfg(feature = "socket")]
+    #[test]
+    fn socket_parses_all_listen_directives() {
+        let f = build_str(
+            "[Socket]\n\
+             ListenStream=/run/foo.sock\n\
+             ListenStream=127.0.0.1:8080\n\
+             ListenDatagram=/run/foo-dgram.sock\n\
+             ListenNetlink=kobject-uevent\n\
+             ListenNetlink=route\n\
+             ListenSequentialPacket=/run/foo-seqpkt.sock\n\
+             Service=foo.service\n",
+            "foo.socket",
+        )
+        .unwrap();
+        let s = f.socket.as_ref().unwrap();
+        assert_eq!(s.listen_stream, vec!["/run/foo.sock", "127.0.0.1:8080"]);
+        assert_eq!(s.listen_datagram, vec!["/run/foo-dgram.sock"]);
+        assert_eq!(s.listen_netlink, vec!["kobject-uevent", "route"]);
+        assert_eq!(s.listen_sequential_packet, vec!["/run/foo-seqpkt.sock"]);
+        assert_eq!(s.service.as_deref(), Some("foo.service"));
     }
 }
