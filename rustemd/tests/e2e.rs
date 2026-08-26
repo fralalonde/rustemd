@@ -9,55 +9,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Scratch, wait_for};
-use rustemd::control::{Control, SocketClient};
-
-/// Spawn the manager daemon in a background thread and return a handle that
-/// shuts it down cleanly on drop.
-struct Daemon {
-    handle: Option<std::thread::JoinHandle<()>>,
-    socket: std::path::PathBuf,
-}
-
-impl Daemon {
-    fn start() -> Daemon {
-        let socket = std::env::var_os("RUSTEMD_SOCKET").unwrap().into();
-        let handle = std::thread::spawn(|| {
-            let mut mgr = rustemd::manager::Manager::new(
-                rustemd::manager::ManagerCfg::for_mode(false).unwrap(),
-            )
-            .unwrap();
-            mgr.load_all();
-            // Mirror the real daemon (cli::run_daemon): enumerate kernel
-            // devices into runtime `.device` units before serving requests.
-            #[cfg(all(target_os = "linux", feature = "udev"))]
-            mgr.udev_init();
-            mgr.bind_ipc().unwrap();
-            mgr.bind_notify().ok();
-            mgr.setup_signals();
-            mgr.run();
-        });
-        Daemon {
-            handle: Some(handle),
-            socket,
-        }
-    }
-
-    fn client(&self) -> SocketClient {
-        SocketClient::for_mode(false).unwrap()
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        // Ask the manager to stop and exit, then reap the thread.
-        let _ =
-            rustemd::client::request_json(&self.socket, &serde_json::json!({ "op": "shutdown" }));
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
+use common::{Daemon, Scratch, wait_for};
+use rustemd::control::Control;
 
 #[test]
 fn start_status_stop_lifecycle() {

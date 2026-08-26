@@ -64,6 +64,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 [dev-dependencies]
 tempfile = "3"
 
+# The D-Bus integration test (tests/dbus.rs) drives the systemd1 surface over a
+# private session bus, so it needs a zbus client of its own (matching the
+# blocking-api/async-io features the `dbus` feature uses).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
 [[bin]]
 name = "rustemd"
 path = "src/main.rs"
+
+# The D-Bus integration test only makes sense with the `dbus` feature: skip it
+# (rather than fail to compile) when building with --no-default-features.
+[[test]]
+name = "dbus"
+required-features = ["dbus"]
