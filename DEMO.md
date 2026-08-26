@@ -1,9 +1,9 @@
-# rustemd — interactive live environment
+# rystemd — interactive live environment
 
-A minimal, **interactive** environment for driving a real rustemd PID-1 daemon
+A minimal, **interactive** environment for driving a real rystemd PID-1 daemon
 by hand: build a busybox initramfs, boot it in qemu, and drop into a getty
-shell on `/dev/ttyS0` where you can type `rustemd …` commands against the live
-manager. It ships one friendly demo unit of **every type rustemd supports**
+shell on `/dev/ttyS0` where you can type `rystemd …` commands against the live
+manager. It ships one friendly demo unit of **every type rystemd supports**
 (`.service`, `.socket`, `.timer`, `.mount`, `.target`) plus runtime-generated
 `.device` units from udev enumeration.
 
@@ -27,17 +27,17 @@ Inside the VM you land on a busybox getty (`/dev/ttyS0`, shell is `/bin/sh`).
 Try:
 
 ```sh
-rustemctl list-units                      # see .device units appear (udev)
-rustemctl status demo.service demo.mount demo.socket demo.timer demo.target
-rustemctl start demo.mount && ls /mnt/demo
-rustemctl is-active demo.mount
-rustemctl list-timers
+rystemctl list-units                      # see .device units appear (udev)
+rystemctl status demo.service demo.mount demo.socket demo.timer demo.target
+rystemctl start demo.mount && ls /mnt/demo
+rystemctl is-active demo.mount
+rystemctl list-timers
 printf 'hi\n' | nc 127.0.0.1 8080          # socket-activates demo-echo.service
-rustemctl status demo-echo.service
-rustemctl poweroff                        # clean shutdown
+rystemctl status demo-echo.service
+rystemctl poweroff                        # clean shutdown
 ```
 
-Quit at any time with `rustemctl poweroff`, or force qemu to exit with `Ctrl-A x`
+Quit at any time with `rystemctl poweroff`, or force qemu to exit with `Ctrl-A x`
 (`-nographic` multiplexes qemu's monitor onto the same keys).
 
 ## The demo units (`examples/live/`)
@@ -59,7 +59,7 @@ when the manager boots into `default.target`.
 
 ### Why the timer uses `OnUnitInactiveSec` (and not only `OnUnitActiveSec`)
 
-`OnUnitActiveSec` re-fires only while the target is **active**, and rustemd's
+`OnUnitActiveSec` re-fires only while the target is **active**, and rystemd's
 `start` on an already-active unit is a no-op — so pairing it with a
 `RemainAfterExit=yes` service produces no visible re-run. The classic systemd
 idiom for "run a one-shot job periodically" is `OnUnitInactiveSec` (target is
@@ -68,22 +68,22 @@ inactive between runs, so each elapse genuinely re-runs it), which is what
 
 ### `.device` units are runtime-generated
 
-There is deliberately **no `.device` unit file** — systemd (and rustemd) derive
+There is deliberately **no `.device` unit file** — systemd (and rystemd) derive
 device units from the kernel, not from disk. The live env's `/init` mounts
 `/proc`, `/sys` (sysfs) and `/dev` (devtmpfs) before exec'ing the daemon, so
 the `udev` feature's sysfs walk registers a `.device` unit per device
-(`sys-devices-…device` / `sys-<subsystem>-<name>.device`). `rustemctl list-units`
-shows them; `rustemctl status sys-tty-ttyS0.device` works, for example.
+(`sys-devices-…device` / `sys-<subsystem>-<name>.device`). `rystemctl list-units`
+shows them; `rystemctl status sys-tty-ttyS0.device` works, for example.
 
 ## TUI over serial
 
-`rustemd-tui` is ratatui/crossterm: it needs raw mode, an alternate screen and
+`rystemd-tui` is ratatui/crossterm: it needs raw mode, an alternate screen and
 cursor addressing. A bare serial console has no window size — `TIOCGWINSZ`
 reports 0×0, so crossterm sees a 0×0 terminal and ratatui's draw area would be
 empty. Two things make the TUI render over the serial console:
 
 1. **`/init` sets a real size.** The initramfs runs
-   `stty rows 24 cols 80 < /dev/ttyS0` before exec'ing rustemd, so `stty size`
+   `stty rows 24 cols 80 < /dev/ttyS0` before exec'ing rystemd, so `stty size`
    reports `24 80` and crossterm sees a normal 80×24 terminal — the TUI needs
    no fallback. Resize it to match your host terminal with
    `stty rows N cols N < /dev/ttyS0`.
@@ -95,16 +95,16 @@ empty. Two things make the TUI render over the serial console:
 Run it straight from the getty shell (`q` quits):
 
 ```sh
-rustemd-tui
+rystemd-tui
 ```
 
 The TUI connects over the same unix control socket the CLI uses, so it also
-works from any real terminal on the host (`rustemd-tui` / `rustemd-tui --user`).
+works from any real terminal on the host (`rystemd-tui` / `rystemd-tui --user`).
 
 ## Notes / bugs fixed along the way
 
 Three real issues surfaced while building the e2e test and were fixed in
-`rustemd/src/manager/mod.rs`:
+`rystemd/src/manager/mod.rs`:
 
 1. **Job-engine deadlock on synchronously-failing dependencies.** A unit whose
    start resolves *synchronously* (e.g. `demo.mount` failing `mount(2)` with
@@ -127,11 +127,11 @@ Three real issues surfaced while building the e2e test and were fixed in
 The live env also brings up loopback (`ip link set lo up` in `/init`) so the
 TCP `demo.socket` is reachable from the getty shell.
 
-Both are covered by `rustemd/tests/e2e.rs` (see below).
+Both are covered by `rystemd/tests/e2e.rs` (see below).
 
 ## Automated coverage
 
-`rustemd/tests/e2e.rs` drives the demo units through the programmatic
+`rystemd/tests/e2e.rs` drives the demo units through the programmatic
 `Control` CLI client against a real in-process daemon:
 
 - `live_demo_units_lifecycle` — the `examples/live/` set: `.service`,
@@ -146,18 +146,18 @@ Both are covered by `rustemd/tests/e2e.rs` (see below).
 The live env was booted for real in qemu (KVM, `-nographic`) with commands
 piped over the serial console. Observed, from the captured serial log:
 
-- `rustemd manager started` and a getty shell on `/dev/ttyS0` responds.
-- `rustemctl list-units` shows every demo unit in the right state at boot:
+- `rystemd manager started` and a getty shell on `/dev/ttyS0` responds.
+- `rystemctl list-units` shows every demo unit in the right state at boot:
   `demo.mount active(mounted)`, `demo.service active(exited)`,
   `demo.socket active(running)`, `demo.timer active`, `demo.target active`,
   `getty@ttyS0.service active(running)`.
 - `udev: 325 devices → 650 .device units` — real `.device` units appear.
-- `rustemctl status demo.mount` → `Active: active (mounted)`; `/mnt/demo` exists.
+- `rystemctl status demo.mount` → `Active: active (mounted)`; `/mnt/demo` exists.
 - The timer fires: `[demo.timer] triggered demo-tick.service`, then
-  `[rustemd demo] tick from demo-tick.service`.
+  `[rystemd demo] tick from demo-tick.service`.
 - Socket activation: `nc -z 127.0.0.1 8080` → `demo-echo.service` goes
   `active (running)` (`activated via socket`).
-- `rustemctl poweroff` → `shutdown complete, powering off` → `reboot: Power
+- `rystemctl poweroff` → `shutdown complete, powering off` → `reboot: Power
   down`. Clean.
 - TUI over serial **renders** a frame now that `/init` sets a size and the TUI
   has a 0×0 fallback (see the section above).

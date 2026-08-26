@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Boot the initramfs in qemu with rustemd as PID 1 and assert: the manager
+# Boot the initramfs in qemu with rystemd as PID 1 and assert: the manager
 # starts, the getty template instance is active, and the machine powers off
-# cleanly (via rustemd's reboot(2) poweroff).
+# cleanly (via rystemd's reboot(2) poweroff).
 #
 # The serial console is streamed live to your terminal so you can watch the
 # machine boot, greet, and shut down; it is also captured to a temp log for
@@ -32,7 +32,7 @@ command -v "$QEMU" >/dev/null || { echo "error: $QEMU not found" >&2; exit 2; }
 # Always (re)build the PID-1 binary with the `boot` feature (incremental, so
 # a fast no-op when current). Guarantees a stale default build is never
 # reused — without `boot` the getty template doesn't resolve and no prompt
-# appears. The `boot` feature is ignored by rustemctl/rustemd-tui.
+# appears. The `boot` feature is ignored by rystemctl/rystemd-tui.
 cargo build --release --features boot
 
 [ -f "$INITRD" ] || { echo "building initramfs..."; scripts/build-initramfs.sh; }
@@ -60,7 +60,7 @@ if command -v stdbuf >/dev/null 2>&1; then
   STDBUF=(stdbuf -oL -eL)
 fi
 
-echo "=== rustemd VM test: booting (kernel: $(basename "$KERNEL")) ==="
+echo "=== rystemd VM test: booting (kernel: $(basename "$KERNEL")) ==="
 "${STDBUF[@]}" "$QEMU" "${ACCEL[@]}" -m 512 -nographic -no-reboot \
   -kernel "$KERNEL" \
   -initrd "$INITRD" \

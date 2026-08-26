@@ -1,4 +1,4 @@
-Package: rustemd
+Package: rystemd
 Version: @VERSION@
 Section: admin
 Priority: optional
@@ -6,7 +6,7 @@ Architecture: @ARCH@
 Maintainer: Francis Lalonde <6190260+fralalonde@users.noreply.github.com>
 Depends: libc6 (>= 2.17)
 Description: systemd init reimplementation: unit manager + systemctl-compatible CLI
- rustemd is a systemd init reimplementation in Rust: a drop-in systemctl
- replacement with unit files, user services, and timers. Ships the rustemd
- manager daemon, the rustemctl systemctl-compatible CLI, and the rustemd-tui
+ rystemd is a systemd init reimplementation in Rust: a drop-in systemctl
+ replacement with unit files, user services, and timers. Ships the rystemd
+ manager daemon, the rystemctl systemctl-compatible CLI, and the rystemd-tui
  terminal client.

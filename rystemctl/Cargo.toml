@@ -1,0 +1,28 @@
+[package]
+name = "rystemctl"
+version = "0.1.1"
+edition = "2024"
+description = "The systemctl-compatible control CLI for the rystemd init manager."
+license = "MIT"
+repository = "https://github.com/fralalonde/rystemd"
+homepage = "https://github.com/fralalonde/rystemd"
+rust-version = "1.89"
+
+[dependencies]
+rystemd = { path = "../rystemd" }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_complete_nushell = "4.6.2"
+serde_json = "1"
+colored = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rystemctl"
+path = "src/main.rs"

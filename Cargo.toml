@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rustemd", "rustemctl", "rustemd-tui"]
+members = ["rystemd", "rystemctl", "rystemd-tui"]
 
 [profile.release]
 opt-level = "z"

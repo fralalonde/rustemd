@@ -1,0 +1,977 @@
+//! The `systemctl`-compatible command surface. `rystemctl` is the control
+//! CLI that talks to a running `rystemd` manager over its control socket;
+//! the daemon itself lives in the `rystemd` crate. Invoking `rystemctl` as
+//! `systemctl` (symlink) also enters CLI mode.
+
+#![allow(clippy::too_many_arguments)]
+
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use colored::Colorize;
+use serde_json::{Value, json};
+use std::io::Write;
+
+use rystemd::cli_style as style;
+use rystemd::client::Client;
+use rystemd::journal::JournalRecord;
+use rystemd::names::normalize_unit;
+use rystemd::paths::Paths;
+
+fn normalize_units(names: &[String]) -> Vec<String> {
+    names.iter().map(|n| normalize_unit(n)).collect()
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rystemctl",
+    version = rystemd::VERSION,
+    about = "systemctl-compatible control CLI for the rystemd unit manager"
+)]
+pub struct Cli {
+    /// Talk to the per-user manager instead of the system one.
+    #[arg(long, global = true)]
+    pub user: bool,
+    /// Do not pipe output through a pager.
+    #[arg(long, global = true)]
+    pub no_pager: bool,
+
+    #[command(subcommand)]
+    pub cmd: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Start (activate) one or more units.
+    Start { units: Vec<String> },
+    /// Stop (deactivate) one or more units.
+    Stop { units: Vec<String> },
+    /// Restart one or more units.
+    Restart { units: Vec<String> },
+    /// Try to restart units if they are active; otherwise start them.
+    #[command(name = "try-restart")]
+    TryRestart { units: Vec<String> },
+    /// Run a unit's ExecReload.
+    Reload { units: Vec<String> },
+    /// Stop and then start units; if not active, just start.
+    RestartOrStart { units: Vec<String> },
+    /// Send a signal to a unit's main process group.
+    Kill {
+        unit: String,
+        #[arg(long)]
+        signal: Option<String>,
+    },
+    /// Mask units (prevent them from being started).
+    Mask { units: Vec<String> },
+    /// Unmask units (allow them to start again).
+    Unmask { units: Vec<String> },
+    /// Reset the failed state of units.
+    #[command(name = "reset-failed")]
+    ResetFailed { units: Vec<String> },
+    /// Disable then re-enable units.
+    Reenable { units: Vec<String> },
+    /// Remove a unit's runtime/state files (journal segments).
+    Clean { units: Vec<String> },
+    /// List one or more units' Requires/Wants dependencies, one per line.
+    #[command(name = "list-dependencies")]
+    ListDependencies {
+        unit: String,
+        /// List the units that require/want this unit instead.
+        #[arg(long)]
+        reverse: bool,
+    },
+    /// List socket units.
+    #[command(name = "list-sockets")]
+    ListSockets {
+        /// Do not print the header line.
+        #[arg(long)]
+        no_legend: bool,
+        /// Show all socket units, including inactive ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show runtime status of one or more units (or all).
+    Status {
+        units: Vec<String>,
+        /// Do not truncate output.
+        #[arg(short = 'l', long)]
+        full: bool,
+    },
+    /// Query whether units are active.
+    #[command(name = "is-active")]
+    IsActive { units: Vec<String> },
+    /// Query whether units are in a failed state.
+    #[command(name = "is-failed")]
+    IsFailed { units: Vec<String> },
+    /// Query whether units are enabled.
+    #[command(name = "is-enabled")]
+    IsEnabled { units: Vec<String> },
+    /// Enable units (create [Install] symlinks).
+    Enable {
+        units: Vec<String>,
+        /// Also start the units right away.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Disable units (remove [Install] symlinks).
+    Disable {
+        units: Vec<String>,
+        /// Also stop the units right away.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Reload the manager's unit configuration from disk.
+    #[command(name = "daemon-reload")]
+    DaemonReload,
+    /// List units and their states.
+    #[command(name = "list-units")]
+    ListUnits {
+        #[arg(long, value_delimiter = ',')]
+        type_: Option<Vec<String>>,
+        #[arg(long)]
+        state: Option<String>,
+        /// Do not print the header line.
+        #[arg(long)]
+        no_legend: bool,
+        #[arg(long)]
+        plain: bool,
+    },
+    /// List installed unit files and their enablement state.
+    #[command(name = "list-unit-files")]
+    ListUnitFiles {
+        #[arg(long)]
+        no_legend: bool,
+    },
+    /// List timers and their next/last elapse.
+    #[command(name = "list-timers")]
+    ListTimers {
+        #[arg(long)]
+        no_legend: bool,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show the contents of unit files.
+    Cat { units: Vec<String> },
+    /// Show unit properties.
+    Show {
+        units: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        property: Vec<String>,
+        #[arg(long)]
+        value: bool,
+    },
+    /// Print the current default target.
+    #[command(name = "get-default")]
+    GetDefault,
+    /// Show the unit-file repository the manager uses (path, backend, git
+    /// HEAD), then open that repository locally with the shared DAO crate and
+    /// list its unit files.
+    #[command(name = "repo")]
+    Repo,
+    /// Show log records from the manager's persistent journal
+    /// (`journalctl`-style).
+    #[command(name = "journal")]
+    Journal {
+        /// Filter to one unit.
+        unit: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(short = 'n', long = "lines")]
+        lines: Option<usize>,
+        /// Follow new entries as they are written.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only records at or after this UNIX timestamp (seconds).
+        #[arg(long, value_name = "SECS")]
+        since: Option<u64>,
+    },
+    /// Show log records from the manager's persistent journal, `journalctl`-style.
+    #[command(name = "journalctl")]
+    Journalctl {
+        /// Filter to one unit.
+        #[arg(short = 'u', long, value_name = "UNIT")]
+        unit: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(short = 'n', long = "lines", value_name = "N")]
+        lines: Option<usize>,
+        /// Follow new entries as they are written.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only records at or after this UNIX timestamp (seconds).
+        #[arg(long, value_name = "SECS")]
+        since: Option<u64>,
+        /// Do not pipe output through a pager (accepted for compatibility;
+        /// output is already unpaged).
+        #[arg(long)]
+        no_pager: bool,
+        /// Filter by log priority. NOT yet supported.
+        #[arg(short = 'p', long)]
+        priority: Option<String>,
+    },
+    /// Set the default target.
+    #[command(name = "set-default")]
+    SetDefault { target: String },
+    /// Start a target and stop units not required by it.
+    Isolate { target: String },
+    /// Whether the manager is running without failed units.
+    #[command(name = "is-system-running")]
+    IsSystemRunning,
+    /// Orderly stop all units and exit.
+    #[command(name = "poweroff")]
+    Poweroff,
+    // ---- explicitly unsupported systemctl surface ----
+    /// Edit a unit's file. Not implemented.
+    Edit { units: Vec<String> },
+    /// Enable/start units per the preset policy. Not implemented.
+    Preset { units: Vec<String> },
+    /// Link a unit file into the search path. Not implemented.
+    Link { units: Vec<String> },
+    /// Revert a unit to its vendor version. Not implemented.
+    Revert { units: Vec<String> },
+    /// Cancel a pending job. Not implemented.
+    Cancel { units: Vec<String> },
+    /// Show version.
+    Version,
+    /// Generate shell completions.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+pub enum Shell {
+    Bash,
+    Fish,
+    Zsh,
+    #[value(name = "powershell")]
+    PowerShell,
+    Nushell,
+}
+
+pub fn run(cli: Cli) -> i32 {
+    let res = match &cli.cmd {
+        Command::Version => {
+            println!("rystemctl {}", rystemd::VERSION);
+            return 0;
+        }
+        command => dispatch(&cli, command),
+    };
+    match res {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{} {}", style::error("Failed:"), e);
+            1
+        }
+    }
+}
+
+fn paths(user: bool) -> Result<Paths, String> {
+    if user {
+        Paths::user()
+    } else {
+        Ok(Paths::system())
+    }
+}
+
+fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
+    match cmd {
+        Command::Version => Ok(0),
+        Command::Start { units } => units_op(cli, "start", units).map(|_| 0),
+        Command::Stop { units } => units_op(cli, "stop", units).map(|_| 0),
+        Command::Restart { units } => units_op(cli, "restart", units).map(|_| 0),
+        Command::TryRestart { units } => units_op(cli, "try_restart", units).map(|_| 0),
+        // try-restart semantics: restart if active, otherwise start.
+        Command::RestartOrStart { units } => units_op(cli, "try_restart", units).map(|_| 0),
+        Command::Reload { units } => units_op(cli, "reload", units).map(|_| 0),
+        Command::Mask { units } => units_op(cli, "mask", units).map(|_| 0),
+        Command::Unmask { units } => units_op(cli, "unmask", units).map(|_| 0),
+        Command::ResetFailed { units } => units_op(cli, "reset_failed", units).map(|_| 0),
+        Command::Reenable { units } => cmd_reenable(cli, units),
+        Command::Clean { units } => cmd_clean(cli, units),
+        Command::ListDependencies { unit, reverse } => cmd_list_dependencies(cli, unit, *reverse),
+        Command::ListSockets { no_legend, all } => cmd_list_sockets(cli, *no_legend, *all),
+        Command::Kill { unit, signal } => {
+            let client = Client::for_mode(cli.user)?;
+            let sig = signal
+                .as_deref()
+                .and_then(rystemd::unit::sig_from_name)
+                .unwrap_or(rystemd::platform::signal::Signal::SIGTERM);
+            client
+                .op_with(
+                    "kill",
+                    json!({"units": [normalize_unit(unit)], "signal": format!("{sig}")}),
+                )
+                .map(|_| 0)
+        }
+        Command::Status { units, full } => cmd_status(cli, units, *full),
+        Command::IsActive { units } => cmd_is_active(cli, units),
+        Command::IsFailed { units } => cmd_is_failed(cli, units),
+        Command::IsEnabled { units } => cmd_is_enabled(cli, units),
+        Command::Enable { units, now } => cmd_enable(cli, units, *now),
+        Command::Disable { units, now } => cmd_disable(cli, units, *now),
+        Command::DaemonReload => {
+            let client = Client::for_mode(cli.user)?;
+            client.simple_op("daemon_reload").map(|_| 0)
+        }
+        Command::ListUnits {
+            type_,
+            state,
+            no_legend,
+            plain,
+        } => cmd_list_units(
+            cli,
+            type_.clone().unwrap_or_default(),
+            state.clone(),
+            *no_legend,
+            *plain,
+        ),
+        Command::ListUnitFiles { no_legend } => cmd_list_unit_files(cli, *no_legend),
+        Command::ListTimers { no_legend, all } => cmd_list_timers(cli, *no_legend, *all),
+        Command::Cat { units } => cmd_cat(cli, units),
+        Command::Show {
+            units,
+            property,
+            value,
+        } => cmd_show(cli, units, property, *value),
+        Command::GetDefault => {
+            let client = Client::for_mode(cli.user)?;
+            let v = client.simple_op("get_default")?;
+            println!("{}", v.as_str().unwrap_or("default.target"));
+            Ok(0)
+        }
+        Command::Repo => cmd_repo(cli),
+        Command::Journal {
+            unit,
+            lines,
+            follow,
+            since,
+        } => cmd_journal(cli, unit.as_deref(), *lines, *follow, *since),
+        Command::Journalctl {
+            unit,
+            lines,
+            follow,
+            since,
+            no_pager: _,
+            priority,
+        } => {
+            if priority.is_some() {
+                return Err("--priority is not yet supported".into());
+            }
+            cmd_journal(cli, unit.as_deref(), *lines, *follow, *since)
+        }
+        Command::SetDefault { target } => {
+            let client = Client::for_mode(cli.user)?;
+            client
+                .op_with("set_default", json!({"name": normalize_unit(target)}))
+                .map(|_| 0)
+        }
+        Command::Isolate { target } => {
+            let client = Client::for_mode(cli.user)?;
+            client
+                .op_with("isolate", json!({"name": normalize_unit(target)}))
+                .map(|_| 0)
+        }
+        Command::IsSystemRunning => {
+            let client = Client::for_mode(cli.user)?;
+            let v = client.simple_op("is_system_running")?;
+            if v.get("degraded").and_then(Value::as_bool).unwrap_or(false) {
+                println!("degraded");
+                Ok(1)
+            } else {
+                println!("running");
+                Ok(0)
+            }
+        }
+        Command::Poweroff => {
+            let client = Client::for_mode(cli.user)?;
+            client.simple_op("shutdown").map(|_| 0)
+        }
+        Command::Edit { .. }
+        | Command::Preset { .. }
+        | Command::Link { .. }
+        | Command::Revert { .. }
+        | Command::Cancel { .. } => {
+            let name = match cmd {
+                Command::Edit { .. } => "edit",
+                Command::Preset { .. } => "preset",
+                Command::Link { .. } => "link",
+                Command::Revert { .. } => "revert",
+                Command::Cancel { .. } => "cancel",
+                _ => unreachable!(),
+            };
+            Err(format!("{name} is not implemented"))
+        }
+        Command::Completions { shell } => {
+            cmd_completions(*shell);
+            Ok(0)
+        }
+    }
+}
+
+/// Generate a shell completion script for the invoked binary. Derives the
+/// program name from `argv[0]` so `systemctl completions bash` emits
+/// completions for `systemctl`, not the internal `rystemctl` name.
+fn cmd_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    let name = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| cmd.get_name().to_string());
+    // Buffer first, then write: `clap_complete` panics on write errors, so
+    // `systemctl completions fish | head` would abort with a broken-pipe
+    // panic instead of exiting quietly.
+    let mut buf = Vec::new();
+    match shell {
+        Shell::Bash => {
+            clap_complete::generate(clap_complete::shells::Bash, &mut cmd, &name, &mut buf)
+        }
+        Shell::Fish => {
+            clap_complete::generate(clap_complete::shells::Fish, &mut cmd, &name, &mut buf)
+        }
+        Shell::Zsh => {
+            clap_complete::generate(clap_complete::shells::Zsh, &mut cmd, &name, &mut buf)
+        }
+        Shell::PowerShell => {
+            clap_complete::generate(clap_complete::shells::PowerShell, &mut cmd, &name, &mut buf)
+        }
+        Shell::Nushell => {
+            clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, &name, &mut buf)
+        }
+    }
+    let _ = std::io::stdout().write_all(&buf);
+}
+
+fn client_for(cli: &Cli) -> Result<Client, String> {
+    Client::for_mode(cli.user)
+}
+
+fn units_op(cli: &Cli, op: &str, units: &[String]) -> Result<(), String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    client.units_op(op, &norm)?;
+    Ok(())
+}
+
+// ---- command handlers ---------------------------------------------------------
+
+fn cmd_is_active(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("is_active", &norm)?;
+    let states: Vec<(String, String)> = v["states"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| {
+                    (
+                        x[0].as_str().unwrap_or("").to_string(),
+                        x[1].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (_, s) in &states {
+        println!("{s}");
+    }
+    Ok(v.get("exit").and_then(Value::as_i64).unwrap_or(0) as i32)
+}
+
+fn cmd_is_failed(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("is_failed", &norm)?;
+    let failed = v
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if failed {
+        println!("failed");
+        Ok(0)
+    } else {
+        println!("active");
+        Ok(1)
+    }
+}
+
+fn cmd_is_enabled(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let paths = paths(cli.user)?;
+    let mut worst = 0;
+    for u in units {
+        let state = rystemd::enable::enabled_state(&paths, u);
+        println!("{state}");
+        worst = worst.max(match state.as_str() {
+            "not-found" => 3,
+            "disabled" | "masked" => 1,
+            _ => 0,
+        });
+    }
+    Ok(worst)
+}
+
+fn cmd_enable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
+    let paths = paths(cli.user)?;
+    for u in units {
+        let norm = normalize_unit(u);
+        let msgs = rystemd::enable::enable(&paths, &norm)?;
+        for m in msgs {
+            println!("{}", style::ok(&m));
+        }
+    }
+    if now {
+        let client = client_for(cli)?;
+        let norm = normalize_units(units);
+        client.units_op("start", &norm)?;
+    } else {
+        // Best-effort daemon reload so the change takes effect.
+        if let Ok(client) = client_for(cli) {
+            let _ = client.simple_op("daemon_reload");
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_disable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
+    let paths = paths(cli.user)?;
+    for u in units {
+        let norm = normalize_unit(u);
+        let msgs = rystemd::enable::disable(&paths, &norm)?;
+        for m in msgs {
+            println!("{}", style::ok(&m));
+        }
+    }
+    if now {
+        let client = client_for(cli)?;
+        let norm = normalize_units(units);
+        client.units_op("stop", &norm)?;
+    }
+    Ok(0)
+}
+
+fn cmd_reenable(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let paths = paths(cli.user)?;
+    for u in units {
+        let norm = normalize_unit(u);
+        for m in rystemd::enable::disable(&paths, &norm)? {
+            println!("{}", style::ok(&m));
+        }
+        for m in rystemd::enable::enable(&paths, &norm)? {
+            println!("{}", style::ok(&m));
+        }
+    }
+    // Best-effort daemon reload so the change takes effect.
+    if let Ok(client) = client_for(cli) {
+        let _ = client.simple_op("daemon_reload");
+    }
+    Ok(0)
+}
+
+fn cmd_clean(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("clean", &norm)?;
+    for m in v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+    {
+        println!("{}", style::ok(m));
+    }
+    Ok(0)
+}
+
+fn cmd_list_dependencies(cli: &Cli, unit: &str, reverse: bool) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let name = normalize_unit(unit);
+    let v = client.op_with(
+        "list_dependencies",
+        json!({"name": name, "reverse": reverse}),
+    )?;
+    let names: Vec<String> = v
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for n in names {
+        println!("{n}");
+    }
+    Ok(0)
+}
+
+fn cmd_list_sockets(cli: &Cli, no_legend: bool, _all: bool) -> Result<i32, String> {
+    // Reuse the list-units implementation with a `socket` type filter.
+    cmd_list_units(cli, vec!["socket".to_string()], None, no_legend, false)
+}
+
+fn cmd_repo(cli: &Cli) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let v = client.simple_op("repo")?;
+    let root = v.get("root").and_then(Value::as_str).unwrap_or("");
+    println!("Repository: {}", root);
+
+    // Open the same repository locally with the shared DAO crate, proving the
+    // client and the daemon agree on what "the unit files" are.
+    let roots: Vec<std::path::PathBuf> = v
+        .get("roots")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(std::path::PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repo = if roots.is_empty() {
+        rystemd::repo::Repo::open(std::path::PathBuf::from(root))
+    } else {
+        rystemd::repo::Repo::open_roots(roots)
+    }
+    .map_err(|e| e.to_string())?;
+    let units = repo.list().map_err(|e| e.to_string())?;
+    println!("Units:      {}", units.len());
+    for uf in units {
+        println!("  {:<24} {}", uf.name, uf.kind.suffix());
+    }
+    Ok(0)
+}
+
+/// `journal [unit] [-n N] [-f] [--since SECS]` — show the manager's durable
+/// log store, `journalctl`-style.
+fn cmd_journal(
+    cli: &Cli,
+    unit: Option<&str>,
+    lines: Option<usize>,
+    follow: bool,
+    since: Option<u64>,
+) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let mut params = serde_json::Map::new();
+    if let Some(u) = unit {
+        params.insert("unit".into(), json!(u));
+    }
+    if let Some(s) = since {
+        params.insert("since".into(), json!(s));
+    }
+    if let Some(t) = lines {
+        params.insert("tail".into(), json!(t));
+    }
+    let v = client.op_with("journal", serde_json::Value::Object(params))?;
+    let dir = v
+        .get("dir")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let records = parse_records(&v)?;
+    print_journal(&records, &dir);
+    println!("# journal: {}", dir);
+
+    if follow {
+        // Re-poll for records newer than the highest timestamp we've seen.
+        let mut last: Option<u64> = records.last().map(|r| r.secs).or(since);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut p = serde_json::Map::new();
+            if let Some(u) = unit {
+                p.insert("unit".into(), json!(u));
+            }
+            if let Some(s) = last.map(|s| s + 1) {
+                p.insert("since".into(), json!(s));
+            }
+            let v = client.op_with("journal", serde_json::Value::Object(p))?;
+            let recs = parse_records(&v)?;
+            if !recs.is_empty() {
+                print_journal(&recs, &dir);
+                last = recs.last().map(|r| r.secs);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn parse_records(v: &Value) -> Result<Vec<JournalRecord>, String> {
+    serde_json::from_value(v.get("records").cloned().unwrap_or(json!([])))
+        .map_err(|e| format!("bad journal response: {e}"))
+}
+
+fn print_journal(records: &[JournalRecord], _dir: &str) {
+    for r in records {
+        println!("{}  {:<24} {}", fmt_ts(r.secs), r.unit, r.text);
+    }
+}
+
+/// Render a UNIX timestamp as a local-ish `YYYY-MM-DD HH:MM:SS` string. Uses a
+/// civil-date algorithm (Howard Hinnant) with no extra dependencies.
+fn fmt_ts(secs: u64) -> String {
+    let days = (secs as i64) / 86_400;
+    let rem = secs % 86_400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s)
+}
+
+fn cmd_status(cli: &Cli, units: &[String], _full: bool) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("status", &norm)?;
+    let arr = v.as_array().ok_or("bad status response")?;
+    for (i, u) in arr.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_unit_status(u);
+    }
+    Ok(0)
+}
+
+fn print_unit_status(u: &Value) {
+    let name = u.get("name").and_then(Value::as_str).unwrap_or("?");
+    let desc = u.get("description").and_then(Value::as_str).unwrap_or("");
+    let active = u.get("active").and_then(Value::as_str).unwrap_or("?");
+    let load = u.get("load").and_then(Value::as_str).unwrap_or("?");
+    let sub = u.get("sub").and_then(Value::as_str).unwrap_or("?");
+    let active_color = match active {
+        "active" => style::star("●"),
+        "failed" => style::error("●"),
+        _ => "●".to_string(),
+    };
+    println!("{} {} - {}", active_color, style::accent(name), desc);
+    let path = u.get("path").and_then(Value::as_str).unwrap_or("");
+    let enabled = u.get("enabled").and_then(Value::as_str).unwrap_or("");
+    println!(
+        "     Loaded: {} ({}{})",
+        style::warn(load),
+        path,
+        if enabled.is_empty() {
+            String::new()
+        } else {
+            format!("; {enabled}")
+        }
+    );
+    let since = u
+        .get("active_enter")
+        .and_then(Value::as_u64)
+        .map(fmt_epoch)
+        .unwrap_or_else(|| "-".into());
+    let main_pid = u.get("main_pid").and_then(Value::as_i64).unwrap_or(0);
+    println!(
+        "     Active: {} ({}) since {}",
+        style::warn(active),
+        style::dim(sub),
+        since
+    );
+    if main_pid > 0 {
+        println!("   Main PID: {main_pid}");
+    }
+    let log = u
+        .get("log")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !log.is_empty() {
+        println!("      Logs:");
+        for line in log.iter().take(20) {
+            println!("        {}", style::dim(line.as_str().unwrap_or("")));
+        }
+    }
+}
+
+fn fmt_epoch(secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dt = chrono::DateTime::from_timestamp(secs as i64, 0);
+    let s = dt
+        .map(|d| d.format("%a %Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
+    let ago = now.saturating_sub(secs);
+    // `fmt_ago` already includes the "ago" suffix.
+    format!(
+        "{}; {}",
+        s,
+        rystemd::timespan::fmt_ago(std::time::Duration::from_secs(ago))
+    )
+}
+
+fn cmd_list_units(
+    cli: &Cli,
+    types: Vec<String>,
+    state: Option<String>,
+    no_legend: bool,
+    _plain: bool,
+) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let v = client.op_with(
+        "list_units",
+        json!({"types": types, "state": state, "pattern": null}),
+    )?;
+    let rows = v.as_array().unwrap_or(&vec![]).clone();
+    if !no_legend {
+        println!(
+            "{:<32} {:<8} {:<8} {:<10} DESCRIPTION",
+            "UNIT", "LOAD", "ACTIVE", "SUB"
+        );
+    }
+    for r in &rows {
+        println!(
+            "{:<32} {:<8} {:<8} {:<10} {}",
+            r["unit"].as_str().unwrap_or(""),
+            r["loaded"].as_str().unwrap_or(""),
+            r["active"].as_str().unwrap_or(""),
+            r["sub"].as_str().unwrap_or(""),
+            r["description"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_list_unit_files(cli: &Cli, no_legend: bool) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let v = client.simple_op("list_unit_files")?;
+    let rows = v.as_array().unwrap_or(&vec![]).clone();
+    if !no_legend {
+        println!("{:<32} STATE", "UNIT FILE");
+    }
+    for r in &rows {
+        println!(
+            "{:<32} {}",
+            r["file"].as_str().unwrap_or(""),
+            style_state(r["state"].as_str().unwrap_or("")),
+        );
+    }
+    Ok(0)
+}
+
+fn style_state(s: &str) -> String {
+    match s {
+        "enabled" => s.green().to_string(),
+        "disabled" => s.yellow().to_string(),
+        _ => s.to_string(),
+    }
+}
+
+fn cmd_list_timers(cli: &Cli, no_legend: bool, _all: bool) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let v = client.simple_op("list_timers")?;
+    let rows = v.as_array().unwrap_or(&vec![]).clone();
+    if !no_legend {
+        println!(
+            "{:<26} {:<12} {:<26} {:<12} {:<20} ACTIVATES",
+            "NEXT", "LEFT", "LAST", "PASSED", "UNIT"
+        );
+    }
+    for r in &rows {
+        let next = r
+            .get("next")
+            .and_then(Value::as_u64)
+            .map(fmt_epoch)
+            .unwrap_or_else(|| "-".into());
+        let next_left = r
+            .get("next_left")
+            .and_then(Value::as_i64)
+            .filter(|d| *d > 0)
+            .map(|d| {
+                format!(
+                    "{} left",
+                    rystemd::timespan::fmt_left(std::time::Duration::from_secs(d.max(0) as u64))
+                )
+            })
+            .unwrap_or_else(String::new);
+        let last = r
+            .get("last")
+            .and_then(Value::as_u64)
+            .map(fmt_epoch)
+            .unwrap_or_else(|| "-".into());
+        let last_passed = r
+            .get("last_passed")
+            .and_then(Value::as_i64)
+            .filter(|d| *d >= 0)
+            .map(|d| rystemd::timespan::fmt_ago(std::time::Duration::from_secs(d as u64)))
+            .unwrap_or_else(String::new);
+        println!(
+            "{:<26} {:<12} {:<26} {:<12} {:<20} {}",
+            style::accent(&next),
+            next_left,
+            last,
+            last_passed,
+            r["unit"].as_str().unwrap_or(""),
+            r["activates"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_cat(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("cat", &norm)?;
+    let rows = v.as_array().unwrap_or(&vec![]).clone();
+    for r in &rows {
+        println!(
+            "# {}\n# {}",
+            r["unit"].as_str().unwrap_or(""),
+            r["path"].as_str().unwrap_or("")
+        );
+        println!("{}", r["text"].as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
+fn cmd_show(
+    cli: &Cli,
+    units: &[String],
+    property: &[String],
+    value_only: bool,
+) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("show", &norm)?;
+    let rows = v.as_array().unwrap_or(&vec![]).clone();
+    for r in &rows {
+        let obj = r.as_object().unwrap();
+        for (k, val) in obj {
+            if !property.is_empty() && !property.contains(k) {
+                continue;
+            }
+            let vs = val
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| val.to_string());
+            if value_only {
+                println!("{vs}");
+            } else {
+                println!("{k}={vs}");
+            }
+        }
+        println!();
+    }
+    Ok(0)
+}
+
+/// Parse argv and run; returns the process exit code. Used by both the
+/// `rystemctl` and `systemctl` binaries (symlink drop-in).
+pub fn entry() -> i32 {
+    match Cli::try_parse() {
+        Ok(cli) => run(cli),
+        Err(e) => {
+            let _ = e.print();
+            e.exit_code()
+        }
+    }
+}

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Smoke test: run rustemd as real PID 1 in a user+mount+pid namespace and
+# Smoke test: run rystemd as real PID 1 in a user+mount+pid namespace and
 # verify it boots a service and shuts down cleanly. No qemu/kernel needed —
 # uses `unshare`, so it runs anywhere user namespaces are enabled (including
 # a toolbox/container).
 set -uo pipefail
 
-BIN=${1:-./target/release/rustemd}
+BIN=${1:-./target/release/rystemd}
 
 # Always (re)build the PID-1 binary with the `boot` feature (incremental, so
 # a fast no-op when current). This guarantees a stale default build is never
@@ -14,18 +14,18 @@ BIN=${1:-./target/release/rustemd}
 cargo build --release --features boot
 
 if [ ! -x "$BIN" ]; then
-  echo "error: need a rustemd binary (build with: cargo build --release --features boot)" >&2
+  echo "error: need a rystemd binary (build with: cargo build --release --features boot)" >&2
   exit 2
 fi
 
-# Temp dir under target/, NOT /tmp (rustemd mounts a fresh /tmp and would hide
+# Temp dir under target/, NOT /tmp (rystemd mounts a fresh /tmp and would hide
 # it) and not the repo root (keep generated artifacts out of the tree).
 mkdir -p target
 D=$(mktemp -d "./target/.ns-boot-XXXXXX")
 trap 'rm -rf "$D"' EXIT
 mkdir -p "$D/units/default.target.wants"
 
-# A oneshot service that proves a unit actually ran under PID-1 rustemd by
+# A oneshot service that proves a unit actually ran under PID-1 rystemd by
 # writing a marker to a host-visible path.
 cat > "$D/units/hello.service" <<EOF
 [Service]
@@ -34,8 +34,8 @@ ExecStart=/bin/sh -c 'echo booted > $D/marker'
 EOF
 ln -s ../hello.service "$D/units/default.target.wants/hello.service"
 
-export RUSTEMD_UNIT_PATH="$D/units"
-unset RUSTEMD_RUNTIME_DIR RUSTEMD_SOCKET RUSTEMD_CONFIG_DIR
+export RYSTEMD_UNIT_PATH="$D/units"
+unset RYSTEMD_RUNTIME_DIR RYSTEMD_SOCKET RYSTEMD_CONFIG_DIR
 
 LOG="$D/daemon.log"
 # --user must come first (creates the userns); --pid implies --fork, so the

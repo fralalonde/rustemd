@@ -1,0 +1,31 @@
+<!-- WiX 4 installer for rystemd (Windows MSI). Built by release.yml with:
+       wix build -d Version=<x.y.z> rystemd.wxs -o rystemd-<ver>-x86_64.msi
+     The workflow copies this file next to the built .exe files first so the
+     relative Source= paths resolve. Version must be a clean x.y.z semver. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="rystemd"
+      Manufacturer="fralalonde"
+      Version="$(Version)"
+      UpgradeCode="6882fed4-7c00-432d-989d-7f886f127b6d"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of rystemd is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="rystemd" />
+    </StandardDirectory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="Binaries" Guid="03dc31c0-b987-46ed-afa6-0716ef27367d">
+        <File Id="rystemdExe" Source="rystemd.exe" />
+        <File Id="rystemctlExe" Source="rystemctl.exe" />
+        <File Id="rystemdTuiExe" Source="rystemd-tui.exe" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="rystemd" Level="1">
+      <ComponentRef Id="Binaries" />
+    </Feature>
+  </Package>
+</Wix>

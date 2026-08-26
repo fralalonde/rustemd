@@ -1,0 +1,81 @@
+[package]
+name = "rystemd"
+version = "0.1.1"
+edition = "2024"
+description = "A systemd init reimplementation in Rust: a drop-in systemctl replacement with unit files, user services, and timers."
+license = "MIT"
+repository = "https://github.com/fralalonde/rystemd"
+homepage = "https://github.com/fralalonde/rystemd"
+rust-version = "1.89"
+
+[features]
+default = ["socket", "udev", "dbus"]
+# Linux PID-1 boot support: mount the API/virtual filesystems, run early-boot
+# configuration (hostname, machine-id, sysctl, modules, tmpfiles, fstab), and
+# power the machine off on shutdown.
+boot = []
+# Socket activation: `.socket` units that bind listening sockets and activate a
+# matching `.service` on the first connection (inetd-style, via LISTEN_FDS).
+socket = []
+# udev integration: discover kernel devices (sysfs + netlink uevents) and track
+# them as runtime-generated `.device` units. Linux-only; no new dependencies —
+# built on `nix` netlink sockets and the sysfs tree. Disable for headless /
+# non-Linux builds that don't need device ordering.
+udev = []
+# D-Bus integration: `Type=dbus`/`BusName=` service activation plus a manager
+# control interface over zbus. On by default for Linux builds; the `dbus` code
+# is `#[cfg(all(target_os = "linux", feature = "dbus"))]`-gated and zbus is a
+# Linux-only dependency, so it compiles out on Windows/macOS.
+dbus = ["dep:zbus"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "user", "resource", "socket", "poll", "hostname", "mount"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# D-Bus (Linux only): pure-Rust, no C dependency. `blocking-api` runs the
+# async machinery on internal threads, so the synchronous poll loop never
+# does async work; `async-io` is the executor backend the blocking API uses.
+# Optional — pulled in only by the `dbus` feature (not in `default`).
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"], optional = true }
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# The D-Bus integration test (tests/dbus.rs) drives the systemd1 surface over a
+# private session bus, so it needs a zbus client of its own (matching the
+# blocking-api/async-io features the `dbus` feature uses).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[[bin]]
+name = "rystemd"
+path = "src/main.rs"
+
+# The D-Bus integration test only makes sense with the `dbus` feature: skip it
+# (rather than fail to compile) when building with --no-default-features.
+[[test]]
+name = "dbus"
+required-features = ["dbus"]

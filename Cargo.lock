@@ -1160,47 +1160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustemctl"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "clap",
- "clap_complete",
- "clap_complete_nushell",
- "colored",
- "libc",
- "rustemd",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "rustemd"
-version = "0.1.1"
-dependencies = [
- "chrono",
- "clap",
- "colored",
- "libc",
- "nix",
- "serde",
- "serde_json",
- "tempfile",
- "windows-sys",
- "zbus",
-]
-
-[[package]]
-name = "rustemd-tui"
-version = "0.1.1"
-dependencies = [
- "clap",
- "crossterm",
- "ratatui",
- "rustemd",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1218,6 +1177,47 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rystemctl"
+version = "0.1.1"
+dependencies = [
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_complete_nushell",
+ "colored",
+ "libc",
+ "rystemd",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "rystemd"
+version = "0.1.1"
+dependencies = [
+ "chrono",
+ "clap",
+ "colored",
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys",
+ "zbus",
+]
+
+[[package]]
+name = "rystemd-tui"
+version = "0.1.1"
+dependencies = [
+ "clap",
+ "crossterm",
+ "ratatui",
+ "rystemd",
+]
 
 [[package]]
 name = "ryu"

@@ -1,8 +1,8 @@
 ## Architecture
 
-This is a Cargo **workspace** with three crates: `rustemd` (the library and
-the PID-1 `rustemd` daemon), `rustemctl` (the `systemctl`-compatible control
-CLI, which depends on the library), and `rustemd-tui` (the terminal client,
+This is a Cargo **workspace** with three crates: `rystemd` (the library and
+the PID-1 `rystemd` daemon), `rystemctl` (the `systemctl`-compatible control
+CLI, which depends on the library), and `rystemd-tui` (the terminal client,
 which depends on the library's `Control` API).
 
 | Module | Responsibility |
@@ -14,14 +14,14 @@ which depends on the library's `Control` API).
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
 | `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
-| `dbus` | zbus bridge for the `org.rustemd.Manager1.Manager` interface (Linux, opt-in `dbus` feature) |
+| `dbus` | zbus bridge for the `org.rystemd.Manager1.Manager` interface (Linux, opt-in `dbus` feature) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
-| `daemon` | The PID-1 manager entry point (`rustemd daemon`) |
+| `daemon` | The PID-1 manager entry point (`rystemd daemon`) |
 | `enable` | `[Install]` symlink management |
 | `paths` | System vs. user filesystem layout |
 
-The `systemctl`-compatible CLI lives in the separate `rustemctl` crate (its
+The `systemctl`-compatible CLI lives in the separate `rystemctl` crate (its
 `cli` module), which consumes the library's `client`/`paths`/`enable`/
 `cli_style`/`names` modules.
 
@@ -40,7 +40,7 @@ The library exposes a `Control` trait implemented two ways — an **in-process**
 alternative to shelling out to `systemctl` or speaking D-Bus.
 
 ```rust
-use rustemd::control::{Control, SocketClient};
+use rystemd::control::{Control, SocketClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Talk to a running daemon over the socket (like `systemctl` does).
@@ -58,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 An in-process manager implements the same trait:
 
 ```rust
-use rustemd::control::Control;
-use rustemd::manager::{Manager, ManagerCfg};
+use rystemd::control::Control;
+use rystemd::manager::{Manager, ManagerCfg};
 
 let mut mgr = Manager::new(ManagerCfg::for_mode(false)?)?;
 mgr.load_all();
@@ -80,19 +80,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 
 # From Windows, run the Linux suite too when WSL is available:
-wsl.exe -e bash -lc 'cd /mnt/d/path/to/rustemd && cargo test --workspace'
+wsl.exe -e bash -lc 'cd /mnt/d/path/to/rystemd && cargo test --workspace'
 ```
 
 Integration tests boot the real manager and drive it over the socket —
-`rustemd/tests/e2e.rs` uses the programmatic `Control` API, and
-`rustemctl/tests/cli.rs` runs the compiled `rustemctl` binary against the
-daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
+`rystemd/tests/e2e.rs` uses the programmatic `Control` API, and
+`rystemctl/tests/cli.rs` runs the compiled `rystemctl` binary against the
+daemon — both against a scratch filesystem via the `RYSTEMD_*` env hooks.
 
 ---
 
 ## Live environment
 
-To drive rustemd interactively as a real PID-1 daemon in qemu (demo units for
+To drive rystemd interactively as a real PID-1 daemon in qemu (demo units for
 every unit type, getty shell, etc.), see **[DEMO.md](DEMO.md)** and
 `scripts/live-vm.sh`.
 
@@ -129,7 +129,7 @@ artifacts on every `v*` tag push:
 | `aarch64-apple-darwin`       | `macos-14`         | tar.gz, dmg   |
 
 The package version comes from the git tag at build time (see
-`rustemd/build.rs`); `Cargo.toml`/`Cargo.lock` are kept in sync by `release.sh`
+`rystemd/build.rs`); `Cargo.toml`/`Cargo.lock` are kept in sync by `release.sh`
 at release time. Linux packaging lives in `scripts/package-linux.sh` +
 `packaging/`.
 
@@ -147,7 +147,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 
 # Also protect the Unix implementation from regressions:
-wsl.exe -e bash -lc 'cd /mnt/d/path/to/rustemd && cargo test --workspace'
+wsl.exe -e bash -lc 'cd /mnt/d/path/to/rystemd && cargo test --workspace'
 ```
 
 Use a separate `CARGO_TARGET_DIR` if a crashed Windows integration test still

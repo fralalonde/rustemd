@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Interactive live environment: boot rustemd as PID 1 in qemu and hand the
+# Interactive live environment: boot rystemd as PID 1 in qemu and hand the
 # serial console straight to your terminal, so you can drive the daemon by
 # hand. A busybox getty on /dev/ttyS0 gives you a shell where you can type
-# `rustemctl list-units`, `rustemctl start demo.service`, `rustemctl status demo.mount`,
-# `rustemd-tui`, and so on — against the real PID-1 manager.
+# `rystemctl list-units`, `rystemctl start demo.service`, `rystemctl status demo.mount`,
+# `rystemd-tui`, and so on — against the real PID-1 manager.
 #
 # Unlike vm-test.sh (which redirects the console to a log and auto-powers-off
 # for CI assertions), this script passes qemu's stdin/stdout through to your
 # terminal (qemu -nographic, no redirection) and boots WITHOUT auto-poweroff.
-# You quit cleanly by typing `rustemctl poweroff` at the getty shell, or force
+# You quit cleanly by typing `rystemctl poweroff` at the getty shell, or force
 # qemu to exit with Ctrl-A x.
 #
 # The initramfs installs the friendly demo units from examples/live/ (one of
-# every unit type rustemd supports) and enables demo.target at boot. The demo
+# every unit type rystemd supports) and enables demo.target at boot. The demo
 # .mount unit needs /mnt/demo to exist; /init creates it.
 #
 # Requires: qemu-system-x86_64, a kernel image, busybox, cpio, gzip.
@@ -31,9 +31,9 @@ if [ -z "$KERNEL" ]; then
 fi
 QEMU=${QEMU:-qemu-system-x86_64}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
-BIN=${BIN:-./target/release/rustemd}
+BIN=${BIN:-./target/release/rystemd}
 INITRD=./target/initramfs-live.cpio.gz
-EXTRA_UNITS=${RUSTEMD_EXTRA_UNITS:-examples/live}
+EXTRA_UNITS=${RYSTEMD_EXTRA_UNITS:-examples/live}
 
 if [ -z "$KERNEL" ] || [ ! -r "$KERNEL" ]; then
   echo "error: no kernel found (pass one as \$1)" >&2; exit 2
@@ -47,12 +47,12 @@ command -v "$QEMU" >/dev/null || { echo "error: $QEMU not found" >&2; exit 2; }
 # stale default build (no `boot`) is never silently reused. The `boot`
 # feature mounts the API filesystems itself; our /init also does it, so the
 # initramfs is explicit. The `--features boot` at the workspace root applies
-# `boot` to rustemd and is ignored by rustemctl/rustemd-tui.
+# `boot` to rystemd and is ignored by rystemctl/rystemd-tui.
 echo "building $BIN (cargo build --release --features boot)..."
 cargo build --release --features boot
 
 # Build the live initramfs: demo units enabled at boot, no auto-poweroff.
-export BUSYBOX RUSTEMD_EXTRA_UNITS="$EXTRA_UNITS" RUSTEMD_NO_BOOTTEST=1
+export BUSYBOX RYSTEMD_EXTRA_UNITS="$EXTRA_UNITS" RYSTEMD_NO_BOOTTEST=1
 scripts/build-initramfs.sh "$BIN" "$INITRD"
 
 # KVM when /dev/kvm is usable, else TCG (software).
@@ -62,20 +62,20 @@ if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
 fi
 
 cat <<EOF
-=== rustemd live env (kernel: $(basename "$KERNEL")) ===
-  Boots rustemd as PID 1 and drops you into a getty shell on /dev/ttyS0.
+=== rystemd live env (kernel: $(basename "$KERNEL")) ===
+  Boots rystemd as PID 1 and drops you into a getty shell on /dev/ttyS0.
 
   Try:
-    rustemctl list-units
-    rustemctl status demo.service demo.mount demo.socket demo.timer demo.target
-    rustemctl start demo.mount && ls /mnt/demo
-    rustemctl is-active demo.mount
-    rustemctl list-timers
+    rystemctl list-units
+    rystemctl status demo.service demo.mount demo.socket demo.timer demo.target
+    rystemctl start demo.mount && ls /mnt/demo
+    rystemctl is-active demo.mount
+    rystemctl list-timers
     printf 'hi\n' | nc 127.0.0.1 8080     # socket-activates demo-echo.service
-    rustemctl status demo-echo.service
-    rustemd-tui                            # renders over serial (see DEMO.md)
+    rystemctl status demo-echo.service
+    rystemd-tui                            # renders over serial (see DEMO.md)
 
-  Quit:  rustemctl poweroff   (or Ctrl-A x to force qemu to exit)
+  Quit:  rystemctl poweroff   (or Ctrl-A x to force qemu to exit)
 ============================================================
 EOF
 

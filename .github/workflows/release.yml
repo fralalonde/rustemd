@@ -32,7 +32,7 @@ jobs:
       # namespace, is what can exercise both paths. Running the binary directly
       # (not `sudo cargo`) avoids root-owned build artifacts and sudo's
       # secure_path resetting the cargo/rustup locations.
-      - run: cargo test -p rustemd --test privileged --no-run
+      - run: cargo test -p rystemd --test privileged --no-run
       - run: sudo "$(find target/debug/deps -maxdepth 1 -name 'privileged-*' -type f -executable -print -quit)"
 
   linux:
@@ -91,22 +91,22 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
 
           # Portable zip.
-          $stage = "dist/rustemd-$ver-x86_64-pc-windows-msvc"
+          $stage = "dist/rystemd-$ver-x86_64-pc-windows-msvc"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item "$bin/rustemd.exe" $stage
-          Copy-Item "$bin/rustemctl.exe" $stage
-          Copy-Item "$bin/rustemd-tui.exe" $stage
+          Copy-Item "$bin/rystemd.exe" $stage
+          Copy-Item "$bin/rystemctl.exe" $stage
+          Copy-Item "$bin/rystemd-tui.exe" $stage
           Set-Content -Path "$stage/VERSION.txt" -Value $ver
-          Compress-Archive -Path "$stage/*" -DestinationPath "dist/rustemd-$ver-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/rystemd-$ver-x86_64-pc-windows-msvc.zip"
 
           # MSI via WiX 4 (.NET tool). Build from the bin dir so relative
           # Source= paths in the .wxs resolve against the .exe files.
           dotnet tool install --global wix
-          Copy-Item packaging/windows/rustemd.wxs $bin/
+          Copy-Item packaging/windows/rystemd.wxs $bin/
           Push-Location $bin
-          wix build -d Version=$ver rustemd.wxs -o "rustemd-$ver-x86_64.msi"
+          wix build -d Version=$ver rystemd.wxs -o "rystemd-$ver-x86_64.msi"
           Pop-Location
-          Move-Item "$bin/rustemd-$ver-x86_64.msi" dist/
+          Move-Item "$bin/rystemd-$ver-x86_64.msi" dist/
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -114,7 +114,7 @@ jobs:
             dist/*.zip
             dist/*.msi
 
-  # NOTE: there is no macOS release job. rustemd is a systemd reimplementation
+  # NOTE: there is no macOS release job. rystemd is a systemd reimplementation
   # and its manager is Linux-native (cgroups v2, netlink/udev, system D-Bus,
   # signalfd); a macOS build was never validated and does not compile. Windows
   # is supported for the CLI/daemon compatibility port (Job Objects, named

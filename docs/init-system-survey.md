@@ -1,9 +1,9 @@
 # Init System Design Survey
 
 A working note on the design decisions of the major init/service systems, and
-which of them are worth adopting, adapting, or rejecting for **rustemd**.
+which of them are worth adopting, adapting, or rejecting for **rystemd**.
 
-**Guiding constraint:** rustemd is a from-scratch reimplementation whose unit
+**Guiding constraint:** rystemd is a from-scratch reimplementation whose unit
 files and `systemctl`-style CLI must stay *drop-in compatible with systemd*.
 That means the dependency vocabulary, unit-file syntax, service types, timer
 semantics, and `[Install]` behavior are fixed by systemd; the survey is about
@@ -25,7 +25,7 @@ is the map the rest of the note is organized around.
 | Startup shape | Sequential, parallel, or on-demand? | sequential (sysvinit) ↔ parallel (dinit/s6-rc/systemd) ↔ on-demand (launchd) |
 | Runlevels | How are "system states" expressed? | numbered runlevels (sysvinit) ↔ targets (systemd/dinit) ↔ bundles (s6-rc) ↔ none (launchd) |
 | Readiness | How does a daemon signal "I'm up"? | sd_notify (systemd) ↔ notifycheck (s6) ↔ notifyfd (dinit) ↔ none (pidfile-era) |
-| Control plane | How does the admin talk to PID 1? | D-Bus (systemd) ↔ Mach/launchctl (launchd) ↔ own socket (s6-rc/dinit/rustemd) |
+| Control plane | How does the admin talk to PID 1? | D-Bus (systemd) ↔ Mach/launchctl (launchd) ↔ own socket (s6-rc/dinit/rystemd) |
 
 ---
 
@@ -103,20 +103,20 @@ systemd's fixed fd 3.[16]
 
 ---
 
-## 3. Salient decisions → rustemd
+## 3. Salient decisions → rystemd
 
 ### 3.1 Adopt (already have, or should)
 
 **Declarative unit files, never executable scripts for metadata.**
-rustemd already parses INI unit files. OpenRC/BSD prove the failure mode of the
+rystemd already parses INI unit files. OpenRC/BSD prove the failure mode of the
 alternative: extracting `depend()`/`PROVIDE` metadata requires *executing* shell,
 which is slow, fragile, and runs untrusted code just to build the graph.[4][14]
-This is the single strongest argument for rustemd's declarative design.
+This is the single strongest argument for rystemd's declarative design.
 
 **longrun vs oneshot as the fundamental split.**
 s6-rc's "a service is either a longrun or a oneshot"[6] is the cleanest framing
 of what systemd expresses as `Type=simple/forking/notify` vs `Type=oneshot`.
-rustemd already has both; making the distinction *conceptual* (a oneshot is a
+rystemd already has both; making the distinction *conceptual* (a oneshot is a
 state change, not a process to supervise) rather than incidental is worth
 reflecting in the docs.
 
@@ -124,26 +124,26 @@ reflecting in the docs.
 dinit's hard link vs ordering-only link[11] and FreeBSD's honest "REQUIRE only
 orders, app must cope"[14] are both just systemd's `Requires=` vs `After=`.[2]
 No new vocabulary — but it confirms the value of keeping the *ordering* path
-strictly separate from the *lifecycle* path, which rustemd's dep engine does.
+strictly separate from the *lifecycle* path, which rystemd's dep engine does.
 
 **Offline (or at least out-of-boot) graph validation.**
-s6-rc's refusal to validate the graph at boot[8] maps to a concrete rustemd
+s6-rc's refusal to validate the graph at boot[8] maps to a concrete rystemd
 rule: unit-load/reload must validate the graph and *fail loudly at load time*,
 never panic or half-boot at PID-1 time. This is a discipline, not a feature.
 
 **Targets, not runlevels.**
 s6-rc's bundles and dinit's `.target` sentinels are functionally systemd's
-targets.[6][11] rustemd already uses targets. Runlevels are a dead end.
+targets.[6][11] rystemd already uses targets. Runlevels are a dead end.
 
 **Supervision contract: "don't double-fork."**
 launchd's requirement that daemons stay in the foreground[16] is shared by
-runit, s6, dinit, and systemd. rustemd's process-group tracking is the cgroups
+runit, s6, dinit, and systemd. rystemd's process-group tracking is the cgroups
 stand-in, so the same rule applies: a self-daemonizing service escapes the
 process group. Worth documenting as an explicit, enforced contract.
 
 **On-demand activation is the biggest remaining systemd gap.**
 "Start less, start more in parallel"[1] is realized through socket/path/timer
-activation. rustemd has timers; `.socket` (and eventually `.path`) is the
+activation. rystemd has timers; `.socket` (and eventually `.path`) is the
 natural next step, and launchd shows how much an init can lean on the on-demand
 posture.[15] Socket activation is also *plumbable into systemd-compat*: the
 `.socket` unit format and fd-passing protocol are fixed by systemd,[3] so it is
@@ -156,27 +156,27 @@ s6-rc). No reason to re-introduce numbered states.
 
 **Pidfiles as the tracking mechanism.** OpenRC/BSD/sysvinit use them; systemd
 and every supervision suite abandoned them for good reason (stale files, PID
-reuse). rustemd keeps pidfile *parsing* for `Type=forking` compatibility, but
+reuse). rystemd keeps pidfile *parsing* for `Type=forking` compatibility, but
 process groups remain the tracking mechanism — never trust a pidfile for state.
 
 **Pure supervision without dependencies.** s6-rc's own rationale document rules
-this out for general-purpose systems.[7] rustemd keeps the dependency graph.
+this out for general-purpose systems.[7] rystemd keeps the dependency graph.
 
 **Sequential startup.** The one thing every post-sysvinit system rejected.[1]
 
-**Shell in the hot path.** OpenRC/BSD run everything through `sh`; rustemd
+**Shell in the hot path.** OpenRC/BSD run everything through `sh`; rystemd
 parses argv itself and only invokes a shell when the unit literally says
 `sh -c`. Keep it that way.
 
 ### 3.3 Deliberate divergences (allowed, because they don't break compat)
 
-**Control plane.** systemd talks D-Bus; launchd talks Mach; s6-rc/dinit/rustemd
-talk a private unix socket. rustemd's JSON-over-unix-socket IPC is a control-
+**Control plane.** systemd talks D-Bus; launchd talks Mach; s6-rc/dinit/rystemd
+talk a private unix socket. rystemd's JSON-over-unix-socket IPC is a control-
 plane choice that never surfaces in a unit file, so it does not affect drop-in
 compatibility. Keep it, and keep the `systemctl`-compatible CLI as the
 compatibility surface.
 
-**Readiness protocol.** systemd's `sd_notify` is the wire format rustemd already
+**Readiness protocol.** systemd's `sd_notify` is the wire format rystemd already
 implements. s6's `s6-notifyoncheck` (probe-based readiness)[6] and dinit's
 notifyfd are *ideas* to consider as an additive `Type=notify`-adjacent option,
 but the on-disk format stays systemd's.
@@ -190,7 +190,7 @@ but the on-disk format stays systemd's.
 2. **Enforce load-time graph validation** with loud, non-panicking errors (the
    s6-rc "never at boot" discipline).[8]
 3. **Next feature after current work: `.socket` units** — the highest-leverage
-   systemd feature rustemd lacks, and a pure additive win for compat.[3]
+   systemd feature rystemd lacks, and a pure additive win for compat.[3]
 4. **Document and (where possible) enforce "no self-daemonization"** as the
    supervision contract, since process groups are the cgroups stand-in.[16]
 5. **Resist every script-embedded-metadata temptation** — OpenRC/BSD are the

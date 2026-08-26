@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# Build a minimal initramfs that boots rustemd as PID 1 (`rdinit=/init`).
-# The initramfs is self-contained: busybox (sh/getty/etc.), rustemd + its
+# Build a minimal initramfs that boots rystemd as PID 1 (`rdinit=/init`).
+# The initramfs is self-contained: busybox (sh/getty/etc.), rystemd + its
 # dynamic libs, unit files, and /init which mounts the API filesystems then
-# execs `rustemd daemon`.
+# execs `rystemd daemon`.
 #
-# Requires: busybox (static), the rustemd binary, cpio + gzip.
-# Usage: scripts/build-initramfs.sh [rustemd-binary] [out.cpio.gz]
+# Requires: busybox (static), the rystemd binary, cpio + gzip.
+# Usage: scripts/build-initramfs.sh [rystemd-binary] [out.cpio.gz]
 #
 # Optional env hooks:
-#   RUSTEMD_EXTRA_UNITS=<dir>   install every unit file in <dir> into
+#   RYSTEMD_EXTRA_UNITS=<dir>   install every unit file in <dir> into
 #                               /etc/systemd/system, and symlink the units
 #                               listed in <dir>/enable into default.target.wants
-#   RUSTEMD_NO_BOOTTEST=1       omit the auto-poweroff boottest.service (used
+#   RYSTEMD_NO_BOOTTEST=1       omit the auto-poweroff boottest.service (used
 #                               by the interactive live env; see live-vm.sh)
 set -euo pipefail
 
-BIN=${1:-./target/release/rustemd}
-CTL=${CTL:-./target/release/rustemctl}
+BIN=${1:-./target/release/rystemd}
+CTL=${CTL:-./target/release/rystemctl}
 OUT=${2:-./target/initramfs.cpio.gz}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
 mkdir -p "$(dirname "$OUT")"
 
-[ -x "$BIN" ] || { echo "error: rustemd binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
-[ -x "$CTL" ] || { echo "error: rustemctl binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "error: rystemd binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
+[ -x "$CTL" ] || { echo "error: rystemctl binary not found (build with: cargo build --release --features boot)" >&2; exit 2; }
 [ -n "$BUSYBOX" ] && [ -x "$BUSYBOX" ] || { echo "error: need a static busybox (set BUSYBOX=/path/to/busybox)" >&2; exit 2; }
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
-mkdir -p "$STAGE"/{bin,sbin,usr/bin,dev,proc,sys,run,tmp,etc/rustemd,etc/systemd/system/default.target.wants,mnt/demo}
+mkdir -p "$STAGE"/{bin,sbin,usr/bin,dev,proc,sys,run,tmp,etc/rystemd,etc/systemd/system/default.target.wants,mnt/demo}
 
 # --- busybox + applet symlinks ---
 cp "$BUSYBOX" "$STAGE/bin/busybox"
@@ -38,7 +38,7 @@ done
 # getty@.service references /sbin/getty (busybox's applet; no agetty there).
 ln -s /bin/busybox "$STAGE/sbin/getty"
 
-# --- rustemd (+ optional rustemd-tui) and their dynamic libs ---
+# --- rystemd (+ optional rystemd-tui) and their dynamic libs ---
 # copy_binary <src> <dest-name>: copy a binary and every shared lib + the
 # dynamic loader it links against, recreating the lib dirs under $STAGE.
 copy_binary() {
@@ -61,24 +61,24 @@ copy_binary() {
     esac
   done
 }
-copy_binary "$BIN" rustemd
-# The systemctl-compatible control CLI (talks to the rustemd daemon over its
+copy_binary "$BIN" rystemd
+# The systemctl-compatible control CLI (talks to the rystemd daemon over its
 # control socket). Required: the boottest service uses it to query/stop the
 # manager, and the live env uses it to drive the PID-1 daemon by hand.
-copy_binary "$CTL" rustemctl
+copy_binary "$CTL" rystemctl
 # The TUI is optional (the live env is CLI-first); ship it when present so a
-# human can run `rustemd-tui` from the getty shell.
-TUI=${TUI:-./target/release/rustemd-tui}
+# human can run `rystemd-tui` from the getty shell.
+TUI=${TUI:-./target/release/rystemd-tui}
 if [ -x "$TUI" ]; then
-  copy_binary "$TUI" rustemd-tui
+  copy_binary "$TUI" rystemd-tui
 else
-  echo "note: $TUI not found — skipping rustemd-tui (build with: cargo build --release --features boot)" >&2
+  echo "note: $TUI not found — skipping rystemd-tui (build with: cargo build --release --features boot)" >&2
 fi
 
 # --- /init ---
-# Mount the API filesystems before exec'ing rustemd so the udev feature sees
+# Mount the API filesystems before exec'ing rystemd so the udev feature sees
 # the real sysfs tree (and thus registers real .device units), and so the
-# getty has a /dev/ttyS0. rustemd's `boot` feature would mount these itself,
+# getty has a /dev/ttyS0. rystemd's `boot` feature would mount these itself,
 # but doing it here keeps the initramfs explicit and self-contained. Every
 # mount is best-effort and idempotent (a mount that already exists is a no-op).
 cat > "$STAGE/init" <<'EOF'
@@ -104,7 +104,7 @@ ip link set lo up 2>/dev/null
 # crossterm would otherwise see a 0×0 terminal. Resize it from the getty shell
 # with `stty rows N cols N < /dev/ttyS0` to match the host terminal.
 stty rows 24 cols 80 < /dev/ttyS0 2>/dev/null || true
-exec /usr/bin/rustemd daemon
+exec /usr/bin/rystemd daemon
 EOF
 chmod +x "$STAGE/init"
 
@@ -126,16 +126,16 @@ ln -s ../getty@.service "$STAGE/etc/systemd/system/default.target.wants/getty@tt
 # template instance, then power off. Output goes to /dev/console (serial), not
 # the unit's captured stdout, so vm-test.sh can both stream it live and grep
 # it. The `BOOTTEST getty=…` line is the assertion the host-side test checks.
-# Skipped for the interactive live env (RUSTEMD_NO_BOOTTEST=1).
-if [ -z "${RUSTEMD_NO_BOOTTEST:-}" ]; then
-cat > "$STAGE/etc/rustemd/boottest.sh" <<'SCRIPT_EOF'
+# Skipped for the interactive live env (RYSTEMD_NO_BOOTTEST=1).
+if [ -z "${RYSTEMD_NO_BOOTTEST:-}" ]; then
+cat > "$STAGE/etc/rystemd/boottest.sh" <<'SCRIPT_EOF'
 #!/bin/sh
 sleep 1
-state=$(/usr/bin/rustemctl is-active getty@ttyS0.service)
+state=$(/usr/bin/rystemctl is-active getty@ttyS0.service)
 cat > /dev/console <<EOF
 
 ==========================================
-  rustemd -- hello from PID 1
+  rystemd -- hello from PID 1
 ==========================================
 
   getty@ttyS0.service is $state
@@ -146,43 +146,43 @@ BOOTTEST getty=$state
   shutting down -- goodbye!
 
 EOF
-/usr/bin/rustemctl poweroff
+/usr/bin/rystemctl poweroff
 SCRIPT_EOF
-chmod +x "$STAGE/etc/rustemd/boottest.sh"
+chmod +x "$STAGE/etc/rystemd/boottest.sh"
 
 cat > "$STAGE/etc/systemd/system/boottest.service" <<'EOF'
 [Service]
 Type=oneshot
-ExecStart=/bin/sh /etc/rustemd/boottest.sh
+ExecStart=/bin/sh /etc/rystemd/boottest.sh
 EOF
 ln -s ../boottest.service "$STAGE/etc/systemd/system/default.target.wants/boottest.service"
 fi
 
 # --- extra unit files (the live demo env) ---
-# When RUSTEMD_EXTRA_UNITS points at a directory, copy every unit file in it
+# When RYSTEMD_EXTRA_UNITS points at a directory, copy every unit file in it
 # into /etc/systemd/system, and symlink the units named in its `enable`
 # manifest (one name per line) into default.target.wants so they start at boot.
-if [ -n "${RUSTEMD_EXTRA_UNITS:-}" ]; then
-  [ -d "$RUSTEMD_EXTRA_UNITS" ] || { echo "error: RUSTEMD_EXTRA_UNITS=$RUSTEMD_EXTRA_UNITS is not a directory" >&2; exit 2; }
-  for f in "$RUSTEMD_EXTRA_UNITS"/*; do
+if [ -n "${RYSTEMD_EXTRA_UNITS:-}" ]; then
+  [ -d "$RYSTEMD_EXTRA_UNITS" ] || { echo "error: RYSTEMD_EXTRA_UNITS=$RYSTEMD_EXTRA_UNITS is not a directory" >&2; exit 2; }
+  for f in "$RYSTEMD_EXTRA_UNITS"/*; do
     [ -f "$f" ] || continue
     case "$(basename "$f")" in
       enable) continue ;;  # not a unit file; handled below
     esac
     cp "$f" "$STAGE/etc/systemd/system/"
   done
-  if [ -f "$RUSTEMD_EXTRA_UNITS/enable" ]; then
+  if [ -f "$RYSTEMD_EXTRA_UNITS/enable" ]; then
     while read -r name; do
       [ -n "$name" ] || continue
       case "$name" in \#*) continue ;; esac
       [ -f "$STAGE/etc/systemd/system/$name" ] || { echo "error: enable manifest names missing unit: $name" >&2; exit 2; }
       ln -s "../$name" "$STAGE/etc/systemd/system/default.target.wants/$name"
-    done < "$RUSTEMD_EXTRA_UNITS/enable"
+    done < "$RYSTEMD_EXTRA_UNITS/enable"
   fi
 fi
 
 # --- etc ---
-echo "rustemd" > "$STAGE/etc/hostname"
+echo "rystemd" > "$STAGE/etc/hostname"
 
 # --- pack into a gzip'd newc cpio ---
 ( cd "$STAGE" && find . -print0 | cpio --null -o -H newc 2>/dev/null ) | gzip -9 > "$OUT"

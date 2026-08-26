@@ -1,5 +1,5 @@
 [Unit]
-Description=Demo target: pull in all the rustemd demo units
+Description=Demo target: pull in all the rystemd demo units
 Wants=demo.service demo.timer demo.socket demo.mount
 After=demo.service demo.timer demo.socket demo.mount
 

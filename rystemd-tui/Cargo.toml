@@ -1,0 +1,15 @@
+[package]
+name = "rystemd-tui"
+version = "0.1.1"
+edition = "2024"
+description = "Terminal UI client for a running rystemd unit manager."
+license = "MIT"
+repository = "https://github.com/fralalonde/rystemd"
+homepage = "https://github.com/fralalonde/rystemd"
+rust-version = "1.89"
+
+[dependencies]
+rystemd = { path = "../rystemd" }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

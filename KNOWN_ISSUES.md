@@ -12,7 +12,7 @@
   `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
   interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
 - **D-Bus is opt-in** — the `dbus` cargo feature pulls in zbus for
-  `Type=dbus`/`BusName=` activation and the `org.rustemd.Manager1.Manager`
+  `Type=dbus`/`BusName=` activation and the `org.rystemd.Manager1.Manager`
   control interface. Off by default to keep the default build free of the
   zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
   `--features dbus` to enable it.
@@ -24,7 +24,7 @@
   generic POSIX-signal equivalent; stop/kill terminate the unit Job Object.
 - **macOS is not yet a supported manager target.**
 - **Journaling is a plain store, not journald** — per-unit on-disk journal
-  under `/var/log/rustemd/` with `rustemctl journal`; no `journalctl` binary,
+  under `/var/log/rystemd/` with `rystemctl journal`; no `journalctl` binary,
   no journald wire format, no syslog/journald forwarding. **Service sandboxing
   is Phase-1 only** — no `CapabilityBoundingSet=`/`AmbientCapabilities=`,
   seccomp (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
@@ -42,15 +42,15 @@ arms these once the unit is activated. Causes spurious firings. The demo works
 around it with `OnBootSec`. Location: `manager/timer.rs` re-arm path.
 
 ### `try-restart` always restarts
-`Command::RestartOrStart` (`rustemctl/src/cli.rs:215`) dispatches `restart`,
-not a `try-restart` op, so `rustemctl try-restart` restarts a unit *even when
+`Command::RestartOrStart` (`rystemctl/src/cli.rs:215`) dispatches `restart`,
+not a `try-restart` op, so `rystemctl try-restart` restarts a unit *even when
 it is inactive* — the documented "restart if running, otherwise just start"
 contract is broken, and it always stops an inactive unit's `ExecStop` (which
 should not run). No `try_restart` IPC op exists; `restart_or_start`/`try-restart`
 semantics are unimplemented.
 
 ### resume_primary_thread can leave a service stuck in START_PENDING
-Location: `rustemd/src/platform/windows/process.rs:299-334`. The thread-resume
+Location: `rystemd/src/platform/windows/process.rs:299-334`. The thread-resume
 path walks a system-wide `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`, resumes
 only the FIRST thread whose owner pid matches, and breaks on the first
 `ResumeThread` that does not return `u32::MAX`. If that thread's prior suspend
@@ -60,7 +60,7 @@ and its service sits in `START_PENDING`.
 
 ## Weaknesses
 
-- The release URLs still use the `fralalonde` org name until the repository is relocated; the Homebrew formula now lives in a dedicated `homebrew-rustemd` tap (`brew tap fralalonde/rustemd` resolves to `github.com/fralalonde/homebrew-rustemd`).
+- The release URLs still use the `fralalonde` org name until the repository is relocated; the Homebrew formula now lives in a dedicated `homebrew-rystemd` tap (`brew tap fralalonde/rystemd` resolves to `github.com/fralalonde/homebrew-rystemd`).
 
 ### D-Bus is a partial `systemd1` drop-in
 The `org.freedesktop.systemd1` surface (runtime-gated: only served when the
@@ -79,9 +79,9 @@ zbus dependency tree entirely.
 
 ### journald drop-in is incomplete
 Service stdout/stderr are captured to a per-unit in-memory ring (`status`) and
-persisted to a size-rotated on-disk journal under `/var/log/rustemd/`
-(`~/.local/state/rustemd/journal` for user mode), readable via
-`rustemctl journal [unit] [-n N] [-f] [--since SECS]`. But there is **no
+persisted to a size-rotated on-disk journal under `/var/log/rystemd/`
+(`~/.local/state/rystemd/journal` for user mode), readable via
+`rystemctl journal [unit] [-n N] [-f] [--since SECS]`. But there is **no
 `journalctl`-named binary** and no wire/format compatibility with journald:
 the store is a plain append file, not the journald binary format, and there is
 no forwarding to an external journald/syslog sink. A desktop user typing
@@ -182,7 +182,7 @@ matters for the stated goals:
 Windows `.socket` units support TCP launch-on-connection, but do not transfer
 the listening Winsock handle to the child. Services that require systemd-style
 `LISTEN_FDS` inheritance are not portable to the Windows MVP. Unix-domain
-listeners are rejected. `take_trigger()` (`rustemd/src/manager/socket.rs:36-48`)
+listeners are rejected. `take_trigger()` (`rystemd/src/manager/socket.rs:36-48`)
 does `accept()` then `drop(stream)`, and the Windows `process::spawn` never
 reads `opts.listen_fds`, so the triggering connection is accepted and closed
 before the service sees it (no `WSADuplicateSocket`/fd-passing equivalent). The
@@ -206,9 +206,9 @@ Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
 carries `#[cfg]` branches for fd-polling vs `drain_output`.
 
 ### Two `windows-sys` versions in the tree — retained
-`windows-sys` 0.61.2 is used directly by rustemd and transitively by current
+`windows-sys` 0.61.2 is used directly by rystemd and transitively by current
 terminal dependencies; 0.59.0 is pulled by `colored` 2.2.0. They do not cross
-the rustemd API boundary and are binding-only declarations. Retain both until
+the rystemd API boundary and are binding-only declarations. Retain both until
 an upstream `colored` upgrade naturally unifies them; forcing Cargo to do so
 would require an incompatible dependency override.
 
@@ -218,8 +218,8 @@ supported manager platform implementation.
 
 ### Live VM has no standard shutdown commands
 Inside the live env, `shutdown` / `halt` / `poweroff` / `init 0` don't exist
-(rustemd *is* PID 1) and `exit` at the getty just respawns the shell
-(`Restart=always`). The only clean shutdown is `rustemctl poweroff`. The
+(rystemd *is* PID 1) and `exit` at the getty just respawns the shell
+(`Restart=always`). The only clean shutdown is `rystemctl poweroff`. The
 `live-vm.sh` banner documents it, but it's an easy trap.
 
 ## Design holes
@@ -242,9 +242,9 @@ assumption. A single early `signal(SIGPIPE, SIG_DFL)` (unix) would make every
 ### journald wire format is a fork, not a bridge
 The on-disk journal uses a plain tab-delimited append format rather than
 journald's native binary format or its `AF_UNIX` forwarding protocol. To be a
-drop-in for desktop tooling, rustemd must either (a) emit the journald native
+drop-in for desktop tooling, rystemd must either (a) emit the journald native
 protocol so `journalctl` reads its entries, or (b) ship a `journalctl`
-replacement that reads the same store — the current `rustemctl journal` is
+replacement that reads the same store — the current `rystemctl journal` is
 neither a wire-compatible producer nor a named `journalctl`. Decide before the
 security inspection whether the goal is "reads like systemd" (own format + own
 CLI) or "is systemd" (native protocol), as it changes the journal store's

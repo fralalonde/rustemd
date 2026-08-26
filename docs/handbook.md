@@ -1,11 +1,11 @@
 # Handbook
 
-Worked examples for writing units and driving the manager with `rustemctl`.
-On Linux, `rustemctl` may be symlinked as `systemctl`; the examples use that
+Worked examples for writing units and driving the manager with `rystemctl`.
+On Linux, `rystemctl` may be symlinked as `systemctl`; the examples use that
 compatibility name.
 
-Linux examples assume `./target/release/rustemd daemon --user` is running.
-Windows examples use either `rustemd.exe daemon --user` or the native SCM host.
+Linux examples assume `./target/release/rystemd daemon --user` is running.
+Windows examples use either `rystemd.exe daemon --user` or the native SCM host.
 
 ---
 
@@ -45,8 +45,8 @@ long-running process:
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/touch /tmp/rustemd-flag
-ExecStop=/usr/bin/rm -f /tmp/rustemd-flag
+ExecStart=/usr/bin/touch /tmp/rystemd-flag
+ExecStop=/usr/bin/rm -f /tmp/rystemd-flag
 ```
 
 ```sh
@@ -155,7 +155,7 @@ dir), `%%` (literal `%`). Instanced units (`web@1.service`) use `%i`.
 ## 8. Programmatic control (no shell, no D-Bus)
 
 ```rust
-use rustemd::control::{Control, SocketClient};
+use rystemd::control::{Control, SocketClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // system mode (false) or user mode (true).
@@ -192,18 +192,18 @@ backend freely. This is the library alternative to `systemctl` or D-Bus.
 | `[Install]` dir | `/etc/systemd/system` | `~/.config/systemd/user` |
 | runtime | `/run` | `$XDG_RUNTIME_DIR` |
 
-Every path is overridable for tests via `RUSTEMD_UNIT_PATH`,
-`RUSTEMD_CONFIG_DIR`, `RUSTEMD_RUNTIME_DIR`, and `RUSTEMD_SOCKET`.
+Every path is overridable for tests via `RYSTEMD_UNIT_PATH`,
+`RYSTEMD_CONFIG_DIR`, `RYSTEMD_RUNTIME_DIR`, and `RYSTEMD_SOCKET`.
 
 ---
 
 ## TUI + shell completions
 
-- **TUI** — `rustemd-tui --user` connects to a running manager over the
+- **TUI** — `rystemd-tui --user` connects to a running manager over the
   `Control` API (it detects the socket; it never starts a second daemon) and
   shows tabbed live views: Units / Services / Timers / Unit files, with a
   status pane and single-key actions (`s` start, `x` stop, `r` restart, …).
-- **Completions** — `rustemctl completions <bash|fish|zsh|powershell|nushell>`
+- **Completions** — `rystemctl completions <bash|fish|zsh|powershell|nushell>`
   emits a completion script for that shell, named after the invoked binary.
 
 
@@ -218,20 +218,20 @@ Build and start the manager from PowerShell:
 
 ```powershell
 cargo build --release
-.\target\release\rustemd.exe daemon --user
+.\target\release\rystemd.exe daemon --user
 ```
 
 Place units in either of these directories (higher precedence first):
 
-- `%LOCALAPPDATA%\rustemd\config`
-- `%LOCALAPPDATA%\rustemd\units`
+- `%LOCALAPPDATA%\rystemd\config`
+- `%LOCALAPPDATA%\rystemd\units`
 
 Then use the normal client from another terminal:
 
 ```powershell
-.\target\release\rustemctl.exe --user daemon-reload
-.\target\release\rustemctl.exe --user start hello.service
-.\target\release\rustemctl.exe --user status hello.service
+.\target\release\rystemctl.exe --user daemon-reload
+.\target\release\rystemctl.exe --user start hello.service
+.\target\release\rystemctl.exe --user status hello.service
 ```
 
 A minimal Windows service unit uses native Windows command-line programs:
@@ -257,18 +257,18 @@ the Job Object, and manager exit closes every remaining job.
 From an elevated terminal:
 
 ```powershell
-rustemd.exe service install
-sc.exe start rustemd
-rustemctl.exe list-units
-sc.exe stop rustemd
-rustemd.exe service uninstall
+rystemd.exe service install
+sc.exe start rystemd
+rystemctl.exe list-units
+sc.exe stop rystemd
+rystemd.exe service uninstall
 ```
 
 Use `service install --manual` for demand start, or `--name` and
 `--display-name` for a custom registration. System units are searched in:
 
-- `%ProgramData%\rustemd\config`
-- `%ProgramData%\rustemd\units`
+- `%ProgramData%\rystemd\config`
+- `%ProgramData%\rystemd\units`
 
 SCM stop and system-shutdown controls request an orderly manager shutdown;
 the control callback itself does not run unit lifecycle work.
@@ -288,7 +288,7 @@ ExecStart=C:\Tools\api.exe
 ```
 
 Starting `api.socket` binds the TCP listener. A pending connection is accepted as the trigger and activates `api.service`.
-For this MVP the listener remains owned by rustemd and is not
+For this MVP the listener remains owned by rystemd and is not
 passed to the child, so this is launch-on-connection rather than full systemd
 `LISTEN_FDS` handoff. Unix-domain listeners are not supported on Windows.
 

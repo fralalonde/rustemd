@@ -8,7 +8,7 @@ Set Height 820
 Set PlaybackSpeed 1
 
 Hide
-Type "rustemd-tui --user"
+Type "rystemd-tui --user"
 Enter
 Sleep 2s
 Show
