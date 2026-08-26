@@ -293,6 +293,36 @@ impl Manager {
         self.cfg.specifier(name)
     }
 
+    /// Runtime context used to evaluate `[Unit]` `Condition*`/`Assert*`
+    /// directives for a starting unit.
+    fn condition_context(&self) -> crate::unit::ConditionContext {
+        #[cfg(unix)]
+        let (gid, groupname) = {
+            let gid = nix::unistd::User::from_uid(self.cfg.uid.into())
+                .ok()
+                .flatten()
+                .map(|u| u.gid)
+                .unwrap_or_else(|| nix::unistd::Gid::from_raw(0));
+            let groupname = nix::unistd::Group::from_gid(gid)
+                .ok()
+                .flatten()
+                .map(|g| g.name)
+                .unwrap_or_else(|| "root".into());
+            (gid.as_raw(), groupname)
+        };
+        #[cfg(not(unix))]
+        let (gid, groupname) = (0u32, "root".to_string());
+
+        crate::unit::ConditionContext {
+            user_manager: self.cfg.user,
+            username: self.cfg.username.clone(),
+            uid: self.cfg.uid,
+            gid,
+            groupname,
+            hostname: self.cfg.hostname.clone(),
+        }
+    }
+
     fn build_env(&self, u: &Unit) -> HashMap<String, String> {
         let mut env = self.cfg.base_env.clone();
         if let Some(sc) = u.service_cfg() {
@@ -817,6 +847,39 @@ impl Manager {
             self.maybe_start_job(id);
             return;
         }
+
+        // [Unit] Condition*/Assert* gate startup (systemd skip-vs-fail
+        // semantics), resolved here before any dependency expansion.
+        //
+        // A failing *condition* skips activation: the start job is treated as
+        // satisfied so it never blocks Requires=/Wants=/After= dependents, and
+        // the unit stays inactive (not failed). A failing *assert* fails the
+        // unit exactly like a hard start error.
+        let conditions = self.units[&name]
+            .file
+            .as_ref()
+            .map(|f| f.unit.conditions.clone())
+            .unwrap_or_default();
+        if !conditions.is_empty() {
+            let ctx = self.condition_context();
+            if let Some(bad) = conditions.iter().find(|c| !c.evaluate(&ctx)) {
+                if bad.is_assert {
+                    self.units.get_mut(&name).unwrap().result = UnitResult::Assert;
+                    self.fail_unit(
+                        &name,
+                        format!("Assert {} failed, refusing to start.", bad.kind.name()),
+                    );
+                } else {
+                    self.mgr(
+                        &name,
+                        &format!("Condition {} failed, skipping {name}.", bad.kind.name()),
+                    );
+                    self.finish_job(id);
+                }
+                return;
+            }
+        }
+
         // Mark this job as mid-expansion so a re-entrant `process_jobs` (e.g.
         // a dependency that fails to spawn synchronously) cannot start it
         // before its `waiting` list is finalised below.

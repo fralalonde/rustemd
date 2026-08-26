@@ -367,6 +367,111 @@ pub struct UnitConfig {
     pub binds_to: Vec<String>,
     pub default_dependencies: bool,
     pub documentation: Vec<String>,
+    /// `[Unit]` `Condition*`/`Assert*` directories that gate startup. Asserts
+    /// fail the unit when unsatisfied; plain conditions skip it.
+    pub conditions: Vec<Condition>,
+}
+
+/// The `[Unit]` condition/assert knobs rustemd understands, mirroring
+/// systemd's `Condition*=`/`Assert*=` directives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionKind {
+    PathExists,
+    FileNotEmpty,
+    DirectoryNotEmpty,
+    PathIsReadWrite,
+    PathIsSymbolicLink,
+    User,
+    Group,
+    Host,
+}
+
+impl ConditionKind {
+    /// The directive suffix used in logs, e.g. `PathExists`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConditionKind::PathExists => "PathExists",
+            ConditionKind::FileNotEmpty => "FileNotEmpty",
+            ConditionKind::DirectoryNotEmpty => "DirectoryNotEmpty",
+            ConditionKind::PathIsReadWrite => "PathIsReadWrite",
+            ConditionKind::PathIsSymbolicLink => "PathIsSymbolicLink",
+            ConditionKind::User => "User",
+            ConditionKind::Group => "Group",
+            ConditionKind::Host => "Host",
+        }
+    }
+}
+
+/// A parsed single `[Unit]` condition/assert directive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Condition {
+    pub kind: ConditionKind,
+    /// The operand (path, user/group/host name) after the `!` decoration.
+    pub value: String,
+    /// True when the value carried a leading `!` (negates the match).
+    pub negate: bool,
+    /// True when this came from an `Assert*=` directive (`is_assert`).
+    pub is_assert: bool,
+}
+
+/// Runtime inputs used to evaluate a [`Condition`] in the manager start path.
+#[derive(Debug, Clone)]
+pub struct ConditionContext {
+    /// True for a user manager, false for the system manager.
+    pub user_manager: bool,
+    pub username: String,
+    pub uid: u32,
+    pub groupname: String,
+    pub gid: u32,
+    pub hostname: String,
+}
+
+impl Condition {
+    /// Evaluate this condition against the runtime context. The result is
+    /// already negated if the value carried a leading `!`.
+    pub fn evaluate(&self, ctx: &ConditionContext) -> bool {
+        let base = self.match_base(ctx);
+        if self.negate { !base } else { base }
+    }
+
+    fn match_base(&self, ctx: &ConditionContext) -> bool {
+        match self.kind {
+            ConditionKind::PathExists => std::fs::metadata(&self.value).is_ok(),
+            ConditionKind::FileNotEmpty => std::fs::metadata(&self.value)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false),
+            ConditionKind::DirectoryNotEmpty => std::fs::read_dir(&self.value)
+                .map(|mut it| it.next().is_some())
+                .unwrap_or(false),
+            #[cfg(unix)]
+            ConditionKind::PathIsReadWrite => nix::unistd::access(
+                std::path::Path::new(&self.value),
+                nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::W_OK,
+            )
+            .is_ok(),
+            #[cfg(not(unix))]
+            ConditionKind::PathIsReadWrite => std::fs::metadata(&self.value).is_ok(),
+            ConditionKind::PathIsSymbolicLink => std::fs::symlink_metadata(&self.value)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            ConditionKind::User => {
+                if ctx.user_manager {
+                    self.value == ctx.username || self.value == ctx.uid.to_string()
+                } else {
+                    // System manager always runs as root.
+                    self.value == "root" || self.value == "0"
+                }
+            }
+            ConditionKind::Group => {
+                if ctx.user_manager {
+                    self.value == ctx.groupname || self.value == ctx.gid.to_string()
+                } else {
+                    self.value == "root" || self.value == "0"
+                }
+            }
+            ConditionKind::Host => self.value == ctx.hostname,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -540,6 +645,7 @@ pub fn build(raw: &parse::RawUnitFile, spec: &SpecifierContext) -> Result<UnitFi
             .into_iter()
             .map(&exp)
             .collect(),
+        conditions: build_conditions(raw, &exp)?,
     };
 
     let install = InstallConfig {
@@ -603,6 +709,67 @@ fn list_of(
         .into_iter()
         .flat_map(|v| split_names(&exp(v)))
         .collect()
+}
+
+/// `[Unit]` condition/assert directives and their `ConditionKind`.
+const CONDITION_KINDS: [(&str, ConditionKind); 8] = [
+    ("PathExists", ConditionKind::PathExists),
+    ("FileNotEmpty", ConditionKind::FileNotEmpty),
+    ("DirectoryNotEmpty", ConditionKind::DirectoryNotEmpty),
+    ("PathIsReadWrite", ConditionKind::PathIsReadWrite),
+    ("PathIsSymbolicLink", ConditionKind::PathIsSymbolicLink),
+    ("User", ConditionKind::User),
+    ("Group", ConditionKind::Group),
+    ("Host", ConditionKind::Host),
+];
+
+/// Collect `Condition*=` and their `Assert*` twins into ordered condition
+/// directives. Asserts are stored with `is_assert = true` so the start path
+/// can tell skip-from-fail.
+fn build_conditions(
+    raw: &parse::RawUnitFile,
+    exp: &impl Fn(&str) -> String,
+) -> Result<Vec<Condition>, String> {
+    let mut conditions = Vec::new();
+    for (suffix, kind) in CONDITION_KINDS {
+        // `Condition*=` first, then its `Assert*=` twin.
+        for (is_assert, prefix) in [(false, "Condition"), (true, "Assert")] {
+            let key = format!("{prefix}{suffix}");
+            for v in raw.list("Unit", &key) {
+                conditions.push(parse_condition(kind, &exp(v), is_assert)?);
+            }
+        }
+    }
+    Ok(conditions)
+}
+
+/// Parse a single directive value into a `Condition`, handling a leading `!`
+/// (negation).
+fn parse_condition(
+    kind: ConditionKind,
+    raw_value: &str,
+    is_assert: bool,
+) -> Result<Condition, String> {
+    let mut value = raw_value.trim();
+    let mut negate = false;
+    if let Some(rest) = value.strip_prefix('!') {
+        negate = true;
+        value = rest.trim_start();
+    }
+    // systemd alternation (`a|b`, empty alternates meaning "always") isn't
+    // supported here; reject it rather than silently mishandle the value.
+    if value.contains('|') {
+        return Err(format!(
+            "OR (`|`) lists in {} are not supported",
+            if is_assert { "Assert" } else { "Condition" }
+        ));
+    }
+    Ok(Condition {
+        kind,
+        value: value.to_string(),
+        negate,
+        is_assert,
+    })
 }
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -1448,5 +1615,157 @@ mod tests {
             UnitKind::from_unit_name("tmp-demo.mount"),
             Some(UnitKind::Mount)
         );
+    }
+
+    fn cond_str(body: &str) -> Vec<Condition> {
+        build_str(&format!("[Unit]\nDescription=x\n{body}\n"), "x.service")
+            .unwrap()
+            .unit
+            .conditions
+    }
+
+    #[test]
+    fn parses_every_condition_kind() {
+        let conds = cond_str(
+            "[Unit]\n\
+             ConditionPathExists=/a\n\
+             ConditionFileNotEmpty=/b\n\
+             ConditionDirectoryNotEmpty=/c\n\
+             ConditionPathIsReadWrite=/d\n\
+             ConditionPathIsSymbolicLink=/e\n\
+             ConditionUser=alice\n\
+             ConditionGroup=staff\n\
+             ConditionHost=myhost\n",
+        );
+        assert_eq!(conds.len(), 8);
+        assert_eq!(
+            conds[0],
+            Condition {
+                kind: ConditionKind::PathExists,
+                value: "/a".into(),
+                negate: false,
+                is_assert: false,
+            }
+        );
+        assert_eq!(conds[1].kind, ConditionKind::FileNotEmpty);
+        assert_eq!(conds[2].kind, ConditionKind::DirectoryNotEmpty);
+        assert_eq!(conds[3].kind, ConditionKind::PathIsReadWrite);
+        assert_eq!(conds[4].kind, ConditionKind::PathIsSymbolicLink);
+        assert_eq!(conds[5].kind, ConditionKind::User);
+        assert_eq!(conds[5].value, "alice");
+        assert_eq!(conds[6].kind, ConditionKind::Group);
+        assert_eq!(conds[7].kind, ConditionKind::Host);
+        assert!(conds.iter().all(|c| !c.is_assert && !c.negate));
+    }
+
+    #[test]
+    fn parses_assert_twins_as_asserts() {
+        let conds = cond_str(
+            "[Unit]\n\
+             AssertPathExists=/a\n\
+             AssertHost=box\n",
+        );
+        assert_eq!(conds.len(), 2);
+        assert!(conds[0].is_assert);
+        assert!(conds[1].is_assert);
+        assert_eq!(conds[0].kind, ConditionKind::PathExists);
+        assert_eq!(conds[1].value, "box");
+    }
+
+    #[test]
+    fn parses_leading_bang_as_negation() {
+        let conds = cond_str("[Unit]\nConditionPathExists=!/nonexistent\n");
+        assert_eq!(conds.len(), 1);
+        assert!(conds[0].negate);
+        assert_eq!(conds[0].value, "/nonexistent");
+        assert_eq!(conds[0].kind, ConditionKind::PathExists);
+        // `!` applies to asserts too.
+        let conds = cond_str("[Unit]\nAssertFileNotEmpty=!/x\n");
+        assert!(conds[0].negate && conds[0].is_assert);
+    }
+
+    #[test]
+    fn value_is_specifier_expanded() {
+        let conds = cond_str("[Unit]\nConditionUser=%u\n");
+        // `spec()` in this module sets user_name = "alice".
+        assert_eq!(conds[0].value, "alice");
+    }
+
+    #[test]
+    fn rejects_or_lists() {
+        let err = build_str(
+            "[Unit]\nDescription=x\nConditionPathExists=/a|/b\n",
+            "x.service",
+        )
+        .unwrap_err();
+        assert!(err.contains("OR"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_path_conditions() {
+        let ctx = ConditionContext {
+            user_manager: true,
+            username: "alice".into(),
+            uid: 1000,
+            groupname: "staff".into(),
+            gid: 100,
+            hostname: "box".into(),
+        };
+        let dir = std::env::temp_dir().join("rustemd_cond_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty_file = dir.join("empty");
+        std::fs::write(&empty_file, "").unwrap();
+        let full_file = dir.join("full");
+        std::fs::write(&full_file, "data").unwrap();
+        let missing = dir.join("missing");
+
+        let cond = |kind: ConditionKind, value: &str| Condition {
+            kind,
+            value: value.into(),
+            negate: false,
+            is_assert: false,
+        };
+
+        // Exists / FileNotEmpty / DirectoryNotEmpty against the scratch dir.
+        assert!(cond(ConditionKind::PathExists, dir.to_str().unwrap()).evaluate(&ctx));
+        assert!(!cond(ConditionKind::PathExists, missing.to_str().unwrap()).evaluate(&ctx));
+        assert!(!cond(ConditionKind::FileNotEmpty, empty_file.to_str().unwrap()).evaluate(&ctx));
+        assert!(cond(ConditionKind::FileNotEmpty, full_file.to_str().unwrap()).evaluate(&ctx));
+        assert!(cond(ConditionKind::DirectoryNotEmpty, dir.to_str().unwrap()).evaluate(&ctx));
+
+        // Negation inverts.
+        let neg = Condition {
+            negate: true,
+            ..cond(ConditionKind::PathExists, missing.to_str().unwrap())
+        };
+        assert!(neg.evaluate(&ctx));
+
+        // User / Group / Host.
+        let ctx_sys = ConditionContext {
+            user_manager: false,
+            username: "alice".into(),
+            uid: 1000,
+            groupname: "staff".into(),
+            gid: 100,
+            hostname: "box".into(),
+        };
+        assert!(cond(ConditionKind::User, "alice").evaluate(&ctx));
+        assert!(!cond(ConditionKind::User, "root").evaluate(&ctx)); // user manager
+        assert!(cond(ConditionKind::User, "root").evaluate(&ctx_sys)); // system manager
+        assert!(cond(ConditionKind::Group, "staff").evaluate(&ctx));
+        assert!(cond(ConditionKind::Host, "box").evaluate(&ctx));
+        assert!(!cond(ConditionKind::Host, "other").evaluate(&ctx));
+
+        // Symbolic link and read-write on a plain existing file.
+        assert!(
+            !cond(
+                ConditionKind::PathIsSymbolicLink,
+                full_file.to_str().unwrap()
+            )
+            .evaluate(&ctx)
+        );
+        assert!(cond(ConditionKind::PathIsReadWrite, full_file.to_str().unwrap()).evaluate(&ctx));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

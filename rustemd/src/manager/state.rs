@@ -76,6 +76,7 @@ pub enum UnitResult {
     Timeout,
     StartLimitHit,
     Dependency,
+    Assert,
     Resources,
     Protocol,
     Watchdog,

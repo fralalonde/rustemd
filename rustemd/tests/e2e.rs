@@ -681,3 +681,101 @@ fn journal_persists_service_output_and_reads_over_ipc() {
         "journal should contain the service's stdout line"
     );
 }
+
+#[test]
+fn failing_condition_skips_unit_but_not_dependents() {
+    let scratch = Scratch::new();
+    // The path genuinely does not exist, so `ConditionPathExists` is
+    // unsatisfied and cond-svc.service must be *skipped* (left inactive and
+    // not failed, per systemd's skip-vs-fail semantics).
+    scratch.write_unit(
+        "cond-svc.service",
+        "[Unit]\n\
+         Description=conditionally skipped service\n\
+         ConditionPathExists=/nonexistent/rustemd-e2e-cond-skip\n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart=/bin/true\n",
+    );
+    // The target `Wants=`+`After=` the skipped service. Even though the
+    // dependency is skipped, its start job is treated as satisfied, so the
+    // target must still activate (the condition must not block dependents).
+    scratch.write_unit(
+        "cond-parent.target",
+        "[Unit]\n\
+         Description=condition dependent target\n\
+         Wants=cond-svc.service\n\
+         After=cond-svc.service\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    ctl.start(&["cond-parent.target"]).unwrap();
+
+    // The dependent target activates...
+    let target_active = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["cond-parent.target"])
+            .map(|v| v.first().is_some_and(|s| s.active == "active"))
+            .unwrap_or(false)
+    });
+    assert!(
+        target_active,
+        "target should still activate despite the skipped Wants= dependency"
+    );
+
+    // ...while the skipped service stays inactive and is NOT marked failed.
+    let st = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["cond-svc.service"])
+            .map(|v| v.first().is_some_and(|s| s.active == "inactive"))
+            .unwrap_or(false)
+    });
+    assert!(
+        st,
+        "condition-skipped service should remain inactive (skipped, not failed)"
+    );
+    let s = &ctl.status(&["cond-svc.service"]).unwrap()[0];
+    assert_ne!(
+        s.active, "failed",
+        "a skipped condition must not fail the unit"
+    );
+}
+
+#[test]
+fn failing_assert_fails_unit() {
+    let scratch = Scratch::new();
+    // `Assert*` is a hard gate: when it is unsatisfied the unit's start job
+    // fails and the unit is marked `failed` (unlike a plain condition, which
+    // skips).
+    scratch.write_unit(
+        "assert-fail.service",
+        "[Unit]\n\
+         Description=assert gated service\n\
+         AssertPathExists=/nonexistent/rustemd-e2e-assert-fail\n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart=/bin/true\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    ctl.start(&["assert-fail.service"]).unwrap();
+    let failed = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["assert-fail.service"])
+            .map(|v| v.first().is_some_and(|s| s.active == "failed"))
+            .unwrap_or(false)
+    });
+    assert!(
+        failed,
+        "an unsatisfied Assert* must fail the unit's start job (state failed)"
+    );
+}
