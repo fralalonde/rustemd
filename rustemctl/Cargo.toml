@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "The systemctl-compatible control CLI for the rustemd init manager."
 license = "MIT"
+repository = "https://github.com/fralalonde/rustemd"
+homepage = "https://github.com/fralalonde/rustemd"
 rust-version = "1.89"
 
 [dependencies]
@@ -12,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_complete_nushell = "4.6.2"
 serde_json = "1"
-colored = "2"
+colored = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(unix)'.dependencies]

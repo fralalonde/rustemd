@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Terminal UI client for a running rustemd unit manager."
 license = "MIT"
+repository = "https://github.com/fralalonde/rustemd"
+homepage = "https://github.com/fralalonde/rustemd"
 rust-version = "1.89"
 
 [dependencies]
