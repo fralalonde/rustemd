@@ -69,10 +69,15 @@ fn systemd1_manager_surface_is_live_over_bus() {
     };
 
     // Point both the manager's monitor thread and our own client at the bus.
-    // SAFETY: single test in this binary; the env var is set before the
-    // manager thread (which reads it via Connection::session) is spawned.
+    // The manager runs in *system* mode (for_mode(false)), so its monitor
+    // thread connects via Connection::system() (DBUS_SYSTEM_BUS_ADDRESS), while
+    // the test client uses the session bus. Point both at the same private
+    // daemon.
+    // SAFETY: single test in this binary; the env vars are set before the
+    // manager thread (which reads them via Connection) is spawned.
     unsafe {
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus.address);
+        std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &bus.address);
     }
 
     let scratch = Scratch::new();

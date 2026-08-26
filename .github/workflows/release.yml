@@ -71,10 +71,12 @@ jobs:
         with:
           fetch-depth: 0
       # Pin the declared workspace MSRV so stable upgrades cannot hide a
-      # newer language or standard-library requirement.
+      # newer language or standard-library requirement. rustup does not
+      # install clippy for a pinned toolchain by default, so add the component.
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           targets: x86_64-pc-windows-msvc
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint native Windows workspace at MSRV
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -112,55 +114,14 @@ jobs:
             dist/*.zip
             dist/*.msi
 
-  macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target aarch64-apple-darwin
-      - name: Package tar.gz + dmg
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="${VERSION#v}"
-          bin="target/aarch64-apple-darwin/release"
-          mkdir -p dist
-
-          # Portable tar.gz.
-          stage="dist/rustemd-$ver-aarch64-apple-darwin"
-          mkdir -p "$stage/bin" "$stage/completions"
-          install -m 0755 "$bin/rustemd"     "$stage/bin/rustemd"
-          install -m 0755 "$bin/rustemctl"   "$stage/bin/rustemctl"
-          install -m 0755 "$bin/rustemd-tui" "$stage/bin/rustemd-tui"
-          "$bin/rustemctl" completions bash       > "$stage/completions/rustemctl.bash"
-          "$bin/rustemctl" completions zsh        > "$stage/completions/_rustemctl"
-          "$bin/rustemctl" completions fish       > "$stage/completions/rustemctl.fish"
-          printf '%s\n' "$ver" > "$stage/VERSION"
-          tar -C dist -czf "dist/rustemd-$ver-aarch64-apple-darwin.tar.gz" "rustemd-$ver-aarch64-apple-darwin"
-
-          # Disk image (drag the binaries to /usr/local/bin).
-          dmgroot="$(mktemp -d)"
-          mkdir -p "$dmgroot/rustemd"
-          install -m 0755 "$bin/rustemd"     "$dmgroot/rustemd/rustemd"
-          install -m 0755 "$bin/rustemctl"   "$dmgroot/rustemd/rustemctl"
-          install -m 0755 "$bin/rustemd-tui" "$dmgroot/rustemd/rustemd-tui"
-          printf 'Copy rustemd, rustemctl and rustemd-tui to /usr/local/bin.\n' > "$dmgroot/rustemd/README.txt"
-          hdiutil create -volname "rustemd $ver" -srcfolder "$dmgroot/rustemd" \
-              -ov -format UDZO "dist/rustemd-$ver-aarch64.dmg"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos
-          path: |
-            dist/*.tar.gz
-            dist/*.dmg
+  # NOTE: there is no macOS release job. rustemd is a systemd reimplementation
+  # and its manager is Linux-native (cgroups v2, netlink/udev, system D-Bus,
+  # signalfd); a macOS build was never validated and does not compile. Windows
+  # is supported for the CLI/daemon compatibility port (Job Objects, named
+  # pipes, SCM). If a real macOS port is ever wanted, it is a separate effort.
 
   release:
-    needs: [test, linux, windows, macos]
+    needs: [test, linux, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
