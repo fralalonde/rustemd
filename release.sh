@@ -82,17 +82,21 @@ if [[ -n "$(git status --porcelain)" ]]; then
     fi
 fi
 
-# Sync Cargo.toml's version to the release (git is the source of truth; the
-# build file just carries it for the toolchain). Committed as part of the
-# release if it changed.
+# Sync the workspace version to the release in every Cargo.toml that declares
+# one (the git tag is the source of truth; the manifests just mirror it for the
+# toolchain). The workspace root has no `version =`, so the member crates carry
+# it — sync each, then keep the lockfile's own-package entries in sync and
+# commit only if something actually changed (a no-op bump must not abort).
 new_version="${major}.${minor}.${patch}"
-if [[ -f Cargo.toml ]] && ! grep -qE "^version = \"${new_version}\"" Cargo.toml; then
-    sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"${new_version}\"/" Cargo.toml
-    # Keep the lockfile's own-package entry in sync (a metadata read rewrites it
-    # without touching dependency pins, unlike `cargo update`).
-    cargo metadata --format-version 1 >/dev/null 2>&1 || true
-    git add Cargo.toml
-    [[ -f Cargo.lock ]] && git add Cargo.lock
+for f in Cargo.toml */Cargo.toml; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' "$f"; then
+        sed -i -E "0,/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/s//version = \"${new_version}\"/" "$f"
+    fi
+done
+cargo metadata --format-version 1 >/dev/null 2>&1 || true
+git add -A
+if ! git diff --cached --quiet; then
     git commit -m "$commit_message"
 fi
 
