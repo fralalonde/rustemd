@@ -2,13 +2,14 @@
 # Automates semantic version bumping and tagging in Git.
 #
 # Usage:
-#   ./release.sh <major|minor|patch> [--push]
+#   ./release.sh <major|minor|patch> [--push] [-y]
 #
 # Examples:
 #   ./release.sh patch
 #   ./release.sh minor --push
+#   ./release.sh patch -y       # tag and push without prompting
 #
-# Without --push, the script prompts before pushing. The default answer is no.
+# Without --push/-y, the script prompts before pushing. The default answer is no.
 set -euo pipefail
 
 show_help() {
@@ -16,13 +17,15 @@ show_help() {
 Automates semantic version bumping and tagging in Git.
 
 Usage:
-  release.sh <major|minor|patch> [--push]
+  release.sh <major|minor|patch> [--push|-y]
 
 Examples:
   ./release.sh patch
   ./release.sh minor --push
+  ./release.sh patch -y
 
-Without --push, the script prompts before pushing. The default answer is no.
+--push or -y: tag and push to origin (branch + tag) in one shot, no prompt.
+Without it, you are prompted before pushing (default no).
 EOF
 }
 
@@ -31,7 +34,7 @@ push=0
 for arg in "$@"; do
     case "$arg" in
         major|minor|patch) increment="$arg" ;;
-        --push) push=1 ;;
+        --push|-y|--yes) push=1 ;;
         -h|--help) show_help; exit 0 ;;
         *) echo "Unknown argument: $arg" >&2; show_help; exit 1 ;;
     esac
