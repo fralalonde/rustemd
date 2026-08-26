@@ -39,7 +39,7 @@ and its service sits in `START_PENDING`.
 
 ## Weaknesses
 
-- The Homebrew tap (`brew tap fralalonde/rustemd https://github.com/fralalonde/rustemd`) and the release URLs still use the `fralalonde` org name until the repository is relocated.
+- The release URLs still use the `fralalonde` org name until the repository is relocated; the Homebrew formula now lives in a dedicated `homebrew-rustemd` tap (`brew tap fralalonde/rustemd` resolves to `github.com/fralalonde/homebrew-rustemd`).
 
 ### D-Bus is not a `systemd1` drop-in
 Only a rustemd-specific `org.rustemd.Manager1.Manager` interface
