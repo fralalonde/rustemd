@@ -58,6 +58,8 @@ pub struct ManagerCfg {
     pub home: String,
     /// Base environment inherited by services.
     pub base_env: HashMap<String, String>,
+    /// Directory for the persistent per-unit journal (disk store).
+    pub journal_dir: PathBuf,
     /// Runtime gate for socket activation: when false, `.socket` units load
     /// but bind/listen nothing (and never trigger their service).
     pub socket_activation: bool,
@@ -106,6 +108,19 @@ impl ManagerCfg {
             (0, username, home, hostname, machine_id)
         };
         let base_env = std::env::vars().collect();
+        let journal_dir = std::env::var_os("RUSTEMD_JOURNAL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                if user {
+                    std::env::var_os("XDG_STATE_HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(&home).join(".local").join("state"))
+                        .join("rustemd")
+                        .join("journal")
+                } else {
+                    PathBuf::from("/var/log/rustemd")
+                }
+            });
         Ok(ManagerCfg {
             user,
             paths,
@@ -115,6 +130,7 @@ impl ManagerCfg {
             username,
             home,
             base_env,
+            journal_dir,
             socket_activation: true,
         })
     }
@@ -168,6 +184,9 @@ struct Job {
 
 pub struct Manager {
     pub cfg: ManagerCfg,
+    /// Persistent per-unit journal (disk store). Appended wherever child
+    /// output is captured (Unix `read_stdout` / Windows `drain_windows_output`).
+    pub journal: crate::journal::Journal,
     /// Unit-file repository (DAO): the disk source of truth for unit files.
     /// LIST ([`Manager::discover_names`]) and READ ([`Manager::load_unit`])
     /// go through it, and the `repo` IPC query reports its root/backend so
@@ -223,9 +242,11 @@ impl Manager {
         crate::platform::process::set_subreaper();
         let repo =
             Repo::open_roots(cfg.paths.unit_path.clone()).map_err(|e| format!("repo: {e}"))?;
+        let journal = crate::journal::Journal::new(cfg.journal_dir.clone(), 10 * 1024 * 1024, 5);
         Ok(Manager {
             cfg,
             repo,
+            journal,
             units: HashMap::new(),
             jobs: HashMap::new(),
             unit_job: HashMap::new(),
@@ -2667,6 +2688,9 @@ impl Manager {
             if let Some(unit) = self.units.get_mut(&name) {
                 unit.log.push_chunk(&String::from_utf8_lossy(&bytes));
             }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            self.journal
+                .append(&name, crate::journal::timestamp_secs(), &text);
         }
     }
 
@@ -2784,6 +2808,10 @@ impl Manager {
             if let Some(u) = self.units.get_mut(&name) {
                 u.log.push_chunk(&String::from_utf8_lossy(&buf[..n]));
             }
+            // Durable journal: same captured bytes go to the disk store.
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            self.journal
+                .append(&name, crate::journal::timestamp_secs(), &text);
         }
     }
 }
@@ -3120,6 +3148,7 @@ mod tests {
             username: "testuser".into(),
             home: "/".into(),
             base_env: HashMap::new(),
+            journal_dir: dir.path().join("journal"),
             socket_activation: true,
         }
     }

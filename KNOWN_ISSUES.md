@@ -40,9 +40,14 @@ won't work. D-Bus is also opt-in (the `dbus` cargo feature, off by default):
 builds without it omit the zbus dependency tree entirely.
 
 ### No journald
-Service stdout/stderr go to the manager's in-memory capture, not a queryable,
-rotating journal. No `journalctl`-compatible surface. (`StandardOutput=journal`
-is parsed but backs onto that capture.)
+Service stdout/stderr are captured to a per-unit in-memory ring (`status`) and
+persisted to a size-rotated on-disk journal under `/var/log/rustemd/`
+(`~/.local/state/rustemd/journal` for user mode), readable via
+`rustemctl journal [unit] [-n N] [-f] [--since SECS]` (the journal is a plain
+append file, not the journald binary format). Not queryable beyond
+unit/tail/since; no `journalctl -u`-style arbitrary field filters, and no
+forwarding to an external journald/syslog sink yet. (`StandardOutput=journal`
+backs onto that capture.)
 
 ### No service sandboxing — highest priority for the security inspection
 `ProtectSystem=` / `ProtectHome=` / `PrivateTmp=` / `PrivateDevices=` /

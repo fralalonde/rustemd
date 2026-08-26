@@ -12,6 +12,7 @@ use std::io::Write;
 
 use rustemd::cli_style as style;
 use rustemd::client::Client;
+use rustemd::journal::JournalRecord;
 use rustemd::names::normalize_unit;
 use rustemd::paths::Paths;
 
@@ -133,6 +134,22 @@ pub enum Command {
     /// list its unit files.
     #[command(name = "repo")]
     Repo,
+    /// Show log records from the manager's persistent journal
+    /// (`journalctl`-style).
+    #[command(name = "journal")]
+    Journal {
+        /// Filter to one unit.
+        unit: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(short = 'n', long = "lines")]
+        lines: Option<usize>,
+        /// Follow new entries as they are written.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only records at or after this UNIX timestamp (seconds).
+        #[arg(long, value_name = "SECS")]
+        since: Option<u64>,
+    },
     /// Set the default target.
     #[command(name = "set-default")]
     SetDefault { target: String },
@@ -246,6 +263,12 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             Ok(0)
         }
         Command::Repo => cmd_repo(cli),
+        Command::Journal {
+            unit,
+            lines,
+            follow,
+            since,
+        } => cmd_journal(cli, unit.as_deref(), *lines, *follow, *since),
         Command::SetDefault { target } => {
             let client = Client::for_mode(cli.user)?;
             client
@@ -454,6 +477,90 @@ fn cmd_repo(cli: &Cli) -> Result<i32, String> {
         println!("  {:<24} {}", uf.name, uf.kind.suffix());
     }
     Ok(0)
+}
+
+/// `journal [unit] [-n N] [-f] [--since SECS]` — show the manager's durable
+/// log store, `journalctl`-style.
+fn cmd_journal(
+    cli: &Cli,
+    unit: Option<&str>,
+    lines: Option<usize>,
+    follow: bool,
+    since: Option<u64>,
+) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let mut params = serde_json::Map::new();
+    if let Some(u) = unit {
+        params.insert("unit".into(), json!(u));
+    }
+    if let Some(s) = since {
+        params.insert("since".into(), json!(s));
+    }
+    if let Some(t) = lines {
+        params.insert("tail".into(), json!(t));
+    }
+    let v = client.op_with("journal", serde_json::Value::Object(params))?;
+    let dir = v
+        .get("dir")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let records = parse_records(&v)?;
+    print_journal(&records, &dir);
+    println!("# journal: {}", dir);
+
+    if follow {
+        // Re-poll for records newer than the highest timestamp we've seen.
+        let mut last: Option<u64> = records.last().map(|r| r.secs).or(since);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut p = serde_json::Map::new();
+            if let Some(u) = unit {
+                p.insert("unit".into(), json!(u));
+            }
+            if let Some(s) = last.map(|s| s + 1) {
+                p.insert("since".into(), json!(s));
+            }
+            let v = client.op_with("journal", serde_json::Value::Object(p))?;
+            let recs = parse_records(&v)?;
+            if !recs.is_empty() {
+                print_journal(&recs, &dir);
+                last = recs.last().map(|r| r.secs);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn parse_records(v: &Value) -> Result<Vec<JournalRecord>, String> {
+    serde_json::from_value(v.get("records").cloned().unwrap_or(json!([])))
+        .map_err(|e| format!("bad journal response: {e}"))
+}
+
+fn print_journal(records: &[JournalRecord], _dir: &str) {
+    for r in records {
+        println!("{}  {:<24} {}", fmt_ts(r.secs), r.unit, r.text);
+    }
+}
+
+/// Render a UNIX timestamp as a local-ish `YYYY-MM-DD HH:MM:SS` string. Uses a
+/// civil-date algorithm (Howard Hinnant) with no extra dependencies.
+fn fmt_ts(secs: u64) -> String {
+    let days = (secs as i64) / 86_400;
+    let rem = secs % 86_400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s)
 }
 
 fn cmd_status(cli: &Cli, units: &[String], _full: bool) -> Result<i32, String> {

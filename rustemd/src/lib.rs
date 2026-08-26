@@ -33,6 +33,7 @@ pub mod dbus;
 pub mod enable;
 pub mod expand;
 pub mod ipc;
+pub mod journal;
 pub mod log;
 pub mod manager;
 pub mod names;

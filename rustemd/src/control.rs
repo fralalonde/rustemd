@@ -27,6 +27,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::journal::JournalRecord;
 use crate::manager::Manager;
 
 /// Control-operation error. Wraps a human-readable message (typically sourced
@@ -161,6 +162,16 @@ pub trait Control {
     /// Which unit-file repository roots the manager uses so a local client can
     /// open the same typed directory repository with `rustemd_repo`.
     fn repo(&self) -> Result<RepoInfo, Error>;
+
+    /// Read entries from the manager's persistent journal. `unit` filters to
+    /// one unit; `since` cuts off older entries; `tail` keeps the most recent
+    /// N. Returns `(records, journal_dir)`.
+    fn journal(
+        &self,
+        unit: Option<&str>,
+        since: Option<u64>,
+        tail: Option<usize>,
+    ) -> Result<(Vec<JournalRecord>, String), Error>;
 }
 
 // ---- in-process implementation (Manager) ----------------------------------------
@@ -262,6 +273,28 @@ impl Control for Manager {
     }
     fn repo(&self) -> Result<RepoInfo, Error> {
         Ok(self.repo_info())
+    }
+    fn journal(
+        &self,
+        unit: Option<&str>,
+        since: Option<u64>,
+        tail: Option<usize>,
+    ) -> Result<(Vec<JournalRecord>, String), Error> {
+        let mut records = Vec::new();
+        match unit {
+            Some(u) => records.extend(self.journal.read(u, since)),
+            None => {
+                for u in self.journal.units() {
+                    records.extend(self.journal.read(&u, since));
+                }
+            }
+        }
+        records.sort_by_key(|r| r.secs);
+        if let Some(n) = tail {
+            records = records.into_iter().rev().take(n).collect();
+            records.reverse();
+        }
+        Ok((records, self.journal.dir().display().to_string()))
     }
 }
 
@@ -406,6 +439,33 @@ impl Control for SocketClient {
     fn repo(&self) -> Result<RepoInfo, Error> {
         let v = self.call(serde_json::json!({ "op": "repo" }))?;
         serde_json::from_value(v).map_err(|e| Error(e.to_string()))
+    }
+    fn journal(
+        &self,
+        unit: Option<&str>,
+        since: Option<u64>,
+        tail: Option<usize>,
+    ) -> Result<(Vec<JournalRecord>, String), Error> {
+        let mut req = serde_json::json!({ "op": "journal" });
+        if let Some(u) = unit {
+            req["unit"] = serde_json::Value::String(u.to_string());
+        }
+        if let Some(s) = since {
+            req["since"] = serde_json::Value::from(s);
+        }
+        if let Some(t) = tail {
+            req["tail"] = serde_json::Value::from(t);
+        }
+        let v = self.call(req)?;
+        let records: Vec<JournalRecord> =
+            serde_json::from_value(v.get("records").cloned().unwrap_or(serde_json::json!([])))
+                .map_err(|e| Error(e.to_string()))?;
+        let dir = v
+            .get("dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok((records, dir))
     }
 }
 

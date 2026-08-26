@@ -22,7 +22,8 @@ impl Scratch {
         let units = root.join("units");
         let config = root.join("config");
         let run = root.join("run");
-        for d in [&units, &config, &run] {
+        let journal = root.join("journal");
+        for d in [&units, &config, &run, &journal] {
             std::fs::create_dir_all(d).unwrap();
         }
         // SAFETY: guarded by ENV_LOCK, so no other test in this process is
@@ -32,6 +33,7 @@ impl Scratch {
             std::env::set_var("RUSTEMD_CONFIG_DIR", &config);
             std::env::set_var("RUSTEMD_RUNTIME_DIR", &run);
             std::env::set_var("RUSTEMD_SOCKET", run.join("control.sock"));
+            std::env::set_var("RUSTEMD_JOURNAL_DIR", &journal);
         }
         Scratch { _lock: lock, dir }
     }
@@ -44,6 +46,11 @@ impl Scratch {
     /// Write a unit file into the scratch unit directory.
     pub fn write_unit(&self, name: &str, body: &str) {
         std::fs::write(self.units().join(name), body).unwrap();
+    }
+
+    /// Path to the isolated journal directory.
+    pub fn journal(&self) -> std::path::PathBuf {
+        self.dir.path().join("journal")
     }
 }
 

@@ -169,6 +169,29 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
         }
         "get_default" => Ok(json!(mgr.get_default())),
         "repo" => Ok(json!(mgr.repo_info())),
+        "journal" => {
+            let unit = req_str(req, "unit");
+            let since = req.get("since").and_then(Value::as_u64);
+            let tail = req.get("tail").and_then(Value::as_u64).map(|v| v as usize);
+            let mut records = Vec::new();
+            match &unit {
+                Some(u) => records.extend(mgr.journal.read(u, since)),
+                None => {
+                    for u in mgr.journal.units() {
+                        records.extend(mgr.journal.read(&u, since));
+                    }
+                }
+            }
+            records.sort_by_key(|r| r.secs);
+            if let Some(n) = tail {
+                records = records.into_iter().rev().take(n).collect();
+                records.reverse();
+            }
+            Ok(json!({
+                "records": records,
+                "dir": mgr.journal.dir().display().to_string(),
+            }))
+        }
         "set_default" => {
             let name = req_str(req, "name").ok_or("set_default: missing name")?;
             mgr.set_default(name)?;

@@ -648,3 +648,36 @@ fn device_units_appear_after_enumeration() {
         "udev enumeration should register .device units in list-units"
     );
 }
+
+#[test]
+fn journal_persists_service_output_and_reads_over_ipc() {
+    let s = Scratch::new();
+    s.write_unit(
+        "j.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/echo journal-marker\n",
+    );
+    let d = Daemon::start();
+    let mut c = d.client();
+    assert!(wait_for(Duration::from_secs(5), || c
+        .list_units(&[], None)
+        .is_ok()));
+    c.start(&["j.service"]).unwrap();
+    assert!(wait_for(Duration::from_secs(5), || c
+        .status(&["j.service"])
+        .map(|v| v.first().is_some_and(|x| x.active == "active"))
+        .unwrap_or(false)));
+
+    // The durable store is on disk under the isolated journal dir.
+    assert!(
+        s.journal().join("j.service").exists(),
+        "journal file should exist on disk"
+    );
+
+    // And it's readable over the IPC journal op.
+    let (records, dir) = c.journal(Some("j.service"), None, None).unwrap();
+    assert_eq!(dir, s.journal().display().to_string());
+    assert!(
+        records.iter().any(|r| r.text.contains("journal-marker")),
+        "journal should contain the service's stdout line"
+    );
+}
