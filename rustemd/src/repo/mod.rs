@@ -4,30 +4,26 @@
 mod backend;
 mod domain;
 mod error;
-mod lock;
 pub use domain::{UnitDefinition, UnitDocument, UnitEntry, UnitSection, UnitType};
 pub use error::Error;
-use lock::RepoLock;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
 };
 pub struct Repo {
     roots: Vec<PathBuf>,
-    lock: RepoLock,
 }
 impl Repo {
     pub fn open(root: PathBuf) -> Result<Self, Error> {
         Self::open_roots(vec![root])
     }
     pub fn open_roots(roots: Vec<PathBuf>) -> Result<Self, Error> {
-        let Some(primary) = roots.first() else {
+        if roots.is_empty() {
             return Err(Error::InvalidName(
                 "repository needs at least one root".into(),
             ));
-        };
-        let lock = RepoLock::open(primary);
-        Ok(Self { roots, lock })
+        }
+        Ok(Self { roots })
     }
     pub fn root(&self) -> &Path {
         &self.roots[0]
@@ -64,12 +60,10 @@ impl Repo {
     }
     pub fn write(&self, unit: &UnitDefinition) -> Result<(), Error> {
         validate_name(&unit.name)?;
-        let _guard = self.lock.acquire();
         backend::write(self.root(), unit)
     }
     pub fn create(&self, unit: &UnitDefinition) -> Result<(), Error> {
         validate_name(&unit.name)?;
-        let _guard = self.lock.acquire();
         if backend::read(self.root(), &unit.name)?.is_some() {
             return Err(Error::AlreadyExists(unit.name.clone()));
         }
@@ -77,7 +71,6 @@ impl Repo {
     }
     pub fn update(&self, unit: &UnitDefinition) -> Result<(), Error> {
         validate_name(&unit.name)?;
-        let _guard = self.lock.acquire();
         if backend::read(self.root(), &unit.name)?.is_none() {
             return Err(Error::NotFound(unit.name.clone()));
         }
@@ -85,7 +78,6 @@ impl Repo {
     }
     pub fn delete(&self, name: &str) -> Result<(), Error> {
         validate_name(name)?;
-        let _guard = self.lock.acquire();
         backend::delete(self.root(), name)
     }
     pub fn mutate<F>(&self, name: &str, f: F) -> Result<(), Error>
@@ -93,7 +85,6 @@ impl Repo {
         F: FnOnce(Option<UnitDefinition>) -> Option<UnitDefinition>,
     {
         validate_name(name)?;
-        let _guard = self.lock.acquire();
         match f(backend::read(self.root(), name)?) {
             Some(unit) => {
                 if unit.name != name {

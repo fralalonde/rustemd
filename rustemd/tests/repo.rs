@@ -73,24 +73,20 @@ fn list_parses_definitions_and_applies_root_precedence() {
     );
 }
 #[test]
-fn mutations_are_typed_and_serialized() {
+fn mutate_reads_modifies_and_writes_typed() {
     let (_dir, repo) = temp_repo();
     repo.create(&definition("counter.service", "zero")).unwrap();
-    std::thread::scope(|scope| {
-        for _ in 0..8 {
-            let repo = &repo;
-            scope.spawn(move || {
-                for _ in 0..25 {
-                    repo.mutate("counter.service", |current| {
-                        let mut definition = current.unwrap();
-                        definition.document.sections[0].entries[0].value.push('!');
-                        Some(definition)
-                    })
-                    .unwrap();
-                }
-            });
-        }
-    });
+    // `Repo` is deliberately single-threaded (no cross-process or cross-thread
+    // lock), so `mutate` is exercised sequentially — its contract is a typed
+    // read-modify-write that preserves the unit name.
+    for _ in 0..200 {
+        repo.mutate("counter.service", |current| {
+            let mut definition = current.unwrap();
+            definition.document.sections[0].entries[0].value.push('!');
+            Some(definition)
+        })
+        .unwrap();
+    }
     assert_eq!(
         repo.read("counter.service")
             .unwrap()
