@@ -66,6 +66,9 @@ fn normalize_file_name(name: &str) -> String {
 /// Enable-state of a unit: enabled / disabled / static / not-found / masked.
 pub fn enabled_state(paths: &Paths, name: &str) -> String {
     let name = normalize_file_name(name);
+    if is_masked(paths, &name) {
+        return "masked".to_string();
+    }
     let Some(path) = paths.find_unit(&name) else {
         return "not-found".to_string();
     };
@@ -140,6 +143,59 @@ fn absolute_of(p: &PathBuf) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("/"))
             .join(p)
     }
+}
+
+/// Is this unit masked? A mask is a symlink named `<unit>` -> `/dev/null`
+/// living in a search dir (the config dir / repo root), shadowing any real
+/// unit file of the same name in a lower-precedence dir. The symlink is
+/// inspected directly (not via [`Paths::find_unit`], whose `is_file` check
+/// excludes a link to the `/dev/null` character device).
+pub fn is_masked(paths: &Paths, name: &str) -> bool {
+    let name = normalize_file_name(name);
+    for dir in &paths.unit_path {
+        let p = dir.join(&name);
+        #[cfg(unix)]
+        if let Ok(target) = std::fs::read_link(&p) {
+            return target.as_path() == std::path::Path::new("/dev/null");
+        }
+    }
+    false
+}
+
+/// Mask a unit: create a `<unit>` -> `/dev/null` symlink in the
+/// highest-precedence unit search dir. The unit can no longer start.
+pub fn mask(paths: &Paths, name: &str) -> Result<(), String> {
+    let name = normalize_file_name(name);
+    let Some(root) = paths.unit_path.first() else {
+        return Err("no unit search path to mask into".into());
+    };
+    let link = root.join(&name);
+    if let Some(p) = link.parent() {
+        fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    // Replace any existing mask/alias at that path.
+    let _ = fs::remove_file(&link);
+    crate::platform::fs::link_file(std::path::Path::new("/dev/null"), &link)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Unmask a unit: remove the `<unit>` -> `/dev/null` symlink so the real unit
+/// file (shadowed until now) becomes visible again.
+pub fn unmask(paths: &Paths, name: &str) -> Result<(), String> {
+    let name = normalize_file_name(name);
+    let Some(root) = paths.unit_path.first() else {
+        return Ok(());
+    };
+    let link = root.join(&name);
+    if fs::symlink_metadata(&link).is_ok() {
+        // Only remove it if it is a `/dev/null` mask symlink (not a real unit
+        // file or an enable alias).
+        if is_masked(paths, &name) {
+            fs::remove_file(&link).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove the enable symlinks (and `Also=` units').

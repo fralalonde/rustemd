@@ -141,7 +141,13 @@ pub trait Control {
     fn start(&mut self, units: &[&str]) -> Result<(), Error>;
     fn stop(&mut self, units: &[&str]) -> Result<(), Error>;
     fn restart(&mut self, units: &[&str]) -> Result<(), Error>;
+    /// Restart units that are active/activating; start all other units.
+    fn try_restart(&mut self, units: &[&str]) -> Result<(), Error>;
     fn reload(&mut self, units: &[&str]) -> Result<(), Error>;
+    /// Clear the failed state of named units (reset-failed).
+    fn reset_failed(&mut self, units: &[&str]) -> Result<(), Error>;
+    /// Remove a unit's runtime/state directories (clean).
+    fn clean(&mut self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn kill(&mut self, unit: &str, signal: &str) -> Result<(), Error>;
     fn reload_daemon(&mut self) -> Result<(), Error>;
     fn isolate(&mut self, unit: &str) -> Result<(), Error>;
@@ -150,6 +156,15 @@ pub trait Control {
     // -- enable/disable (mutating, filesystem) --
     fn enable(&mut self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn disable(&mut self, units: &[&str]) -> Result<Vec<String>, Error>;
+    /// Mask units (symlink to /dev/null so they can't start).
+    fn mask(&mut self, units: &[&str]) -> Result<(), Error>;
+    /// Unmask units (remove the mask symlinks).
+    fn unmask(&mut self, units: &[&str]) -> Result<(), Error>;
+    /// Disable then re-enable units.
+    fn reenable(&mut self, units: &[&str]) -> Result<Vec<String>, Error>;
+    /// A unit's Requires/Wants graph as normalized names; `reverse` lists the
+    /// units that require/want it.
+    fn list_dependencies(&self, unit: &str, reverse: bool) -> Result<Vec<String>, Error>;
 
     // -- queries (read-only) --
     fn status(&self, units: &[&str]) -> Result<Vec<UnitStatus>, Error>;
@@ -179,6 +194,9 @@ pub trait Control {
 impl Control for Manager {
     fn start(&mut self, units: &[&str]) -> Result<(), Error> {
         for u in normalize(units) {
+            if crate::enable::is_masked(&self.cfg.paths, &u) {
+                return Err(Error(format!("Unit {u} is masked.")));
+            }
             self.start(&u).map_err(Error)?;
         }
         Ok(())
@@ -194,6 +212,15 @@ impl Control for Manager {
             self.restart(&u).map_err(Error)?;
         }
         Ok(())
+    }
+    fn try_restart(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.try_restart_units(&normalize(units)).map_err(Error)
+    }
+    fn reset_failed(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.reset_failed_units(&normalize(units)).map_err(Error)
+    }
+    fn clean(&mut self, units: &[&str]) -> Result<Vec<String>, Error> {
+        Ok(self.clean_units(&normalize(units)))
     }
     fn reload(&mut self, units: &[&str]) -> Result<(), Error> {
         for u in normalize(units) {
@@ -235,6 +262,19 @@ impl Control for Manager {
             msgs.extend(crate::enable::disable(&self.cfg.paths, &u).map_err(Error)?);
         }
         Ok(msgs)
+    }
+    fn mask(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.mask_units(&normalize(units)).map_err(Error)
+    }
+    fn unmask(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.unmask_units(&normalize(units)).map_err(Error)
+    }
+    fn reenable(&mut self, units: &[&str]) -> Result<Vec<String>, Error> {
+        self.reenable_units(&normalize(units)).map_err(Error)
+    }
+    fn list_dependencies(&self, unit: &str, reverse: bool) -> Result<Vec<String>, Error> {
+        let unit = crate::names::normalize_unit(unit);
+        Ok(self.list_dependencies(&unit, reverse))
     }
 
     fn status(&self, units: &[&str]) -> Result<Vec<UnitStatus>, Error> {
@@ -348,6 +388,18 @@ impl Control for SocketClient {
         self.op("restart", &normalize(units))?;
         Ok(())
     }
+    fn try_restart(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.op("try_restart", &normalize(units))?;
+        Ok(())
+    }
+    fn reset_failed(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.op("reset_failed", &normalize(units))?;
+        Ok(())
+    }
+    fn clean(&mut self, units: &[&str]) -> Result<Vec<String>, Error> {
+        let v = self.op("clean", &normalize(units))?;
+        str_vec(v).ok_or_else(|| Error("failed to parse clean result".into()))
+    }
     fn reload(&mut self, units: &[&str]) -> Result<(), Error> {
         self.op("reload", &normalize(units))?;
         Ok(())
@@ -389,6 +441,26 @@ impl Control for SocketClient {
                     .collect()
             })
             .unwrap_or_default())
+    }
+    fn mask(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.op("mask", &normalize(units))?;
+        Ok(())
+    }
+    fn unmask(&mut self, units: &[&str]) -> Result<(), Error> {
+        self.op("unmask", &normalize(units))?;
+        Ok(())
+    }
+    fn reenable(&mut self, units: &[&str]) -> Result<Vec<String>, Error> {
+        let v = self.op("reenable", &normalize(units))?;
+        str_vec(v).ok_or_else(|| Error("failed to parse reenable result".into()))
+    }
+    fn list_dependencies(&self, unit: &str, reverse: bool) -> Result<Vec<String>, Error> {
+        let v = self.call(serde_json::json!({
+            "op": "list_dependencies",
+            "name": crate::names::normalize_unit(unit),
+            "reverse": reverse,
+        }))?;
+        str_vec(v).ok_or_else(|| Error("failed to parse list_dependencies result".into()))
     }
 
     fn status(&self, units: &[&str]) -> Result<Vec<UnitStatus>, Error> {
@@ -476,6 +548,16 @@ fn normalize(units: &[&str]) -> Vec<String> {
         .iter()
         .map(|u| crate::names::normalize_unit(u))
         .collect()
+}
+
+/// Interpret a JSON value as an array of strings (like `enable`/`disable`
+/// results). Returns `None` when the shape is unexpected.
+fn str_vec(v: serde_json::Value) -> Option<Vec<String>> {
+    v.as_array().map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 fn query_names(mgr: &Manager, units: &[&str]) -> Vec<String> {

@@ -26,7 +26,10 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Scratch {
-        let lock = ENV_LOCK.lock().unwrap();
+        // Recover from a previous test that panicked while holding the env
+        // lock (std poisons the mutex on drop-during-unwind), so a single
+        // failing test doesn't cascade into unrelated PoisonError panics.
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let units = root.join("units");
@@ -242,4 +245,176 @@ fn journalctl_priority_is_rejected() {
         stderr.contains("--priority is not yet supported"),
         "-p should report the unsupported message, got: {stderr}"
     );
+}
+
+/// `try-restart` of an inactive unit must START it and never run ExecStop
+/// (the `restart` op stops too, which would run ExecStop). On an active unit
+/// it must truly restart (ExecStop runs), proving the two are distinct.
+#[test]
+fn try_restart_starts_inactive_without_stop() {
+    let scratch = Scratch::new();
+    let marker = scratch.dir.path().join("re.stopped");
+    scratch.write_unit(
+        "re.service",
+        &format!(
+            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\nExecStop=/bin/sh -c 'echo stopped > {}'\n",
+            marker.display()
+        ),
+    );
+    let daemon = spawn_daemon();
+
+    // Inactive unit: try-restart starts it, ExecStop must NOT run.
+    rustemctl(&["try-restart", "re.service"]);
+    let active = wait_for(Duration::from_secs(5), || {
+        is_active("re.service") == "active"
+    });
+    assert!(active, "try-restart should start an inactive unit");
+    assert!(
+        !marker.exists(),
+        "ExecStop must not run on try-restart of an inactive unit"
+    );
+
+    // Active unit: try-restart restarts it (ExecStop runs).
+    rustemctl(&["try-restart", "re.service"]);
+    let stopped = wait_for(Duration::from_secs(5), || marker.exists());
+    assert!(
+        stopped,
+        "ExecStop should run on try-restart of an active unit"
+    );
+
+    shutdown_daemon(daemon);
+}
+
+/// `mask` makes a unit unstartable and `is-enabled` reports `masked`; `unmask`
+/// restores it (is-enabled state and startability both come back). Uses a
+/// higher-precedence search dir so the mask symlink shadows the real unit file
+/// without touching it — the same layout real systemd uses.
+#[test]
+fn mask_unmask_roundtrip() {
+    let scratch = Scratch::new();
+    let shadow = scratch.dir.path().join("shadow");
+    std::fs::create_dir_all(&shadow).unwrap();
+    let search = format!(
+        "{}:{}",
+        shadow.display(),
+        scratch.dir.path().join("units").display()
+    );
+    // Prepend the shadow dir to the unit search path (overrides Scratch's
+    // plain `units`), so a mask symlink there shadows the real unit file.
+    unsafe {
+        std::env::set_var("RUSTEMD_UNIT_PATH", &search);
+    }
+    scratch.write_unit(
+        "halo.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
+    );
+    let enabled_of = |u: &str| {
+        String::from_utf8_lossy(&rustemctl_raw(&["is-enabled", u]).stdout)
+            .trim()
+            .to_string()
+    };
+    let before = enabled_of("halo.service");
+
+    let daemon = spawn_daemon();
+
+    rustemctl(&["start", "halo.service"]);
+    let active = wait_for(Duration::from_secs(5), || {
+        is_active("halo.service") == "active"
+    });
+    assert!(active, "halo.service should start before masking");
+
+    // Mask: is-enabled now reports masked.
+    rustemctl(&["mask", "halo.service"]);
+    assert_eq!(enabled_of("halo.service"), "masked");
+
+    // Stop it, reload so the daemon sees the mask, then start must fail.
+    rustemctl(&["stop", "halo.service"]);
+    let inactive = wait_for(Duration::from_secs(5), || {
+        is_active("halo.service") != "active"
+    });
+    assert!(inactive, "halo.service should stop before masking assert");
+    rustemctl(&["daemon-reload"]);
+    let out = rustemctl_raw(&["start", "halo.service"]);
+    assert!(
+        !out.status.success(),
+        "start must fail while the unit is masked, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Unmask restores is-enabled and startability.
+    rustemctl(&["unmask", "halo.service"]);
+    rustemctl(&["daemon-reload"]);
+    rustemctl(&["start", "halo.service"]);
+    let active2 = wait_for(Duration::from_secs(5), || {
+        is_active("halo.service") == "active"
+    });
+    assert!(active2, "unmasked unit should start again");
+    assert_eq!(enabled_of("halo.service"), before);
+
+    shutdown_daemon(daemon);
+}
+
+/// Exercises the newly-added systemctl surface against the live daemon:
+/// reset-failed, list-dependencies (forward + reverse), list-sockets, and clean.
+#[test]
+fn extended_systemctl_surface() {
+    let scratch = Scratch::new();
+    scratch.write_unit(
+        "boom.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/false\n",
+    );
+    scratch.write_unit(
+        "dep2.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+    );
+    scratch.write_unit(
+        "dep1.service",
+        "[Unit]\nWants=dep2.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
+    );
+    let daemon = spawn_daemon();
+
+    // reset-failed: a unit whose ExecStart fails goes failed; reset-failed
+    // clears it back to inactive.
+    rustemctl(&["start", "boom.service"]);
+    let failed = wait_for(Duration::from_secs(5), || {
+        is_active("boom.service") == "failed"
+    });
+    assert!(
+        failed,
+        "ExecStart=/bin/false should leave boom.service failed"
+    );
+    rustemctl(&["reset-failed", "boom.service"]);
+    let inactive = wait_for(Duration::from_secs(5), || {
+        is_active("boom.service") != "failed"
+    });
+    assert!(inactive, "reset-failed should clear the failed state");
+
+    // list-dependencies: dep1 wants dep2 (forward), dep1 requires it (reverse).
+    let deps = rustemctl(&["list-dependencies", "dep1.service"]);
+    assert!(
+        deps.lines().any(|l| l.trim() == "dep2.service"),
+        "dep1.service should list dep2.service as a dependency: {deps}"
+    );
+    let rev = rustemctl(&["list-dependencies", "dep2.service", "--reverse"]);
+    assert!(
+        rev.lines().any(|l| l.trim() == "dep1.service"),
+        "reverse deps of dep2 should include dep1.service: {rev}"
+    );
+
+    // list-sockets: no socket units in the scratch, but the op runs cleanly.
+    let out = rustemctl_raw(&["list-sockets", "--no-legend"]);
+    assert!(
+        out.status.success(),
+        "list-sockets should succeed, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // clean: prunes a unit's runtime state (no-op message when none).
+    let cleaned = rustemctl(&["clean", "boom.service"]);
+    assert!(
+        cleaned.contains("Clean"),
+        "clean should print a message: {cleaned}"
+    );
+
+    shutdown_daemon(daemon);
 }

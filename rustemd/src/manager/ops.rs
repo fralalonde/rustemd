@@ -6,12 +6,14 @@
 //! the CLI, the in-process library API, and the socket client all see the same
 //! data and the same semantics.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use crate::control::{CatEntry, RepoInfo, TimerInfo, UnitFileInfo, UnitStatus, UnitSummary};
 use crate::enable;
 use crate::manager::Manager;
-use crate::manager::state::{ActiveState, LoadState};
+use crate::manager::state::{ActiveState, LoadState, SubState, UnitResult};
 use crate::unit::UnitKind;
 
 /// `LoadState` as the stable wire/CLI string.
@@ -323,5 +325,158 @@ impl Manager {
             self.stop(&n)?;
         }
         self.start(&name)
+    }
+
+    /// `try-restart`: restart units that are active/activating, start the rest.
+    /// Unlike `restart`, a unit that is not active is *started*, never stopped.
+    pub fn try_restart_units(&mut self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let active = self
+                .units
+                .get(name)
+                .map(|u| u.active)
+                .unwrap_or(ActiveState::Inactive);
+            if active == ActiveState::Active || active == ActiveState::Activating {
+                self.restart(name)?;
+            } else {
+                self.start(name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `reset-failed`: clear the failed state of named units, returning them
+    /// to inactive.
+    pub fn reset_failed_units(&mut self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let u = self
+                .units
+                .get_mut(name)
+                .ok_or_else(|| format!("Unit {name} not found."))?;
+            if u.active == ActiveState::Failed {
+                u.active = ActiveState::Inactive;
+                u.sub = SubState::Dead;
+                u.result = UnitResult::Success;
+            }
+        }
+        Ok(())
+    }
+
+    /// `list-dependencies`: the unit's `Requires`/`Wants` graph. `reverse`
+    /// lists the units that require/want `name` instead of those `name` pulls
+    /// in. One entry per dependency, deduped and sorted.
+    pub fn list_dependencies(&self, name: &str, reverse: bool) -> Vec<String> {
+        let name = crate::names::normalize_unit(name);
+        let deps_of = |n: &str| -> HashSet<String> {
+            let mut set: HashSet<String> = HashSet::new();
+            if let Some(u) = self.units.get(n)
+                && let Some(f) = &u.file
+            {
+                for d in f.unit.requires.iter().chain(f.unit.wants.iter()) {
+                    set.insert(crate::names::normalize_unit(d));
+                }
+            }
+            for d in self.cfg.paths.dir_deps(n, "wants") {
+                set.insert(crate::names::normalize_unit(&d));
+            }
+            for d in self.cfg.paths.dir_deps(n, "requires") {
+                set.insert(crate::names::normalize_unit(&d));
+            }
+            set
+        };
+        let mut out: Vec<String> = if reverse {
+            let mut set = HashSet::new();
+            for n2 in self.units.keys() {
+                if deps_of(n2).contains(&name) {
+                    set.insert(n2.clone());
+                }
+            }
+            set.into_iter().collect()
+        } else {
+            deps_of(&name).into_iter().collect()
+        };
+        out.sort();
+        out
+    }
+
+    /// `mask`: create `<unit>` -> `/dev/null` symlinks in the highest-precedence
+    /// search dir so the units can no longer start. Reloads so the manager sees
+    /// the mask.
+    pub fn mask_units(&mut self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let name = crate::names::normalize_unit(name);
+            enable::mask(&self.cfg.paths, &name)?;
+        }
+        self.load_all();
+        Ok(())
+    }
+
+    /// `unmask`: remove the mask symlinks, restoring the real unit files.
+    pub fn unmask_units(&mut self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let name = crate::names::normalize_unit(name);
+            enable::unmask(&self.cfg.paths, &name)?;
+        }
+        self.load_all();
+        Ok(())
+    }
+
+    /// `reenable`: disable then re-enable units (recreate their `[Install]`
+    /// symlinks). Returns human-readable confirmation lines.
+    pub fn reenable_units(&mut self, names: &[String]) -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        for name in names {
+            let name = crate::names::normalize_unit(name);
+            out.extend(enable::disable(&self.cfg.paths, &name)?);
+            out.extend(enable::enable(&self.cfg.paths, &name)?);
+        }
+        self.load_all();
+        Ok(out)
+    }
+
+    /// `clean`: remove a unit's `*Directory=` runtime/state/cache/logs/config
+    /// directories (systemd semantics), plus rustemd's per-unit journal
+    /// segments.
+    pub fn clean_units(&mut self, names: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in names {
+            let unit = crate::names::normalize_unit(name);
+            // systemd `clean` removes the unit's directory state.
+            let dirs = self
+                .units
+                .get(&unit)
+                .and_then(|u| u.service_cfg())
+                .map(|s| s.directories.clone())
+                .unwrap_or_default();
+            for d in &dirs {
+                let path = self.base_dir(d.kind).join(&d.name);
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            // Bonus (rustemd-specific): prune the unit's journal segments.
+            let jdir = self.journal.dir().to_path_buf();
+            let mut removed_journal = false;
+            if let Ok(rd) = std::fs::read_dir(&jdir) {
+                for e in rd.flatten() {
+                    let f = e.file_name().to_string_lossy().into_owned();
+                    let is_segment = f == unit
+                        || (f.starts_with(&unit) && f.as_bytes().get(unit.len()) == Some(&b'.'));
+                    if is_segment {
+                        let p = e.path();
+                        if p.is_dir() {
+                            let _ = std::fs::remove_dir_all(&p);
+                        } else {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                        removed_journal = true;
+                    }
+                }
+            }
+            out.push(if !dirs.is_empty() || removed_journal {
+                format!("Cleaned runtime state of {unit}.")
+            } else {
+                format!("Clean {unit}: nothing to clean.")
+            });
+        }
+        out
     }
 }

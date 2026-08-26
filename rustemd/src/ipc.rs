@@ -51,6 +51,9 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
     match op {
         "start" => {
             for u in req_units(req) {
+                if crate::enable::is_masked(&mgr.cfg.paths, &u) {
+                    return Err(format!("Unit {u} is masked."));
+                }
                 mgr.start(&u)?;
             }
             Ok(Value::Null)
@@ -66,6 +69,20 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
                 mgr.restart(&u)?;
             }
             Ok(Value::Null)
+        }
+        "try_restart" => {
+            mgr.try_restart_units(&req_units(req))?;
+            Ok(Value::Null)
+        }
+        "reset_failed" => {
+            mgr.reset_failed_units(&req_units(req))?;
+            Ok(Value::Null)
+        }
+        "clean" => Ok(json!(mgr.clean_units(&req_units(req)))),
+        "list_dependencies" => {
+            let name = req_str(req, "name").ok_or("list_dependencies: missing name")?;
+            let reverse = req.get("reverse").and_then(Value::as_bool).unwrap_or(false);
+            Ok(json!(mgr.list_dependencies(name, reverse)))
         }
         "reload" => {
             for u in req_units(req) {
@@ -216,6 +233,15 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
             }
             Ok(json!(msgs))
         }
+        "mask" => {
+            mgr.mask_units(&req_units(req))?;
+            Ok(Value::Null)
+        }
+        "unmask" => {
+            mgr.unmask_units(&req_units(req))?;
+            Ok(Value::Null)
+        }
+        "reenable" => Ok(json!(mgr.reenable_units(&req_units(req))?)),
         "is_enabled" => {
             let states: Vec<String> = req_units(req)
                 .iter()

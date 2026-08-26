@@ -46,6 +46,9 @@ pub enum Command {
     Stop { units: Vec<String> },
     /// Restart one or more units.
     Restart { units: Vec<String> },
+    /// Try to restart units if they are active; otherwise start them.
+    #[command(name = "try-restart")]
+    TryRestart { units: Vec<String> },
     /// Run a unit's ExecReload.
     Reload { units: Vec<String> },
     /// Stop and then start units; if not active, just start.
@@ -55,6 +58,35 @@ pub enum Command {
         unit: String,
         #[arg(long)]
         signal: Option<String>,
+    },
+    /// Mask units (prevent them from being started).
+    Mask { units: Vec<String> },
+    /// Unmask units (allow them to start again).
+    Unmask { units: Vec<String> },
+    /// Reset the failed state of units.
+    #[command(name = "reset-failed")]
+    ResetFailed { units: Vec<String> },
+    /// Disable then re-enable units.
+    Reenable { units: Vec<String> },
+    /// Remove a unit's runtime/state files (journal segments).
+    Clean { units: Vec<String> },
+    /// List one or more units' Requires/Wants dependencies, one per line.
+    #[command(name = "list-dependencies")]
+    ListDependencies {
+        unit: String,
+        /// List the units that require/want this unit instead.
+        #[arg(long)]
+        reverse: bool,
+    },
+    /// List socket units.
+    #[command(name = "list-sockets")]
+    ListSockets {
+        /// Do not print the header line.
+        #[arg(long)]
+        no_legend: bool,
+        /// Show all socket units, including inactive ones.
+        #[arg(long)]
+        all: bool,
     },
     /// Show runtime status of one or more units (or all).
     Status {
@@ -184,6 +216,17 @@ pub enum Command {
     /// Orderly stop all units and exit.
     #[command(name = "poweroff")]
     Poweroff,
+    // ---- explicitly unsupported systemctl surface ----
+    /// Edit a unit's file. Not implemented.
+    Edit { units: Vec<String> },
+    /// Enable/start units per the preset policy. Not implemented.
+    Preset { units: Vec<String> },
+    /// Link a unit file into the search path. Not implemented.
+    Link { units: Vec<String> },
+    /// Revert a unit to its vendor version. Not implemented.
+    Revert { units: Vec<String> },
+    /// Cancel a pending job. Not implemented.
+    Cancel { units: Vec<String> },
     /// Show version.
     Version,
     /// Generate shell completions.
@@ -234,8 +277,17 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
         Command::Start { units } => units_op(cli, "start", units).map(|_| 0),
         Command::Stop { units } => units_op(cli, "stop", units).map(|_| 0),
         Command::Restart { units } => units_op(cli, "restart", units).map(|_| 0),
+        Command::TryRestart { units } => units_op(cli, "try_restart", units).map(|_| 0),
+        // try-restart semantics: restart if active, otherwise start.
+        Command::RestartOrStart { units } => units_op(cli, "try_restart", units).map(|_| 0),
         Command::Reload { units } => units_op(cli, "reload", units).map(|_| 0),
-        Command::RestartOrStart { units } => units_op(cli, "restart", units).map(|_| 0),
+        Command::Mask { units } => units_op(cli, "mask", units).map(|_| 0),
+        Command::Unmask { units } => units_op(cli, "unmask", units).map(|_| 0),
+        Command::ResetFailed { units } => units_op(cli, "reset_failed", units).map(|_| 0),
+        Command::Reenable { units } => cmd_reenable(cli, units),
+        Command::Clean { units } => cmd_clean(cli, units),
+        Command::ListDependencies { unit, reverse } => cmd_list_dependencies(cli, unit, *reverse),
+        Command::ListSockets { no_legend, all } => cmd_list_sockets(cli, *no_legend, *all),
         Command::Kill { unit, signal } => {
             let client = Client::for_mode(cli.user)?;
             let sig = signal
@@ -331,6 +383,21 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
         Command::Poweroff => {
             let client = Client::for_mode(cli.user)?;
             client.simple_op("shutdown").map(|_| 0)
+        }
+        Command::Edit { .. }
+        | Command::Preset { .. }
+        | Command::Link { .. }
+        | Command::Revert { .. }
+        | Command::Cancel { .. } => {
+            let name = match cmd {
+                Command::Edit { .. } => "edit",
+                Command::Preset { .. } => "preset",
+                Command::Link { .. } => "link",
+                Command::Revert { .. } => "revert",
+                Command::Cancel { .. } => "cancel",
+                _ => unreachable!(),
+            };
+            Err(format!("{name} is not implemented"))
         }
         Command::Completions { shell } => {
             cmd_completions(*shell);
@@ -482,6 +549,65 @@ fn cmd_disable(cli: &Cli, units: &[String], now: bool) -> Result<i32, String> {
         client.units_op("stop", &norm)?;
     }
     Ok(0)
+}
+
+fn cmd_reenable(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let paths = paths(cli.user)?;
+    for u in units {
+        let norm = normalize_unit(u);
+        for m in rustemd::enable::disable(&paths, &norm)? {
+            println!("{}", style::ok(&m));
+        }
+        for m in rustemd::enable::enable(&paths, &norm)? {
+            println!("{}", style::ok(&m));
+        }
+    }
+    // Best-effort daemon reload so the change takes effect.
+    if let Ok(client) = client_for(cli) {
+        let _ = client.simple_op("daemon_reload");
+    }
+    Ok(0)
+}
+
+fn cmd_clean(cli: &Cli, units: &[String]) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let norm = normalize_units(units);
+    let v = client.units_op("clean", &norm)?;
+    for m in v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+    {
+        println!("{}", style::ok(m));
+    }
+    Ok(0)
+}
+
+fn cmd_list_dependencies(cli: &Cli, unit: &str, reverse: bool) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let name = normalize_unit(unit);
+    let v = client.op_with(
+        "list_dependencies",
+        json!({"name": name, "reverse": reverse}),
+    )?;
+    let names: Vec<String> = v
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for n in names {
+        println!("{n}");
+    }
+    Ok(0)
+}
+
+fn cmd_list_sockets(cli: &Cli, no_legend: bool, _all: bool) -> Result<i32, String> {
+    // Reuse the list-units implementation with a `socket` type filter.
+    cmd_list_units(cli, vec!["socket".to_string()], None, no_legend, false)
 }
 
 fn cmd_repo(cli: &Cli) -> Result<i32, String> {
