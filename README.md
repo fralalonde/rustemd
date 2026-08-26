@@ -102,11 +102,22 @@ On Linux (e.g. Bazzite) or macOS, install from a tap without layering via
 `rpm-ostree`:
 
 ```sh
-brew tap fralalonde/rustemd https://github.com/fralalonde/rustemd
+brew tap fralalonde/rustemd
 brew install rustemd
 ```
 
-The formula (`Formula/rustemd.rb`) installs `rustemd`, `rustemctl`, and
+### ublue / Bazzite
+
+On ublue images (Bazzite, Aurora, Bluefin) Homebrew is the supported way to
+install CLI/TUI tools: it installs into its own prefix
+(`/home/linuxbrew/.linuxbrew`) rather than layering into the immutable `/usr`,
+so no `rpm-ostree` layer or reboot is needed. If `brew` isn't on PATH yet,
+install it via the Bazzite Portal or `ujust` (see the
+[Bazzite Homebrew docs](https://docs.bazzite.gg/Installing_and_Managing_Software/Homebrew/)),
+then run the tap + install commands above. Binaries land in
+`$(brew --prefix)/bin`, which the brew `shellenv` puts on PATH.
+
+The formula (in the `homebrew-rustemd` tap) installs `rustemd`, `rustemctl`, and
 `rustemd-tui` plus shell completions. It deliberately does **not** create a
 `systemctl` symlink — on a systemd host that would shadow the real `systemctl`
 in your PATH. To exercise the drop-in CLI, symlink it into a directory you
@@ -117,8 +128,8 @@ ln -s "$(brew --prefix)/bin/rustemctl" ~/.local/bin/systemctl
 ```
 
 Refresh the formula's pinned sha256 after each release with
-`scripts/gen-brew-formula.sh <version>` (run once the release assets are
-published).
+`scripts/gen-brew-formula.sh <version>` in the `homebrew-rustemd` tap (run once
+the release assets are published).
 
 ## TUI
 
