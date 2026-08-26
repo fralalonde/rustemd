@@ -490,11 +490,13 @@ impl Manager {
         &self,
         path: &std::path::Path,
     ) -> Result<crate::unit::parse::RawUnitFile, String> {
-        let text = self
+        let definition = self
             .repo
-            .read_file(path)
+            .read_path(path)
             .map_err(|e| format!("can't read {}: {e}", path.display()))?;
-        crate::unit::parse::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+        Ok(crate::unit::parse::from_repository_document(
+            definition.document,
+        ))
     }
 
     // ---- IPC plumbing -------------------------------------------------------
@@ -730,7 +732,20 @@ impl Manager {
     }
 
     pub fn idle(&mut self) -> bool {
-        self.jobs.is_empty() && !self.wheel.has_service_timers()
+        self.jobs.is_empty()
+            && !self.wheel.has_service_timers()
+            // Windows output readers run on worker threads. Keep the manager
+            // alive until they have reached EOF, so shutdown drains tail data.
+            && {
+                #[cfg(windows)]
+                {
+                    !spawn::output_pending()
+                }
+                #[cfg(not(windows))]
+                {
+                    true
+                }
+            }
     }
 
     // ---- job engine ---------------------------------------------------------
@@ -2586,7 +2601,14 @@ impl Manager {
                     .filter(|(_, (_, service))| {
                         self.units
                             .get(service)
-                            .map(|unit| unit.active == ActiveState::Inactive)
+                            .map(|unit| {
+                                !matches!(
+                                    unit.active,
+                                    ActiveState::Active
+                                        | ActiveState::Activating
+                                        | ActiveState::Deactivating
+                                )
+                            })
                             .unwrap_or(true)
                     })
                     .filter_map(|(id, _)| {

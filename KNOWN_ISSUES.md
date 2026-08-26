@@ -106,28 +106,29 @@ because Win32 has no generic POSIX-signal delivery API. `kill_group`
 graceful-stop phase (no `GenerateConsoleCtrlEvent`/`CTRL_BREAK`) and no
 SIGTERM-then-timeout-then-SIGKILL like the Linux path.
 
-### Windows output capture can drop the tail on shutdown and has no backpressure
-Location: `rustemd/src/platform/windows/process.rs:336-355`. `forward_output`
-spawns detached reader threads that are never joined, feeding an unbounded mpsc
-channel; `drain_output` does a non-blocking `try_iter` drain. If the manager
-exits before a reader thread drains its pipe the final lines are lost (the
-Linux path polls fixed-size pipes with owned fds and backpressure), and a
-service that writes faster than the manager drains grows memory without bound.
+### ~~Windows output capture can drop the tail on shutdown and has no backpressure~~ — fixed (Windows)
+Output readers now feed a bounded `sync_channel` (256 chunks), so a noisy child
+is backpressured through its pipe rather than growing manager memory without
+limit. Shutdown stays non-idle while either a reader remains alive or queued
+output remains; it drains final chunks before exit. Regression tests cover queue
+backpressure and the shutdown-pending invariant.
 
 ### Spawned diverges by platform, leaking the platform seam
 Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
 `Spawned { pid, stdout, stderr }` (`platform/process.rs:39-43`); the manager
 carries `#[cfg]` branches for fd-polling vs `drain_output`.
 
-### ~~MSRV under-declared (1.85 vs actual 1.89)~~ — fixed
-`rustemd`, `rustemctl`, and `rustemd-tui` all declared `rust-version = "1.85"`
-while the code used let-chains (stabilized in Rust 1.88) and depends on
-`rustemd-repo` (declared `1.89`, uses `std::fs::File::lock`) transitively. Bumped
-all three crates to `1.89` (matching `rustemd-repo`) and collapsed the ~31
-`collapsible_if` clippy lints the higher MSRV unmasked, via `cargo clippy --fix`.
+### ~~Declared MSRV (1.85) is wrong; code needs 1.88+~~ — fixed
+Every workspace package now declares Rust 1.89, matching the effective floor
+already imposed by `rustemd-repo`'s use of `std::fs::File::lock`. The MSRV-gated
+Clippy diagnostics were resolved with behavior-preserving let-chain rewrites.
 
-### Two windows-sys versions in the tree
-0.61.2 (direct) and 0.59.0 (via crossterm/anstyle). Harmless.
+### Two `windows-sys` versions in the tree — retained
+`windows-sys` 0.61.2 is used directly by rustemd and transitively by current
+terminal dependencies; 0.59.0 is pulled by `colored` 2.2.0. They do not cross
+the rustemd API boundary and are binding-only declarations. Retain both until
+an upstream `colored` upgrade naturally unifies them; forcing Cargo to do so
+would require an incompatible dependency override.
 
 ### macOS build path unverified
 The release workflow builds a macOS artifact, but macOS does not yet have a
@@ -155,7 +156,3 @@ worth revisiting before more unit types are added.
 The CLI bug above is one symptom; the daemon/IPC write paths make the same
 assumption. A single early `signal(SIGPIPE, SIG_DFL)` (unix) would make every
 `| head`-style pipeline behave like `systemctl`.
-
-### No LICENSE file
-`Cargo.toml` declares MIT but no `LICENSE` text ships in the repo or in the
-deb/rpm/msi packages — a gap to close before any public release.

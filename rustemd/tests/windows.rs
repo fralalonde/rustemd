@@ -18,7 +18,9 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let lock = ENV_LOCK.lock().unwrap();
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let units = dir.path().join("units");
         let config = dir.path().join("config");
@@ -85,6 +87,20 @@ fn wait_for(timeout: Duration, mut test: impl FnMut() -> bool) -> bool {
     test()
 }
 
+fn wait_for_client() -> SocketClient {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match SocketClient::for_mode(true) {
+            Ok(client) => return client,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("manager named pipe did not become available: {error}"),
+        }
+    }
+}
+
 #[test]
 fn user_manager_runs_oneshot_service_over_named_pipe() {
     let scratch = Scratch::new();
@@ -93,7 +109,7 @@ fn user_manager_runs_oneshot_service_over_named_pipe() {
         "[Unit]\nDescription=Windows hello\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=cmd.exe /D /C exit 0\n",
     );
     let _daemon = Daemon::start();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -124,7 +140,7 @@ fn tcp_socket_unit_activates_matching_service() {
         "[Service]\nType=simple\nExecStart=cmd.exe /D /C ping -n 30 127.0.0.1 >NUL\n",
     );
     let _daemon = Daemon::start();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -152,7 +168,7 @@ fn user_daemon_subprocess_accepts_named_pipe_control() {
         .env("RUSTEMD_SOCKET", &scratch.pipe)
         .spawn()
         .unwrap();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -178,7 +194,7 @@ fn unsupported_windows_service_types_fail_loudly() {
         "[Service]\nType=forking\nExecStart=cmd.exe /D /C exit 0\nPIDFile=C:\\\\missing.pid\n",
     );
     let _daemon = Daemon::start();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -216,7 +232,7 @@ fn one_tcp_connection_triggers_oneshot_only_once() {
         ),
     );
     let _daemon = Daemon::start();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -252,7 +268,7 @@ fn short_lived_windows_service_preserves_captured_output() {
         "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=cmd.exe /D /C echo final-output\n",
     );
     let _daemon = Daemon::start();
-    let mut client = SocketClient::for_mode(true).unwrap();
+    let mut client = wait_for_client();
     assert!(wait_for(Duration::from_secs(5), || client
         .list_units(&[], None)
         .is_ok()));
@@ -262,4 +278,40 @@ fn short_lived_windows_service_preserves_captured_output() {
         .is_ok_and(|status| status.first().is_some_and(|unit| {
             unit.log.iter().any(|line| line.contains("final-output"))
         }))));
+}
+
+#[test]
+fn tcp_socket_retriggers_a_service_after_a_failed_launch() {
+    let scratch = Scratch::new();
+    let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let marker = scratch.dir.path().join("failed-socket-hits.txt");
+    scratch.write_unit(
+        "retry.socket",
+        &format!("[Socket]\nListenStream=127.0.0.1:{port}\n"),
+    );
+    scratch.write_unit(
+        "retry.service",
+        &format!(
+            "[Service]\nType=oneshot\nExecStart=cmd.exe /D /C echo hit>>{} & exit 1\n",
+            marker.display().to_string().replace('\\', "/")
+        ),
+    );
+    let _daemon = Daemon::start();
+    let mut client = wait_for_client();
+    assert!(wait_for(Duration::from_secs(5), || client
+        .list_units(&[], None)
+        .is_ok()));
+    client.start(&["retry.socket"]).unwrap();
+
+    let _first = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert!(wait_for(Duration::from_secs(5), || client
+        .is_active(&["retry.service"])
+        .is_ok_and(|state| state == ["failed"])));
+
+    let _second = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert!(wait_for(Duration::from_secs(5), || {
+        std::fs::read_to_string(&marker).is_ok_and(|hits| hits.lines().count() == 2)
+    }));
 }

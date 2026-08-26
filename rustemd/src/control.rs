@@ -126,11 +126,6 @@ pub struct RepoInfo {
     pub root: String,
     /// All roots, highest precedence first (the primary root is first).
     pub roots: Vec<String>,
-    /// Backend kind: `"dir"` or `"git"`.
-    pub backend: String,
-    /// The git HEAD commit, when git-backed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_head: Option<String>,
 }
 
 // ---- the trait ------------------------------------------------------------------
@@ -163,8 +158,8 @@ pub trait Control {
     fn is_enabled(&self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn is_active(&self, units: &[&str]) -> Result<Vec<String>, Error>;
     fn get_default(&self) -> Result<String, Error>;
-    /// Which unit-file repository the manager uses (path + backend kind + git
-    /// HEAD), so a client can open the same repository with `rustemd_repo`.
+    /// Which unit-file repository roots the manager uses so a local client can
+    /// open the same typed directory repository with `rustemd_repo`.
     fn repo(&self) -> Result<RepoInfo, Error>;
 }
 

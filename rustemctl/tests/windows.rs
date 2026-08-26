@@ -61,19 +61,22 @@ fn cli_drives_windows_user_manager_over_named_pipe() {
         String::from_utf8_lossy(&start.stderr)
     );
 
-    let status = Command::new(binary)
-        .args(["--user", "status", "cli.service"])
-        .env("RUSTEMD_SOCKET", &pipe)
-        .output()
-        .unwrap();
     assert!(
-        status.status.success(),
-        "{}",
-        String::from_utf8_lossy(&status.stderr)
+        wait_for(Duration::from_secs(5), || {
+            let status = Command::new(binary)
+                .args(["--user", "status", "cli.service"])
+                .env("RUSTEMD_SOCKET", &pipe)
+                .output();
+            match status {
+                Ok(status) if status.status.success() => {
+                    let stdout = String::from_utf8_lossy(&status.stdout);
+                    stdout.contains("Windows CLI service") && stdout.contains("active")
+                }
+                Ok(_) | Err(_) => false,
+            }
+        }),
+        "cli.service did not reach active state within five seconds"
     );
-    let stdout = String::from_utf8_lossy(&status.stdout);
-    assert!(stdout.contains("Windows CLI service"));
-    assert!(stdout.contains("active"));
 
     client.simple_op("shutdown").unwrap();
     manager.join().unwrap();

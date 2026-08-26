@@ -197,7 +197,7 @@ impl Manager {
                 .ok_or_else(|| format!("Unit {u} not found."))?;
             match &unit.path {
                 Some(p) => {
-                    let text = self.repo.read_file(p).map_err(|e| e.to_string())?;
+                    let text = self.repo.read_path(p).map_err(|e| e.to_string())?.to_text();
                     out.push(CatEntry {
                         unit: u.clone(),
                         path: p.display().to_string(),
@@ -288,8 +288,6 @@ impl Manager {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
-            backend: self.repo.backend_kind().as_str().to_string(),
-            git_head: self.repo.git_head(),
         }
     }
 

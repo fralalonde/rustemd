@@ -39,6 +39,25 @@ pub struct RawUnitFile {
     pub sections: Vec<RawSection>,
 }
 
+/// Convert the repository-owned parsed document into the semantic builder's
+/// existing structural input without reading or parsing unit text again.
+pub fn from_repository_document(document: rustemd_repo::UnitDocument) -> RawUnitFile {
+    RawUnitFile {
+        sections: document
+            .sections
+            .into_iter()
+            .map(|section| RawSection {
+                name: section.name,
+                entries: section
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.value))
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 impl RawUnitFile {
     /// Iterate `(key, value)` pairs across all matching sections in order.
     pub fn entries<'a>(
@@ -315,6 +334,21 @@ fn unescape_one(c: char) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_repository_document_without_reparsing_text() {
+        let document = rustemd_repo::UnitDocument {
+            sections: vec![rustemd_repo::UnitSection {
+                name: "Unit".into(),
+                entries: vec![rustemd_repo::UnitEntry {
+                    key: "Description".into(),
+                    value: "typed".into(),
+                }],
+            }],
+        };
+        let raw = from_repository_document(document);
+        assert_eq!(raw.scalar("Unit", "Description"), Some("typed"));
+    }
 
     #[test]
     fn sections_and_keys() {
