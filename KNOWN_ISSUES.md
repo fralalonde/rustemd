@@ -1,16 +1,37 @@
-# Known issues
+## Limitations (intentional)
 
-A categorized inventory for checkpointing and as the input to the upcoming
-**security inspection**. Three buckets:
-
-- **Bugs** — incorrect behavior (a unit does the wrong thing, or crashes).
-- **Weaknesses** — incomplete or partial features; the happy path works but
-  coverage is thin.
-- **Design holes** — structural risks that need an architectural decision, not
-  a point fix.
-
-Updated with the desktop drop-in (systemd/journald) and test-harness
-maturity assessment.
+- **cgroup v2 (Linux)** — one cgroup per unit for reliable tree cleanup and
+  `MemoryMax`/`MemoryHigh`/`CPUWeight`/`CPUQuota`/`IOWeight`/`IODeviceWeight`/
+  `TasksMax`; falls back to process groups + a subreaper where cgroups aren't
+  available.
+- **PID-1 boot is opt-in** — the `boot` cargo feature adds mounting
+  `/proc`/`/sys`/`/dev`/`/run`/`cgroup2`, early-boot config (hostname, sysctl,
+  modules, fstab), template units (`getty@tty1`), and `reboot(2)` power-off.
+  Off by default — a container runtime does this for you. Test it with
+  `scripts/ns-boot-test.sh` (unprivileged namespaces, no qemu),
+  `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
+  interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
+- **D-Bus is opt-in** — the `dbus` cargo feature pulls in zbus for
+  `Type=dbus`/`BusName=` activation and the `org.rustemd.Manager1.Manager`
+  control interface. Off by default to keep the default build free of the
+  zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
+  `--features dbus` to enable it.
+- **Windows socket activation is trigger-only** — TCP listeners activate the
+  service but are not inherited by it. Unix sockets and `LISTEN_FDS` handoff
+  remain Unix-only.
+- **Windows service-type subset** — `forking`, `notify`, `dbus`, `User=`,
+  `Group=`, `MemoryHigh=`, `CPUWeight=`, and `KillMode=process` fail explicitly. Windows has no
+  generic POSIX-signal equivalent; stop/kill terminate the unit Job Object.
+- **macOS is not yet a supported manager target.**
+- **Journaling is a plain store, not journald** — per-unit on-disk journal
+  under `/var/log/rustemd/` with `rustemctl journal`; no `journalctl` binary,
+  no journald wire format, no syslog/journald forwarding. **Service sandboxing
+  is Phase-1 only** — no `CapabilityBoundingSet=`/`AmbientCapabilities=`,
+  seccomp (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
+  (eBPF). No `systemd-analyze`-style tooling. See
+  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
+- `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
+  not yet wired.
 
 ## Bugs
 

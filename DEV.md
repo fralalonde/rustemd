@@ -1,3 +1,95 @@
+## Architecture
+
+This is a Cargo **workspace** with three crates: `rustemd` (the library and
+the PID-1 `rustemd` daemon), `rustemctl` (the `systemctl`-compatible control
+CLI, which depends on the library), and `rustemd-tui` (the terminal client,
+which depends on the library's `Control` API).
+
+| Module | Responsibility |
+| --- | --- |
+| `unit` | Unit-file parser + typed unit configuration |
+| `calendar` / `timespan` | systemd calendar expressions & time spans |
+| `manager` | The daemon: unit table, state machine, process supervision, timers, socket activation, mounts, udev devices |
+| `manager::ops` | Typed operations shared by IPC and the `Control` API |
+| `manager::deps` | Dependency graph (start/stop ordering) |
+| `manager::timer` | Cancelable timer wheel |
+| `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
+| `dbus` | zbus bridge for the `org.rustemd.Manager1.Manager` interface (Linux, opt-in `dbus` feature) |
+| `ipc` / `client` | JSON wire protocol + client |
+| `control` | The `Control` trait + in-process/remote implementations |
+| `daemon` | The PID-1 manager entry point (`rustemd daemon`) |
+| `enable` | `[Install]` symlink management |
+| `paths` | System vs. user filesystem layout |
+
+The `systemctl`-compatible CLI lives in the separate `rustemctl` crate (its
+`cli` module), which consumes the library's `client`/`paths`/`enable`/
+`cli_style`/`names` modules.
+
+**Portability.** Raw OS operations live under `platform/`: Unix uses `nix`,
+while Windows uses direct `windows-sys` bindings for named pipes, Job Objects,
+console controls, Winsock polling, and SCM hosting. The manager retains one
+state machine with platform-specific event-loop adapters.
+
+---
+
+## Programmatic control API
+
+The library exposes a `Control` trait implemented two ways — an **in-process**
+[`Manager`] and a **remote** [`SocketClient`] — so callers can hold a
+`&mut dyn Control` without caring which one they have. This is the intended
+alternative to shelling out to `systemctl` or speaking D-Bus.
+
+```rust
+use rustemd::control::{Control, SocketClient};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Talk to a running daemon over the socket (like `systemctl` does).
+    let mut ctl = SocketClient::for_mode(false /* system */)?;
+
+    ctl.start(&["myapp.service"])?;
+    for status in ctl.status(&["myapp.service"])? {
+        println!("{}: {} ({})", status.name, status.active, status.sub);
+    }
+    ctl.stop(&["myapp.service"])?;
+    Ok(())
+}
+```
+
+An in-process manager implements the same trait:
+
+```rust
+use rustemd::control::Control;
+use rustemd::manager::{Manager, ManagerCfg};
+
+let mut mgr = Manager::new(ManagerCfg::for_mode(false)?)?;
+mgr.load_all();
+mgr.start(&["myapp.service"])?;      // Control::start
+```
+
+Typed request/response structs — [`UnitStatus`], [`UnitSummary`],
+[`TimerInfo`], [`UnitFileInfo`] — are `Serialize`/`Deserialize` and are the
+same types the wire protocol carries.
+
+---
+
+## Testing
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+
+# From Windows, run the Linux suite too when WSL is available:
+wsl.exe -e bash -lc 'cd /mnt/d/path/to/rustemd && cargo test --workspace'
+```
+
+Integration tests boot the real manager and drive it over the socket —
+`rustemd/tests/e2e.rs` uses the programmatic `Control` API, and
+`rustemctl/tests/cli.rs` runs the compiled `rustemctl` binary against the
+daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
+
+---
+
 ## Live environment
 
 To drive rustemd interactively as a real PID-1 daemon in qemu (demo units for
