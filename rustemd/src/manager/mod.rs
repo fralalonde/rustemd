@@ -3067,6 +3067,21 @@ impl Manager {
             while let Ok(ev) = handle.events.try_recv() {
                 events.push(ev);
             }
+            // Push a fresh full-unit snapshot for the systemd1-compatible
+            // surface, built exactly like the ListUnits branch below. The
+            // dbus thread coalesces bursts, and send errors (dbus thread gone)
+            // are ignored.
+            let mut names: Vec<String> = self.units.keys().cloned().collect();
+            names.sort();
+            let mut snapshot: Vec<crate::dbus::UnitEntry> = Vec::with_capacity(names.len());
+            for n in names {
+                if let Some(e) = self.dbus_entry(&n) {
+                    snapshot.push(e);
+                }
+            }
+            let _ = handle
+                .unit_tx
+                .send(crate::dbus::DbUnitEvent::Snapshot(snapshot));
             (requests, events)
         };
 
