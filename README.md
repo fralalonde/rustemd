@@ -172,7 +172,7 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
   start / unmount on stop (Linux only)
 - `.device` units — runtime-generated from sysfs + netlink uevents (the
   `udev` feature, default-on); no unit file, matching systemd
-- D-Bus — `org.fralalonde.rustemd1.Manager` (`ListUnits`/`GetUnit`/`StartUnit`/
+- D-Bus — `org.rustemd.Manager1.Manager` (`ListUnits`/`GetUnit`/`StartUnit`/
   `StopUnit`/`Version`) plus `Type=dbus`/`BusName=` activation (Linux only;
   behind the opt-in `dbus` feature, not in `default`; not a `systemd1` drop-in)
 
@@ -249,7 +249,7 @@ which depends on the library's `Control` API).
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
 | `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
-| `dbus` | zbus bridge for the `org.fralalonde.rustemd1.Manager` interface (Linux, opt-in `dbus` feature) |
+| `dbus` | zbus bridge for the `org.rustemd.Manager1.Manager` interface (Linux, opt-in `dbus` feature) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
 | `daemon` | The PID-1 manager entry point (`rustemd daemon`) |
@@ -299,7 +299,7 @@ daemon — both against a scratch filesystem via the `RUSTEMD_*` env hooks.
   `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
   interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
 - **D-Bus is opt-in** — the `dbus` cargo feature pulls in zbus for
-  `Type=dbus`/`BusName=` activation and the `org.fralalonde.rustemd1.Manager`
+  `Type=dbus`/`BusName=` activation and the `org.rustemd.Manager1.Manager`
   control interface. Off by default to keep the default build free of the
   zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
   `--features dbus` to enable it.

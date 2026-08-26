@@ -39,8 +39,10 @@ and its service sits in `START_PENDING`.
 
 ## Weaknesses
 
+- The Homebrew tap (`brew tap fralalonde/rustemd https://github.com/fralalonde/rustemd`) and the release URLs still use the `fralalonde` org name until the repository is relocated.
+
 ### D-Bus is not a `systemd1` drop-in
-Only a rustemd-specific `org.fralalonde.rustemd1.Manager` interface
+Only a rustemd-specific `org.rustemd.Manager1.Manager` interface
 (`ListUnits`/`GetUnit`/`StartUnit`/`StopUnit`/`Version`). No per-unit object
 graph, no `org.freedesktop.DBus.Properties`, no job objects or signals. This is
 the single largest desktop blocker: real D-Bus consumers — `logind`/seat

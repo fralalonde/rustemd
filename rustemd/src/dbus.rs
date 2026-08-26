@@ -30,9 +30,9 @@ use zbus::interface;
 use crate::log::mgr_log;
 
 /// Well-known bus name rustemd owns on the (system or session) bus.
-const BUS_NAME: &str = "org.fralalonde.rustemd1";
+const BUS_NAME: &str = "org.rustemd.Manager1";
 /// Object path the manager interface is exposed at.
-const OBJECT_PATH: &str = "/org/fralalonde/rustemd1";
+const OBJECT_PATH: &str = "/org/rustemd/Manager1";
 
 /// One unit's listing row, as returned over the bus.
 #[derive(Debug, Clone)]
@@ -123,7 +123,7 @@ struct ManagerIface {
     cmd_tx: Sender<DbRequest>,
 }
 
-#[interface(name = "org.fralalonde.rustemd1.Manager")]
+#[interface(name = "org.rustemd.Manager1.Manager")]
 impl ManagerIface {
     /// List loaded units: array of `(name, load, active, sub, description)`.
     fn list_units(&self) -> zbus::fdo::Result<Vec<UnitRow>> {
