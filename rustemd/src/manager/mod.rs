@@ -384,6 +384,14 @@ impl Manager {
         for name in names {
             match self.load_unit(&name) {
                 Ok(Some(mut unit)) => {
+                    // Emit a compat warning for recognized-but-unimplemented
+                    // sandbox directives (one per unit per load).
+                    #[cfg(target_os = "linux")]
+                    if let Some(svc) = unit.service_cfg() {
+                        for (k, v) in svc.sandbox.compat_warnings() {
+                            self.mgr(&name, &format!("{k}={v} is not yet supported; ignoring"));
+                        }
+                    }
                     // Preserve runtime state for still-active units.
                     if let Some(old) = self.units.get(&name)
                         && old.active != ActiveState::Inactive
@@ -1388,6 +1396,8 @@ impl Manager {
                 }
             },
             cgroup,
+            #[cfg(target_os = "linux")]
+            sandbox_ops: crate::platform::sandbox::plan(&sc.sandbox),
             #[cfg(windows)]
             limits: sc.cgroup_limits,
             #[cfg(windows)]

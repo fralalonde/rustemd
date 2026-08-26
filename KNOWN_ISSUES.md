@@ -49,11 +49,21 @@ unit/tail/since; no `journalctl -u`-style arbitrary field filters, and no
 forwarding to an external journald/syslog sink yet. (`StandardOutput=journal`
 backs onto that capture.)
 
-### No service sandboxing — highest priority for the security inspection
-`ProtectSystem=` / `ProtectHome=` / `PrivateTmp=` / `PrivateDevices=` /
-`DynamicUser=` / `NoNewPrivileges=` / `CapabilityBoundingSet=` /
-`SystemCallFilter=` (seccomp) / `ReadOnlyPaths=` / `DeviceAllow=` are all
-unimplemented and silently ignored. A unit that asks for hardening gets none.
+### Service sandboxing is partial
+Implemented (Linux, Phase-1): mount-namespace plumbing via `CLONE_NEWNS` (root)
+or `CLONE_NEWUSER|CLONE_NEWNS` + uid_map (user), `PrivateTmp=`, `ProtectHome=`
+(read-only or tmpfs), `ProtectSystem=` (yes/full/strict), `ReadOnlyPaths=`,
+`NoNewPrivileges=`. A user-mode manager cannot read-only-relabel pre-existing
+host mounts (needs `CAP_SYS_ADMIN` over them, which a userns doesn't confer) —
+those ops degrade to a visible warning rather than failing the unit, matching
+systemd's tolerance. Notably unimplemented: `CapabilityBoundingSet=` and
+`AmbientCapabilities=` (dropped from Phase-1; the raw `capset` ABI wasn't in
+`libc`), and the Phase-2/3 family — `SystemCallFilter=` (seccomp),
+`SystemCallArchitectures=`, `MemoryDenyWriteExecute=`, `PrivateDevices=`,
+`DynamicUser=`, `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
+`Restrict*`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
+are **parsed and emit a per-unit compat warning at load** rather than being
+silently ignored.
 
 ### Partial cgroup resource controls
 Only `MemoryMax` / `MemoryHigh` / `CPUWeight` / `TasksMax`. Missing

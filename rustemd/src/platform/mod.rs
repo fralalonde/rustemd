@@ -23,6 +23,8 @@ pub mod process;
 #[cfg(windows)]
 #[path = "windows/process.rs"]
 pub mod process;
+#[cfg(target_os = "linux")]
+pub mod sandbox;
 #[cfg(windows)]
 pub mod service;
 pub mod signal;

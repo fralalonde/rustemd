@@ -64,6 +64,9 @@ pub struct SpawnOptions {
     /// cgroup v2 directory (Linux) the child self-adopts into before exec.
     /// `None` = no cgroup, process-group only.
     pub cgroup: Option<PathBuf>,
+    /// Prebuilt sandbox ops (from the unit's `[Service]` sandbox config).
+    /// Executed after cgroup adoption, before chdir/priv-drop.
+    pub sandbox_ops: Option<Vec<crate::platform::sandbox::Op>>,
 }
 
 /// How a reaped child terminated.
@@ -156,6 +159,7 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
         .cgroup
         .as_ref()
         .and_then(|d| CString::new(d.join("cgroup.procs").as_os_str().as_bytes()).ok());
+    let sandbox_ops = opts.sandbox_ops.clone();
 
     // The one justified `unsafe` in the spawn path: pre_exec is the only
     // hook between fork and exec. We call only async-signal-safe functions;
@@ -224,6 +228,14 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
                     libc::write(fd, buf[i..].as_ptr().cast(), buf.len() - i);
                     libc::close(fd);
                 }
+            }
+            // Sandbox (mount namespace + NoNewPrivileges) — after cgroup
+            // self-adopt, before any privilege drop, so mount ops still have
+            // CAP_SYS_ADMIN. A partial failure (`Err`) aborts the spawn.
+            if let Some(ops) = &sandbox_ops
+                && let Err(e) = crate::platform::sandbox::apply(ops)
+            {
+                return Err(std::io::Error::other(e));
             }
             if let Some(dir) = &cwd
                 && let Err(e) = chdir(dir)

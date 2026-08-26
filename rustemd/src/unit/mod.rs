@@ -279,6 +279,69 @@ pub struct CgroupLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProtectMode {
+    #[default]
+    No,
+    /// Read-only bind.
+    ReadOnly,
+    /// Inaccessible (bind an empty dir / tmpfs).
+    Tmpfs,
+}
+
+/// `ProtectSystem=` levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtectSystemLevel {
+    #[default]
+    No,
+    /// `/usr` (and `/boot`, `/efi` if present) read-only.
+    Yes,
+    /// `Yes` plus `/etc`.
+    Full,
+    /// Remount the whole `/` read-only (dangerous).
+    Strict,
+}
+
+/// Phase-1 service sandboxing directives (implemented) plus the set of
+/// Phase-2/3 directives that are **recognized but not yet implemented** — the
+/// latter are recorded here so the manager can emit a compat warning instead
+/// of silently ignoring them.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxConfig {
+    pub no_new_privileges: bool,
+    pub private_tmp: bool,
+    pub protect_home: ProtectMode,
+    pub protect_system: ProtectSystemLevel,
+    /// Read-only paths, in order.
+    pub read_only_paths: Vec<String>,
+    /// Capability bounding-set. `invert` = `~` prefix (drop everything but
+    /// the listed caps).
+    pub bounding_invert: bool,
+    pub bounding_set: Vec<String>,
+    pub ambient_set: Vec<String>,
+    /// `(directive, value)` pairs for recognized-but-unimplemented directives.
+    pub compat: Vec<(String, String)>,
+}
+
+impl SandboxConfig {
+    /// True if any implemented (Phase-1) sandbox directive is set.
+    pub fn has_sandbox(&self) -> bool {
+        self.no_new_privileges
+            || self.private_tmp
+            || self.protect_home != ProtectMode::No
+            || self.protect_system != ProtectSystemLevel::No
+            || !self.read_only_paths.is_empty()
+            || self.bounding_invert
+            || !self.bounding_set.is_empty()
+            || !self.ambient_set.is_empty()
+    }
+
+    /// The Phase-2/3 directives that were parsed but not implemented.
+    pub fn compat_warnings(&self) -> &[(String, String)] {
+        &self.compat
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StdioTarget {
     /// Capture to the in-memory per-unit log ring (shown by `status`).
     #[default]
@@ -338,6 +401,7 @@ pub struct ServiceConfig {
     pub bus_name: Option<String>,
     pub rlimits: Vec<Rlimit>,
     pub cgroup_limits: CgroupLimits,
+    pub sandbox: SandboxConfig,
     pub std_output: StdioTarget,
     pub std_error: StdioTarget,
     pub std_input: bool, // false = /dev/null
@@ -768,6 +832,7 @@ fn build_service(
             other => return Err(format!("unsupported StandardInput `{other}`")),
         };
     }
+    parse_sandbox(raw, exp, &mut cfg)?;
     Ok(cfg)
 }
 
@@ -838,6 +903,113 @@ fn parse_cpu_quota(v: &str) -> Result<Option<f32>, String> {
         return Err(format!("CPUQuota out of range: `{v}`"));
     }
     Ok(Some(pct / 100.0))
+}
+
+/// Parse the `[Service]` sandboxing directives. The Phase-1 directives are
+/// recorded in `cfg.sandbox`; recognized-but-unimplemented Phase-2/3
+/// directives go into `cfg.sandbox.compat` for later warning.
+fn parse_sandbox(
+    raw: &parse::RawUnitFile,
+    exp: &impl Fn(&str) -> String,
+    cfg: &mut ServiceConfig,
+) -> Result<(), String> {
+    let s = &mut cfg.sandbox;
+    if let Some(v) = unit_scalar(raw, "Service", "NoNewPrivileges") {
+        s.no_new_privileges = parse_bool(&exp(v))?;
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "PrivateTmp") {
+        s.private_tmp = parse_bool(&exp(v))?;
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
+        s.protect_home = parse_protect(&exp(v))?;
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "ProtectSystem") {
+        s.protect_system = parse_protect_system(&exp(v))?;
+    }
+    s.read_only_paths = list_of(raw, "Service", "ReadOnlyPaths", exp);
+    if let Some(v) = unit_scalar(raw, "Service", "CapabilityBoundingSet") {
+        let e = exp(v);
+        s.bounding_invert = e.trim_start().starts_with('~');
+        s.bounding_set = e
+            .split_whitespace()
+            .map(|c| c.trim_start_matches('~').to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+    }
+    s.ambient_set = split_names(&exp(unit_scalar(raw, "Service", "AmbientCapabilities")
+        .map(str::to_string)
+        .as_deref()
+        .unwrap_or("")));
+
+    // Phase-2/3 directives: recognized, not implemented. Record so the manager
+    // can warn at load rather than silently ignore.
+    const COMPAT: &[&str] = &[
+        "SystemCallFilter",
+        "SystemCallArchitectures",
+        "SystemCallErrorNumber",
+        "RestrictAddressFamilies",
+        "MemoryDenyWriteExecute",
+        "LockPersonality",
+        "RestrictNamespaces",
+        "RestrictRealtime",
+        "RestrictSUIDSGID",
+        "RemoveIPC",
+        "PrivateDevices",
+        "DeviceAllow",
+        "DevicePolicy",
+        "IPAddressDeny",
+        "IPAddressAllow",
+        "SocketBindDeny",
+        "SocketBindAllow",
+        "DynamicUser",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectKernelLogs",
+        "ProtectControlGroups",
+        "ProtectClock",
+        "ProtectHostname",
+        "ProtectProc",
+        "ProcSubset",
+        "RestrictFileSystems",
+    ];
+    for key in COMPAT {
+        for v in raw.list("Service", key) {
+            if v.trim().is_empty() {
+                continue; // empty-value clear, no warning
+            }
+            s.compat.push(((*key).to_string(), exp(v)));
+        }
+    }
+    Ok(())
+}
+
+/// Parse `ProtectHome=` values (`yes`, `read-only`, `tmpfs`, `no`).
+fn parse_protect(v: &str) -> Result<ProtectMode, String> {
+    Ok(match v.trim() {
+        "yes" | "true" | "1" | "read-only" => ProtectMode::ReadOnly,
+        "tmpfs" => ProtectMode::Tmpfs,
+        "no" | "false" | "0" | "" => ProtectMode::No,
+        other => {
+            return Err(format!(
+                "invalid ProtectHome value `{other}` (expected yes|read-only|tmpfs|no)"
+            ));
+        }
+    })
+}
+
+/// Parse `ProtectSystem=` (`yes`, `full`, `strict`, `no`).
+fn parse_protect_system(v: &str) -> Result<ProtectSystemLevel, String> {
+    Ok(match v.trim() {
+        "yes" | "true" | "1" => ProtectSystemLevel::Yes,
+        "full" => ProtectSystemLevel::Full,
+        "strict" => ProtectSystemLevel::Strict,
+        "no" | "false" | "0" | "" => ProtectSystemLevel::No,
+        other => {
+            return Err(format!(
+                "invalid ProtectSystem value `{other}` (expected yes|full|strict|no)"
+            ));
+        }
+    })
 }
 
 fn parse_stdio(v: &str) -> Result<StdioTarget, String> {
