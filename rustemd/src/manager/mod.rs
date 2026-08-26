@@ -1285,6 +1285,14 @@ impl Manager {
                 _ if sc.cgroup_limits.cpu_weight.is_some() => {
                     Some("CPUWeight= is not supported by the Windows manager MVP")
                 }
+                _ if sc.cgroup_limits.cpu_quota.is_some() => {
+                    Some("CPUQuota= is not supported by the Windows manager MVP")
+                }
+                _ if sc.cgroup_limits.io_weight.is_some()
+                    || !sc.cgroup_limits.io_device_weights.is_empty() =>
+                {
+                    Some("IOWeight=/IODeviceWeight= are not supported by the Windows manager MVP")
+                }
                 _ => None,
             };
             if let Some(reason) = unsupported {

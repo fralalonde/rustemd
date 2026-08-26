@@ -116,6 +116,33 @@ pub fn apply_limits(dir: &Path, l: &CgroupLimits) {
     if let Some(v) = l.cpu_weight {
         let _ = write_file(&dir.join("cpu.weight"), &v.to_string());
     }
+    if let Some(quota) = l.cpu_quota {
+        // cpu.max = "<max> <period>", both in microseconds. systemd targets a
+        // 100ms (100000 µs) period; the max is quota × period. f32 → integer
+        // math: round up so a budget is never silently under-granted.
+        let period_us: u64 = 100_000;
+        let max_us = (quota * period_us as f32).round() as u64;
+        let _ = write_file(&dir.join("cpu.max"), &format!("{max_us} {period_us}"));
+    }
+    if let Some(v) = l.io_weight {
+        // Base weight applies to any device without a specific rule.
+        let _ = write_file(&dir.join("io.weight"), &v.to_string());
+    }
+    if !l.io_device_weights.is_empty() {
+        // Per-device weights need major:minor numbers. `io.weight` is a
+        // multi-line file: `<major>:<minor> <weight>`. Best-effort per line:
+        // a path we can't stat (or a non-block device) is skipped silently,
+        // matching the existing partial-delegation tolerance.
+        let mut lines = Vec::with_capacity(l.io_device_weights.len());
+        for (path, weight) in &l.io_device_weights {
+            if let Some(mm) = device_major_minor(path) {
+                lines.push(format!("{mm} {weight}"));
+            }
+        }
+        if !lines.is_empty() {
+            let _ = write_file(&dir.join("io.weight"), &lines.join("\n"));
+        }
+    }
     if let Some(v) = l.tasks_max {
         write_limit(&dir.join("pids.max"), v);
     }
@@ -148,6 +175,23 @@ fn procs(dir: &Path) -> Vec<i32> {
 
 fn write_file(path: &Path, content: &str) -> io::Result<()> {
     fs::write(path, content)
+}
+
+/// Resolve a device path to its `major:minor` string for cgroup `io.weight`,
+/// or `None` if it isn't a block device we can stat. On Linux the minor range
+/// is 20 bits, so the dev_t encoding is `(major << 20) | minor`.
+fn device_major_minor(path: &str) -> Option<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let md = fs::metadata(path).ok()?;
+    let ft = md.file_type();
+    if ft.is_block_device() || ft.is_char_device() {
+        let dev = md.rdev();
+        let major = (dev >> 8) & 0xfff;
+        let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+        Some(format!("{major}:{minor}"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +231,43 @@ mod tests {
             is_empty(&dir),
             "cgroup should be empty after the child died"
         );
+        release(&dir);
+    }
+
+    /// `apply_limits` writes cpu.max / io.weight / pids.max for the new
+    /// directives, where the controllers are available; writes that fail
+    /// (controller not enabled) are skipped silently by design.
+    #[test]
+    fn apply_limits_writes_cpu_quota_and_io_weight_when_available() {
+        let Some(root) = root() else {
+            eprintln!("skipping: cgroup v2 not available");
+            return;
+        };
+        let dir = create(&root, "rustemd-test-limits").unwrap();
+
+        let limits = CgroupLimits {
+            cpu_quota: Some(0.5),
+            io_weight: Some(400),
+            ..Default::default()
+        };
+        apply_limits(&dir, &limits);
+
+        if dir.join("cpu.max").exists() {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("cpu.max")).unwrap().trim(),
+                "50000 100000",
+                "50% quota against a 100000us period must write 50000 100000"
+            );
+        }
+        if dir.join("io.weight").exists() {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("io.weight"))
+                    .unwrap()
+                    .trim(),
+                "400"
+            );
+        }
+
         release(&dir);
     }
 }

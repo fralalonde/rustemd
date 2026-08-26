@@ -14,29 +14,11 @@ Nothing here blocks the current dogfood scope; it is triage material.
 
 ## Bugs
 
-### ~~CLI panics on a broken stdout pipe~~ — fixed (rustemctl)
-`rustemctl list-units | head` (any command whose stdout pipe closes early) used
-to panic instead of exiting cleanly. Rust's runtime ignores `SIGPIPE` by
-default, so `println!` surfaced `EPIPE` and the CLI unwrapped it into a panic;
-`systemctl` dies silently (the default `SIGPIPE` action). Fixed by restoring
-the `SIGPIPE` default disposition (`libc::signal(SIGPIPE, SIG_DFL)`) early in
-`rustemctl/src/main.rs`; the CLI now dies via `SIGPIPE` (exit 141) like
-systemd. See also the design hole below — the daemon/IPC write paths still
-make the same assumption.
-
 ### Timer re-arm fires units that were never started
 `OnUnitActiveSec` / `OnUnitInactiveSec` / `OnCalendar` re-arm and fire even
 when the timer's target unit is not in the started state, whereas systemd only
 arms these once the unit is activated. Causes spurious firings. The demo works
 around it with `OnBootSec`. Location: `manager/timer.rs` re-arm path.
-
-### ~~Required dependency failing synchronously treated as satisfied~~ — fixed
-`Requires=` on a dependency whose job fails *synchronously* (a `.mount` hitting
-`EPERM`/`ENOENT`, a `.socket` bind failure) used to be dropped by the job
-engine's `waiting.retain`, so the parent proceeded as if the dependency were
-met. Fixed this checkpoint; regression test
-`required_dependency_that_fails_synchronously_fails_parent` in
-`rustemd/src/manager/mod.rs`.
 
 ### resume_primary_thread can leave a service stuck in START_PENDING
 Location: `rustemd/src/platform/windows/process.rs:299-334`. The thread-resume
@@ -46,13 +28,6 @@ only the FIRST thread whose owner pid matches, and breaks on the first
 count is 0 (it was not actually suspended), `found=true` fires without resuming
 the real suspended primary thread, so a `CREATE_SUSPENDED` newborn hangs forever
 and its service sits in `START_PENDING`.
-
-### ~~Braced `${VAR}` expansion left a trailing `}`~~ — fixed
-The shared `expand_env_token` had an off-by-one (consumed `end + 2` instead of
-`end + 3`) so `${HOME}` expanded to `/home/me}`. Found and fixed while
-deduplicating the two platform copies into `rustemd/src/expand.rs` (with
-tests); the Unix and Windows impls previously diverged here (Windows consumed
-the brace correctly).
 
 ## Weaknesses
 
@@ -106,22 +81,10 @@ because Win32 has no generic POSIX-signal delivery API. `kill_group`
 graceful-stop phase (no `GenerateConsoleCtrlEvent`/`CTRL_BREAK`) and no
 SIGTERM-then-timeout-then-SIGKILL like the Linux path.
 
-### ~~Windows output capture can drop the tail on shutdown and has no backpressure~~ — fixed (Windows)
-Output readers now feed a bounded `sync_channel` (256 chunks), so a noisy child
-is backpressured through its pipe rather than growing manager memory without
-limit. Shutdown stays non-idle while either a reader remains alive or queued
-output remains; it drains final chunks before exit. Regression tests cover queue
-backpressure and the shutdown-pending invariant.
-
 ### Spawned diverges by platform, leaking the platform seam
 Windows `Spawned { pid }` (`windows/process.rs:57-59`) vs Unix
 `Spawned { pid, stdout, stderr }` (`platform/process.rs:39-43`); the manager
 carries `#[cfg]` branches for fd-polling vs `drain_output`.
-
-### ~~Declared MSRV (1.85) is wrong; code needs 1.88+~~ — fixed
-Every workspace package now declares Rust 1.89, matching the effective floor
-already imposed by `rustemd-repo`'s use of `std::fs::File::lock`. The MSRV-gated
-Clippy diagnostics were resolved with behavior-preserving let-chain rewrites.
 
 ### Two `windows-sys` versions in the tree — retained
 `windows-sys` 0.61.2 is used directly by rustemd and transitively by current

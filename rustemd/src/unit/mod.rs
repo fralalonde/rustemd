@@ -256,7 +256,7 @@ pub struct Rlimit {
 
 /// cgroup v2 resource limits (Linux-only; no-ops elsewhere). Byte values are
 /// raw bytes; `None` = unset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CgroupLimits {
     /// `MemoryMax=` — hard ceiling on resident memory.
     pub memory_max: Option<u64>,
@@ -264,6 +264,16 @@ pub struct CgroupLimits {
     pub memory_high: Option<u64>,
     /// `CPUWeight=` — relative CPU share (1..=10000).
     pub cpu_weight: Option<u32>,
+    /// `CPUQuota=` — CPU time budget as a fraction of one CPU, matched against
+    /// a fixed 100ms (`100000` µs) period. `Some(0.5)` = 50% of one core,
+    /// `Some(2.0)` = two cores. `None` = no quota.
+    pub cpu_quota: Option<f32>,
+    /// `IOWeight=` — relative I/O share (1..=10000).
+    pub io_weight: Option<u32>,
+    /// `IODeviceWeight=` — per-device I/O weight: `(device path, weight)`,
+    /// in the order the directives appeared. `DeviceAllow=` is a separate
+    /// (eBPF) concern and is not a cgroup file write on v2.
+    pub io_device_weights: Vec<(String, u32)>,
     /// `TasksMax=` — maximum number of tasks (threads/processes).
     pub tasks_max: Option<u64>,
 }
@@ -704,6 +714,37 @@ fn build_service(
         }
         cfg.cgroup_limits.cpu_weight = Some(w);
     }
+    if let Some(v) = unit_scalar(raw, "Service", "CPUQuota") {
+        let q = parse_cpu_quota(&exp(v)).map_err(|e| format!("invalid CPUQuota `{v}`: {e}"))?;
+        cfg.cgroup_limits.cpu_quota = q;
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "IOWeight") {
+        let w: u32 = exp(v)
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid IOWeight `{v}`"))?;
+        if w == 0 || w > 10000 {
+            return Err(format!("IOWeight out of range 1..=10000: `{v}`"));
+        }
+        cfg.cgroup_limits.io_weight = Some(w);
+    }
+    for v in raw.list("Service", "IODeviceWeight") {
+        // Format: `IODeviceWeight=/dev/sda 100`.
+        let expanded = exp(v);
+        let fields: Vec<&str> = expanded.split_whitespace().collect();
+        if fields.len() != 2 {
+            return Err(format!("IODeviceWeight expects `path weight`: `{v}`"));
+        }
+        let w: u32 = fields[1]
+            .parse()
+            .map_err(|_| format!("invalid IODeviceWeight weight `{v}`"))?;
+        if w == 0 || w > 10000 {
+            return Err(format!("IODeviceWeight out of range 1..=10000: `{v}`"));
+        }
+        cfg.cgroup_limits
+            .io_device_weights
+            .push((fields[0].to_string(), w));
+    }
     if let Some(v) = unit_scalar(raw, "Service", "TasksMax") {
         let t = exp(v);
         cfg.cgroup_limits.tasks_max = Some(if t.trim().eq_ignore_ascii_case("infinity") {
@@ -779,6 +820,24 @@ fn parse_bytes(v: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid size `{v}`"))?;
     n.checked_mul(mult)
         .ok_or_else(|| format!("size overflow `{v}`"))
+}
+
+/// Parse a CPU quota percentage (e.g. `50%`, `150%`, `200%`, or `infinity`)
+/// into a fraction of one CPU. `infinity` (and no directive) maps to `None`
+/// (unlimited). Used by `CPUQuota=`.
+fn parse_cpu_quota(v: &str) -> Result<Option<f32>, String> {
+    let s = v.trim();
+    if s.eq_ignore_ascii_case("infinity") {
+        return Ok(None);
+    }
+    let s = s.strip_suffix('%').unwrap_or(s).trim();
+    let pct: f32 = s
+        .parse()
+        .map_err(|_| format!("expected a percentage like `50%` or `infinity`, got `{v}`"))?;
+    if !(0.001..=1_000_000.0).contains(&pct) {
+        return Err(format!("CPUQuota out of range: `{v}`"));
+    }
+    Ok(Some(pct / 100.0))
 }
 
 fn parse_stdio(v: &str) -> Result<StdioTarget, String> {
@@ -1097,15 +1156,32 @@ mod tests {
     #[test]
     fn cgroup_resource_directives() {
         let f = build_str(
-            "[Service]\nExecStart=/bin/true\nMemoryMax=512M\nMemoryHigh=100M\nCPUWeight=256\nTasksMax=64\n",
+            "[Service]\nExecStart=/bin/true\nMemoryMax=512M\nMemoryHigh=100M\nCPUWeight=256\nCPUQuota=50%\nIOWeight=400\nIODeviceWeight=/dev/sda 200\nTasksMax=64\n",
             "r.service",
         )
         .unwrap();
-        let l = f.service.as_ref().unwrap().cgroup_limits;
+        let l = f.service.as_ref().unwrap().cgroup_limits.clone();
         assert_eq!(l.memory_max, Some(512 * 1024 * 1024));
         assert_eq!(l.memory_high, Some(100 * 1024 * 1024));
         assert_eq!(l.cpu_weight, Some(256));
+        assert_eq!(l.cpu_quota, Some(0.5));
+        assert_eq!(l.io_weight, Some(400));
+        assert_eq!(l.io_device_weights, vec![("/dev/sda".to_string(), 200)]);
         assert_eq!(l.tasks_max, Some(64));
+
+        // CPUQuota accepts whole and partial percentages; infinity = unlimited.
+        let q = |s: &str| {
+            build_str(&format!("[Service]\nCPUQuota={s}\n"), "q.service")
+                .unwrap()
+                .service
+                .unwrap()
+                .cgroup_limits
+                .cpu_quota
+        };
+        assert_eq!(q("150%"), Some(1.5));
+        assert_eq!(q("200%"), Some(2.0));
+        assert_eq!(q("12.5%"), Some(0.125));
+        assert_eq!(q("infinity"), None);
     }
 
     #[test]
@@ -1115,12 +1191,24 @@ mod tests {
             "i.service",
         )
         .unwrap();
-        let l = f.service.as_ref().unwrap().cgroup_limits;
+        let l = f.service.as_ref().unwrap().cgroup_limits.clone();
         assert_eq!(l.memory_max, Some(u64::MAX));
         assert_eq!(l.tasks_max, Some(u64::MAX));
 
         assert!(build_str("[Service]\nCPUWeight=0\n", "b.service").is_err());
         assert!(build_str("[Service]\nCPUWeight=10001\n", "b.service").is_err());
+        assert!(build_str("[Service]\nIOWeight=0\n", "b.service").is_err());
+        assert!(build_str("[Service]\nIOWeight=10001\n", "b.service").is_err());
+        assert!(build_str("[Service]\nCPUQuota=bogus\n", "b.service").is_err());
+        assert!(build_str("[Service]\nCPUQuota=0%\n", "b.service").is_err());
+        assert!(
+            build_str("[Service]\nIODeviceWeight=/dev/sda\n", "b.service").is_err(),
+            "IODeviceWeight without a weight must be rejected"
+        );
+        assert!(
+            build_str("[Service]\nIODeviceWeight=/dev/sda 0\n", "b.service").is_err(),
+            "IODeviceWeight weight out of range must be rejected"
+        );
         assert!(build_str("[Service]\nMemoryMax=bogus\n", "b.service").is_err());
     }
 
