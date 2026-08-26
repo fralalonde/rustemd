@@ -84,10 +84,10 @@ condition/assert) are parsed. Desktop unit files lean heavily on these
 (`ConditionPathExists=!/etc/foo` to gate a service), so many real units will
 either load unconditionally or fail for reasons that are opaque.
 
-### Missing unit types: `.path`, `.slice`, `.scope`
-Only `.service`, `.socket`, `.timer`, `.target`, `.mount`, `.device` exist.
-`.path` (path-based activation) and `.slice`/`.scope` (the cgroup hierarchy the
-desktop depends on — `user.slice`, `app.slice`, `session.slice`) are absent.
+### Missing unit types: `.slice`, `.scope`, `.automount`
+Only `.service`, `.socket`, `.timer`, `.target`, `.mount`, `.path`, `.device`
+exist. `.slice`/`.scope` (the cgroup hierarchy the desktop depends on —
+`user.slice`, `app.slice`, `session.slice`) and `.automount` are absent.
 `systemd-analyze`-style tooling is also absent.
 
 ### Missing runtime-directory directives
