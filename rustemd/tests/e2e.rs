@@ -307,6 +307,58 @@ fn socket_activates_service_on_connection() {
     );
 }
 
+/// A `.path` unit watches a directory; when a file is dropped into it, the
+/// matched `Unit=` service is activated on demand (path activation).
+#[test]
+fn path_activates_service_on_directory_change() {
+    let scratch = Scratch::new();
+    let watchdir = scratch.dir.path().join("incoming");
+    std::fs::create_dir_all(&watchdir).unwrap();
+    let watch_s = watchdir.to_string_lossy().to_string();
+    scratch.write_unit(
+        "job.path",
+        &format!("[Path]\nDirectoryNotEmpty={watch_s}\nUnit=job.service\n"),
+    );
+    scratch.write_unit(
+        "job.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 5\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+
+    let mut ctl = daemon.client();
+
+    // Start the path unit: it arms the watch; the service stays down.
+    ctl.start(&["job.path"]).unwrap();
+    let armed = wait_for(Duration::from_secs(3), || {
+        ctl.status(&["job.path"])
+            .map(|v| v.first().map(|s| s.active == "active").unwrap_or(false))
+            .unwrap_or(false)
+    });
+    assert!(armed, "path unit should be active(armed)");
+    assert_eq!(
+        ctl.is_active(&["job.service"]).unwrap(),
+        vec!["inactive"],
+        "service must not start before a file arrives"
+    );
+
+    // Drop a file into the watched directory → path activation fires.
+    std::fs::write(watchdir.join("trigger"), b"x").unwrap();
+
+    let activated = wait_for(Duration::from_secs(5), || {
+        ctl.status(&["job.service"])
+            .map(|v| v.first().map(|s| s.active == "active").unwrap_or(false))
+            .unwrap_or(false)
+    });
+    assert!(
+        activated,
+        "dropping a file should activate the service via path activation"
+    );
+}
+
 /// A `.mount` unit mounts a filesystem on start and unmounts on stop, with no
 /// process to supervise. `mount(2)` needs `CAP_SYS_ADMIN`, so this test
 /// self-skips when not run as root (or in an unprivileged user+mount

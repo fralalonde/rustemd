@@ -28,7 +28,8 @@ use crate::platform::signals::SignalSource;
 use crate::repo::Repo;
 use crate::specifier::SpecifierContext;
 use crate::unit::{
-    DirectoryKind, KillMode, RestartPolicy, ServiceConfig, ServiceType, UnitFile, UnitKind,
+    DirectoryKind, KillMode, PathConfig, RestartPolicy, ServiceConfig, ServiceType, UnitFile,
+    UnitKind,
 };
 
 use self::deps as D;
@@ -38,7 +39,7 @@ use self::socket::{
     bind_listen_sequential_packet, bind_listen_stream,
 };
 use self::state::ControlCommand as UnitControlCommand;
-use self::state::{ActiveState, LoadState, SubState, TimerState, Unit, UnitResult};
+use self::state::{ActiveState, LoadState, PathState, SubState, TimerState, Unit, UnitResult};
 use self::timer::{TimerKind, TimerWheel};
 #[cfg(all(target_os = "linux", feature = "udev"))]
 use self::unit_type::DeviceUnit;
@@ -46,7 +47,7 @@ use self::unit_type::DeviceUnit;
 use self::unit_type::MountUnit;
 #[cfg(feature = "socket")]
 use self::unit_type::SocketUnit;
-use self::unit_type::{ServiceUnit, TargetUnit, TimerUnit, UnitType};
+use self::unit_type::{PathUnit, ServiceUnit, TargetUnit, TimerUnit, UnitType};
 
 pub type Name = String;
 
@@ -472,6 +473,7 @@ impl Manager {
                 if f.ends_with(".service")
                     || f.ends_with(".timer")
                     || f.ends_with(".target")
+                    || f.ends_with(".path")
                     || (cfg!(feature = "socket") && f.ends_with(".socket"))
                     || (cfg!(target_os = "linux") && f.ends_with(".mount"))
                 {
@@ -1184,6 +1186,7 @@ impl Manager {
         for entry in self.wheel.pop_due(now) {
             self.fire_timer(&entry.unit, entry.kind, now);
         }
+        self.poll_paths();
         self.reap();
         self.process_jobs();
     }
@@ -1324,6 +1327,7 @@ impl Manager {
         match self.units.get(name).map(|u| u.kind) {
             Some(UnitKind::Timer) => &TimerUnit,
             Some(UnitKind::Target) => &TargetUnit,
+            Some(UnitKind::Path) => &PathUnit,
             #[cfg(feature = "socket")]
             Some(UnitKind::Socket) => &SocketUnit,
             #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -1443,6 +1447,7 @@ impl Manager {
             },
             service: None,
             timer: None,
+            path_unit: None,
             #[cfg(feature = "socket")]
             socket: None,
             #[cfg(target_os = "linux")]
@@ -2633,7 +2638,67 @@ impl Manager {
         }
     }
 
-    // ---- signal handling ------------------------------------------------------
+    // ---- paths (`.path` activation) ----------------------------------------
+
+    /// Poll every armed `.path` unit's watch conditions and start its `Unit=`
+    /// target on a fresh trigger. A unit only fires while its target is not
+    /// running/starting (mirroring how socket activation keeps a listener out
+    /// of the poll set while its service runs), so a satisfied path restarts
+    /// the target each time the target drops back to inactive.
+    fn poll_paths(&mut self) {
+        let candidates: Vec<(String, String, PathConfig)> = self
+            .units
+            .iter()
+            .filter(|(_, u)| u.kind == UnitKind::Path && u.active == ActiveState::Active)
+            .filter_map(|(name, u)| {
+                let pc = u.path_cfg()?.clone();
+                Some((name.clone(), u.activated_path_target(), pc))
+            })
+            .collect();
+
+        // Resolve which targets are quiescent (not active/activating) so re-arm
+        // and re-fire decisions don't fight the mutable borrow of `units`.
+        let target_quiescent: HashSet<String> = candidates
+            .iter()
+            .filter(|(_, t, _)| {
+                self.units
+                    .get(t)
+                    .map(|tu| !matches!(tu.active, ActiveState::Active | ActiveState::Activating))
+                    .unwrap_or(true)
+            })
+            .map(|(_, t, _)| t.clone())
+            .collect();
+
+        let mut fired: Vec<(String, String)> = Vec::new();
+        for (name, target, pc) in candidates {
+            let mut st = self
+                .units
+                .get_mut(&name)
+                .unwrap()
+                .path_state
+                .take()
+                .unwrap_or_default();
+            if target_quiescent.contains(&target) {
+                if st.triggered {
+                    // Target dropped out of `active` → re-arm, may fire again.
+                    st.triggered = false;
+                }
+                if !st.triggered && eval_path_triggers(&pc, &mut st) {
+                    st.triggered = true;
+                    fired.push((name.clone(), target));
+                }
+            }
+            self.units.get_mut(&name).unwrap().path_state = Some(st);
+        }
+
+        for (path_unit, target) in fired {
+            self.mgr(&path_unit, &format!("triggered {target}"));
+            let _ = self.start(&target);
+            self.process_jobs();
+        }
+    }
+
+    // ---- signal handling ----------------------------
 
     /// Block the manager's signals and install the signalfd used by the event
     /// loop to read them. Idempotent; called once at daemon startup.
@@ -3419,6 +3484,108 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
+/// Evaluate a `.path` unit's watch conditions against the live filesystem,
+/// updating `PathChanged=` mtime bookkeeping. True when any condition fires.
+fn eval_path_triggers(pc: &PathConfig, st: &mut PathState) -> bool {
+    if pc.path_exists.iter().any(|p| std::fs::metadata(p).is_ok()) {
+        return true;
+    }
+    if pc.directory_not_empty.iter().any(|p| {
+        std::fs::read_dir(p)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false)
+    }) {
+        return true;
+    }
+    if pc.path_exists_glob.iter().any(|pat| matches_glob_any(pat)) {
+        return true;
+    }
+    for p in &pc.path_changed {
+        if path_changed_triggered(p, st) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `PathChanged=` semantics: fire when the path exists and its mtime differs
+/// from the mtime recorded the first time the unit observed it. Unlike
+/// `PathExists=`/`DirectoryNotEmpty=`, a path that already exists at arm time
+/// does *not* trigger immediately (systemd.path(5)). The baseline is
+/// re-recorded on every change, so a stop → re-arm cycle only re-fires on a
+/// *new* distinct mtime, never on the same one.
+fn path_changed_triggered(path: &str, st: &mut PathState) -> bool {
+    let now = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let baseline = st.armed_mtimes.get(path).copied().flatten();
+    match (st.armed_mtimes.contains_key(path), baseline, now) {
+        // First observation: record the baseline, do not fire.
+        (false, _, m) => {
+            st.armed_mtimes.insert(path.to_string(), m);
+            false
+        }
+        // Path appeared after being absent at arm time → a change.
+        (true, None, Some(m)) => {
+            st.armed_mtimes.insert(path.to_string(), Some(m));
+            true
+        }
+        // mtime differs from the recorded baseline → fire and re-baseline.
+        (true, Some(prev), Some(m)) if prev != m => {
+            st.armed_mtimes.insert(path.to_string(), Some(m));
+            true
+        }
+        // Path vanished → record absence, no fire.
+        (true, Some(_), None) => {
+            st.armed_mtimes.insert(path.to_string(), None);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Match a `PathExistsGlob=` spec: a minimal glob (`*` = any chars, `?` =
+/// exactly one char within a single path component) evaluated by listing the
+/// spec's parent directory and matching entries against the final component.
+/// No `/`, `[...]`, or `{...}` support. A spec with no wildcards is treated as
+/// plain `PathExists`.
+fn matches_glob_any(pattern: &str) -> bool {
+    let (parent, glob) = match pattern.rfind('/') {
+        Some(i) => (&pattern[..i], &pattern[i + 1..]),
+        None => ("", pattern),
+    };
+    if !glob.contains('*') && !glob.contains('?') {
+        return std::path::Path::new(pattern).exists();
+    }
+    let parent = if parent.is_empty() { "." } else { parent };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .any(|name| glob_match(glob, &name))
+}
+
+/// Backtracking `*`/`?` matcher for a single path component.
+fn glob_match(pat: &str, name: &str) -> bool {
+    fn rec(pat: &[u8], name: &[u8]) -> bool {
+        match pat.first() {
+            None => name.is_empty(),
+            Some(b'*') => {
+                // Collapse consecutive stars, then try every split point.
+                let mut rest_start = 1;
+                while rest_start < pat.len() && pat[rest_start] == b'*' {
+                    rest_start += 1;
+                }
+                let rest = &pat[rest_start..];
+                (0..=name.len()).any(|k| rec(rest, &name[k..]))
+            }
+            Some(b'?') => !name.is_empty() && rec(&pat[1..], &name[1..]),
+            Some(&c) => name.first() == Some(&c) && rec(&pat[1..], &name[1..]),
+        }
+    }
+    rec(pat.as_bytes(), name.as_bytes())
+}
+
 fn kind_unit_needs_file(kind: UnitKind) -> bool {
     kind == UnitKind::Target
 }
@@ -3439,6 +3606,7 @@ fn builtin_target(name: &str) -> Unit {
         },
         service: None,
         timer: None,
+        path_unit: None,
         #[cfg(feature = "socket")]
         socket: None,
         #[cfg(target_os = "linux")]
@@ -3657,5 +3825,36 @@ mod tests {
             !mgr.unit_job.contains_key("a.target"),
             "parent job must resolve (fail), not hang on a dead dependency"
         );
+    }
+
+    /// `PathChanged=` must not fire for a path that already exists at arm time,
+    /// and must re-baseline after a change so a stop → re-arm cycle does not
+    /// re-fire on the same mtime (systemd.path(5)). Regression test.
+    #[test]
+    fn path_changed_only_fires_on_distinct_mtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("watch.conf");
+        std::fs::write(&file, "v0").unwrap();
+        let path = file.to_string_lossy();
+        let mut st = PathState::default();
+
+        // Existing at arm time: record baseline, do NOT fire.
+        assert!(!path_changed_triggered(&path, &mut st));
+        // Same mtime on a second poll: still no fire.
+        assert!(!path_changed_triggered(&path, &mut st));
+
+        // A real change fires once and re-baselines...
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, "v1").unwrap();
+        assert!(path_changed_triggered(&path, &mut st));
+        // ...so the same mtime does not re-fire.
+        assert!(!path_changed_triggered(&path, &mut st));
+
+        // Disappearance records absence and does not fire...
+        std::fs::remove_file(&file).unwrap();
+        assert!(!path_changed_triggered(&path, &mut st));
+        // ...and a reappearance is a fresh change.
+        std::fs::write(&file, "v2").unwrap();
+        assert!(path_changed_triggered(&path, &mut st));
     }
 }

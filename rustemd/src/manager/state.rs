@@ -1,5 +1,6 @@
 //! Unit active-state machine and per-unit runtime state.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -8,7 +9,7 @@ use crate::log::LogRing;
 use crate::unit::MountConfig;
 #[cfg(feature = "socket")]
 use crate::unit::SocketConfig;
-use crate::unit::{ServiceConfig, TimerConfig, UnitFile, UnitKind};
+use crate::unit::{PathConfig, ServiceConfig, TimerConfig, UnitFile, UnitKind};
 
 pub type Pid = i32;
 
@@ -150,6 +151,8 @@ pub struct Unit {
     pub notify_ready: bool,
     /// Timer scheduling state when this is a timer unit.
     pub timer: Option<TimerState>,
+    /// Path-watch state when this is a path unit.
+    pub path_state: Option<PathState>,
 }
 
 impl Unit {
@@ -184,6 +187,7 @@ impl Unit {
             notify_fd: None,
             notify_ready: false,
             timer: None,
+            path_state: None,
         }
     }
 
@@ -192,6 +196,9 @@ impl Unit {
     }
     pub fn timer_cfg(&self) -> Option<&TimerConfig> {
         self.file.as_ref().and_then(|f| f.timer.as_ref())
+    }
+    pub fn path_cfg(&self) -> Option<&PathConfig> {
+        self.file.as_ref().and_then(|f| f.path_unit.as_ref())
     }
 
     #[cfg(feature = "socket")]
@@ -220,6 +227,17 @@ impl Unit {
     pub fn activated_service(&self) -> String {
         if let Some(s) = self.socket_cfg()
             && let Some(u) = &s.service
+        {
+            return u.clone();
+        }
+        let dot = self.name.rfind('.').unwrap_or(self.name.len());
+        format!("{}.service", &self.name[..dot])
+    }
+
+    /// The unit a `.path` unit activates (default: same prefix, `.service`).
+    pub fn activated_path_target(&self) -> String {
+        if let Some(p) = self.path_cfg()
+            && let Some(u) = &p.unit
         {
             return u.clone();
         }
@@ -282,4 +300,18 @@ impl TimerState {
             spec_strings,
         }
     }
+}
+
+/// Bookkeeping for a `.path` unit's watch state.
+#[derive(Debug, Clone, Default)]
+pub struct PathState {
+    /// mtime of each `PathChanged=` path when the unit first observed it
+    /// (`None` = path absent). A `PathChanged=` path only fires when its mtime
+    /// differs from this baseline; unlike `PathExists=` it does not fire
+    /// merely because the path already exists at arm time. Keyed by the
+    /// literal watch path.
+    pub armed_mtimes: HashMap<String, Option<SystemTime>>,
+    /// True once this watch has fired and its target was started. Cleared when
+    /// the target leaves `active`, so the path can trigger again.
+    pub triggered: bool,
 }

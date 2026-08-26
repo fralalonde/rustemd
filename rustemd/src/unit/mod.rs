@@ -20,6 +20,7 @@ pub enum UnitKind {
     Service,
     Timer,
     Target,
+    Path,
     #[cfg(feature = "socket")]
     Socket,
     #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -34,6 +35,7 @@ impl UnitKind {
             UnitKind::Service => "service",
             UnitKind::Timer => "timer",
             UnitKind::Target => "target",
+            UnitKind::Path => "path",
             #[cfg(feature = "socket")]
             UnitKind::Socket => "socket",
             #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -47,6 +49,7 @@ impl UnitKind {
             "service" => Some(UnitKind::Service),
             "timer" => Some(UnitKind::Timer),
             "target" => Some(UnitKind::Target),
+            "path" => Some(UnitKind::Path),
             #[cfg(feature = "socket")]
             "socket" => Some(UnitKind::Socket),
             #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -569,6 +572,27 @@ pub struct TimerConfig {
     pub wake_system: bool,
 }
 
+/// `[Path]` section — path-activation config. The unit stays armed while it is
+/// `active`; each tick the manager polls the listed paths and, on a fresh
+/// trigger whose `Unit=` target is not running, starts the target.
+#[derive(Debug, Clone, Default)]
+pub struct PathConfig {
+    /// `PathExists=`: trigger when the path exists.
+    pub path_exists: Vec<String>,
+    /// `PathExistsGlob=`: trigger when any entry matching the glob exists.
+    pub path_exists_glob: Vec<String>,
+    /// `PathChanged=`: trigger when the path's mtime changes from the armed
+    /// baseline.
+    pub path_changed: Vec<String>,
+    /// `DirectoryNotEmpty=`: trigger when the directory has at least one entry.
+    pub directory_not_empty: Vec<String>,
+    /// `Unit=` — the unit to activate (default: same prefix, `.service`).
+    pub unit: Option<String>,
+    /// `MakeDirectory=`: create the watched directory (with parents) on start
+    /// when it does not exist yet.
+    pub make_directory: bool,
+}
+
 /// `[Socket]` section — socket-activation config. `listen_stream` entries are
 /// unix socket paths (bare or `unix:/path`) or TCP `host:port`; interpretation
 /// happens at bind time in the manager.
@@ -619,6 +643,7 @@ pub struct UnitFile {
     pub unit: UnitConfig,
     pub service: Option<ServiceConfig>,
     pub timer: Option<TimerConfig>,
+    pub path_unit: Option<PathConfig>,
     #[cfg(feature = "socket")]
     pub socket: Option<SocketConfig>,
     #[cfg(target_os = "linux")]
@@ -632,6 +657,8 @@ impl UnitFile {
             UnitKind::Service
         } else if self.timer.is_some() {
             UnitKind::Timer
+        } else if self.path_unit.is_some() {
+            UnitKind::Path
         } else {
             #[cfg(feature = "socket")]
             if self.socket.is_some() {
@@ -700,6 +727,11 @@ pub fn build(raw: &parse::RawUnitFile, spec: &SpecifierContext) -> Result<UnitFi
     } else {
         None
     };
+    let path_unit = if kind == UnitKind::Path {
+        Some(build_path(raw, &exp)?)
+    } else {
+        None
+    };
     #[cfg(feature = "socket")]
     let socket = if kind == UnitKind::Socket {
         Some(build_socket(raw, &exp)?)
@@ -718,6 +750,7 @@ pub fn build(raw: &parse::RawUnitFile, spec: &SpecifierContext) -> Result<UnitFi
         unit,
         service,
         timer,
+        path_unit,
         #[cfg(feature = "socket")]
         socket,
         #[cfg(target_os = "linux")]
@@ -1357,6 +1390,25 @@ fn build_timer(
     Ok(cfg)
 }
 
+/// Parse the `[Path]` section into a [`PathConfig`].
+fn build_path(
+    raw: &parse::RawUnitFile,
+    exp: &impl Fn(&str) -> String,
+) -> Result<PathConfig, String> {
+    let make_directory = match unit_scalar(raw, "Path", "MakeDirectory") {
+        Some(v) => parse_bool(&exp(v))?,
+        None => false,
+    };
+    Ok(PathConfig {
+        path_exists: list_of(raw, "Path", "PathExists", exp),
+        path_exists_glob: list_of(raw, "Path", "PathExistsGlob", exp),
+        path_changed: list_of(raw, "Path", "PathChanged", exp),
+        directory_not_empty: list_of(raw, "Path", "DirectoryNotEmpty", exp),
+        unit: unit_scalar(raw, "Path", "Unit").map(exp),
+        make_directory,
+    })
+}
+
 /// Derive a mount point from a `.mount` unit name: `tmp-demo.mount` →
 /// `/tmp/demo`. The escaping mirrors systemd's path units — `-` maps to `/`,
 /// and `\xHH` escapes decode to the literal byte (so a literal `-` in the path
@@ -1571,6 +1623,28 @@ mod tests {
         assert_eq!(t.on_boot_sec.len(), 1);
         assert!(t.persistent);
         assert_eq!(t.unit.as_deref(), Some("backup.service"));
+    }
+
+    #[test]
+    fn path_parsing() {
+        let f = build_str(
+            "[Path]\nPathExists=/tmp/lock\nPathExistsGlob=/var/spool/*.job\nPathChanged=/etc/my.conf\nDirectoryNotEmpty=/var/spool\nUnit=run.service\nMakeDirectory=yes\n",
+            "run.path",
+        )
+        .unwrap();
+        let p = f.path_unit.as_ref().unwrap();
+        assert_eq!(p.path_exists, vec!["/tmp/lock"]);
+        assert_eq!(p.path_exists_glob, vec!["/var/spool/*.job"]);
+        assert_eq!(p.path_changed, vec!["/etc/my.conf"]);
+        assert_eq!(p.directory_not_empty, vec!["/var/spool"]);
+        assert_eq!(p.unit.as_deref(), Some("run.service"));
+        assert!(p.make_directory);
+        // A `.path` unit with no explicit Unit= defaults to the same-prefix
+        // `.service` at activation time — the parser leaves `unit` unset.
+        let no_unit = build_str("[Path]\nPathExists=/tmp/lock\n", "implicit.path").unwrap();
+        let p = no_unit.path_unit.as_ref().unwrap();
+        assert!(p.unit.is_none());
+        assert!(!p.make_directory);
     }
 
     #[test]

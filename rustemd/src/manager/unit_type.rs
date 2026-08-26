@@ -118,6 +118,53 @@ impl UnitType for TimerUnit {
     }
 }
 
+/// A `.path`: an activation trigger for another unit based on filesystem path
+/// events, not a process. Starting it marks it active (armed); the polling
+/// lives in the manager's tick loop, which resolves `Unit=` and starts the
+/// target when a watched path triggers.
+pub struct PathUnit;
+
+impl UnitType for PathUnit {
+    fn start(&self, mgr: &mut Manager, name: &str) {
+        // `MakeDirectory=yes`: create each watched directory (or a glob spec's
+        // parent directory) with parents before arming the watch. Ignored for
+        // `PathExists=` per systemd.path(5) — creating that path would make the
+        // "exists" condition trivially true forever.
+        if let Some(pc) = mgr.units.get(name).and_then(|u| u.path_cfg()).cloned()
+            && pc.make_directory
+        {
+            for p in pc.path_changed.iter().chain(pc.directory_not_empty.iter()) {
+                let _ = std::fs::create_dir_all(p);
+            }
+            for g in &pc.path_exists_glob {
+                if let Some(parent) = glob_parent(g) {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+        }
+        mgr.units.get_mut(name).unwrap().set_active(
+            ActiveState::Active,
+            SubState::Dead,
+            UnitResult::Success,
+        );
+        mgr.complete_start_job(name);
+    }
+
+    fn stop(&self, mgr: &mut Manager, name: &str) {
+        mgr.finalize_stop(name);
+    }
+}
+
+/// The directory of a possibly-glob path — the spec up to the last `/` (`None`
+/// when relative with no slash). Used by `MakeDirectory=` to create a glob
+/// spec's parent before the watch can observe it.
+fn glob_parent(path: &str) -> Option<String> {
+    match path.rfind('/') {
+        Some(i) if i > 0 => Some(path[..i].to_string()),
+        _ => None,
+    }
+}
+
 /// A `.socket`: binds listening sockets and activates a matching `.service` on
 /// the first connection. Compiled only with the `socket` feature.
 #[cfg(feature = "socket")]

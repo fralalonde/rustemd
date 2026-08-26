@@ -137,6 +137,7 @@ mod tests {
             },
             service: None,
             timer: None,
+            path_unit: None,
             #[cfg(feature = "socket")]
             socket: None,
             #[cfg(target_os = "linux")]

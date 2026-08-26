@@ -7,16 +7,18 @@ pub enum UnitType {
     Service,
     Timer,
     Target,
+    Path,
     Socket,
     Mount,
     Device,
 }
 
 impl UnitType {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Service,
         Self::Timer,
         Self::Target,
+        Self::Path,
         Self::Socket,
         Self::Mount,
         Self::Device,
@@ -26,6 +28,7 @@ impl UnitType {
             Self::Service => "service",
             Self::Timer => "timer",
             Self::Target => "target",
+            Self::Path => "path",
             Self::Socket => "socket",
             Self::Mount => "mount",
             Self::Device => "device",
@@ -36,6 +39,7 @@ impl UnitType {
             "service" => Self::Service,
             "timer" => Self::Timer,
             "target" => Self::Target,
+            "path" => Self::Path,
             "socket" => Self::Socket,
             "mount" => Self::Mount,
             "device" => Self::Device,
