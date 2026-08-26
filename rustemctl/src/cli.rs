@@ -150,6 +150,29 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         since: Option<u64>,
     },
+    /// Show log records from the manager's persistent journal, `journalctl`-style.
+    #[command(name = "journalctl")]
+    Journalctl {
+        /// Filter to one unit.
+        #[arg(short = 'u', long, value_name = "UNIT")]
+        unit: Option<String>,
+        /// Show only the most recent N lines.
+        #[arg(short = 'n', long = "lines", value_name = "N")]
+        lines: Option<usize>,
+        /// Follow new entries as they are written.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only records at or after this UNIX timestamp (seconds).
+        #[arg(long, value_name = "SECS")]
+        since: Option<u64>,
+        /// Do not pipe output through a pager (accepted for compatibility;
+        /// output is already unpaged).
+        #[arg(long)]
+        no_pager: bool,
+        /// Filter by log priority. NOT yet supported.
+        #[arg(short = 'p', long)]
+        priority: Option<String>,
+    },
     /// Set the default target.
     #[command(name = "set-default")]
     SetDefault { target: String },
@@ -269,6 +292,19 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             follow,
             since,
         } => cmd_journal(cli, unit.as_deref(), *lines, *follow, *since),
+        Command::Journalctl {
+            unit,
+            lines,
+            follow,
+            since,
+            no_pager: _,
+            priority,
+        } => {
+            if priority.is_some() {
+                return Err("--priority is not yet supported".into());
+            }
+            cmd_journal(cli, unit.as_deref(), *lines, *follow, *since)
+        }
         Command::SetDefault { target } => {
             let client = Client::for_mode(cli.user)?;
             client

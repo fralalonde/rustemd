@@ -32,13 +32,15 @@ impl Scratch {
         let units = root.join("units");
         let config = root.join("config");
         let run = root.join("run");
-        for d in [&units, &config, &run] {
+        let journal = root.join("journal");
+        for d in [&units, &config, &run, &journal] {
             std::fs::create_dir_all(d).unwrap();
         }
         unsafe {
             std::env::set_var("RUSTEMD_UNIT_PATH", &units);
             std::env::set_var("RUSTEMD_CONFIG_DIR", &config);
             std::env::set_var("RUSTEMD_RUNTIME_DIR", &run);
+            std::env::set_var("RUSTEMD_JOURNAL_DIR", &journal);
             std::env::set_var("RUSTEMD_SOCKET", run.join("control.sock"));
         }
         Scratch { _lock: lock, dir }
@@ -169,5 +171,75 @@ fn cli_drives_daemon_roundtrip() {
     assert!(
         status.status.success(),
         "daemon should exit cleanly after shutdown"
+    );
+}
+
+/// Fork the scratch manager as a child process (re-exec'd test binary) and
+/// wait until its control socket exists. Returns the live child handle.
+fn spawn_daemon() -> std::process::Child {
+    let exe = std::env::current_exe().unwrap();
+    let daemon = Command::new(&exe)
+        .arg("daemon_subprocess")
+        .env("RUSTEMCTL_DAEMON", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn daemon");
+    let socket: std::path::PathBuf = std::env::var_os("RUSTEMD_SOCKET").unwrap().into();
+    assert!(wait_for(Duration::from_secs(5), || {
+        std::path::Path::new(&socket).exists()
+    }));
+    daemon
+}
+
+/// Ask the daemon to stop and exit, then reap it (asserting a clean exit).
+fn shutdown_daemon(daemon: std::process::Child) {
+    let socket: std::path::PathBuf = std::env::var_os("RUSTEMD_SOCKET").unwrap().into();
+    let _ = rustemd::client::request_json(&socket, &serde_json::json!({ "op": "shutdown" }));
+    let status = daemon.wait_with_output().expect("failed to reap daemon");
+    assert!(
+        status.status.success(),
+        "daemon should exit cleanly after shutdown"
+    );
+}
+
+#[test]
+fn journalctl_reads_unit_marker() {
+    let scratch = Scratch::new();
+    scratch.write_unit(
+        "jctl.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/echo journalctl-marker-42\n",
+    );
+    let daemon = spawn_daemon();
+
+    rustemctl(&["start", "jctl.service"]);
+    let active = wait_for(Duration::from_secs(3), || {
+        is_active("jctl.service") == "active"
+    });
+    assert!(active, "jctl.service should become active");
+
+    // `journalctl -u <unit> -n 5` reuses the same daemon journal op and shows
+    // the service's captured stdout line.
+    let found = wait_for(Duration::from_secs(5), || {
+        let out = rustemctl_raw(&["journalctl", "-u", "jctl.service", "-n", "5"]);
+        String::from_utf8_lossy(&out.stdout).contains("journalctl-marker-42")
+    });
+    assert!(
+        found,
+        "journalctl -u jctl.service should show the service's stdout marker"
+    );
+
+    shutdown_daemon(daemon);
+}
+
+#[test]
+fn journalctl_priority_is_rejected() {
+    let out = rustemctl_raw(&["journalctl", "-p", "err"]);
+    assert!(!out.status.success(), "-p should exit nonzero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--priority is not yet supported"),
+        "-p should report the unsupported message, got: {stderr}"
     );
 }
