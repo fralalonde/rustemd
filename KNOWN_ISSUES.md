@@ -34,7 +34,7 @@
   `ReadOnlyPaths=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`,
   `AmbientCapabilities=`, `SystemCallFilter=`, `PrivateDevices=`,
   `RestrictRealtime=`, `LockPersonality=`, `RestrictSUIDSGID=`,
-  `RestrictAddressFamilies=`) — no
+  `RestrictAddressFamilies=`, `MemoryDenyWriteExecute=`) — no
   `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
@@ -173,8 +173,15 @@ a seccomp gate on `socket(2)`/`socketpair(2)`: the family argument is compared
 against the directive's list (`~`-prefixed lists deny the named families, an
 un-prefixed list allows only those), with unit tests on the BPF layout and an
 `e2e` test (`restrict_address_families_allows_only_unix`) covering the
-allow-list form against a real `socket(AF_INET)` probe. Still unimplemented:
-the rest of the Phase-2/3 family — `MemoryDenyWriteExecute=`, `DynamicUser=`,
+allow-list form against a real `socket(AF_INET)` probe.
+`MemoryDenyWriteExecute=` is enforced as a seccomp arg-gate on
+`mmap`/`mprotect`/`pkey_mprotect` (and implies `NoNewPrivileges=` like the
+other filter installs): the `prot` argument is masked to
+`PROT_WRITE|PROT_EXEC` (0x6) and any request that sets *both* bits — creating
+a mapping, or `mprotect`ing RW→RWX — is denied with `EPERM`, with unit tests
+on the BPF layout and an `e2e` test (`memory_deny_write_execute_blocks_wx_protect`)
+probing an RW→RWX `mprotect` via `ctypes`. Still unimplemented:
+the rest of the Phase-2/3 family — `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`, `IPAddress*`,
 `RemoveIPC=`. All of the latter are **parsed and emit a per-unit compat
 warning at load** rather than being silently ignored.

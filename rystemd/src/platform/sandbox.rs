@@ -160,7 +160,8 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             || cfg.restrict_realtime
             || cfg.lock_personality
             || cfg.restrict_suidsgid
-            || cfg.af_present;
+            || cfg.af_present
+            || cfg.memory_deny_write_execute;
         if need_seccomp {
             // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
             // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
@@ -208,7 +209,14 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             } else {
                 None
             };
-            let program = build_seccomp(&cfg.syscall_nrs, deny, cfg.syscall_errno, &extra_deny, af);
+            let program = build_seccomp(
+                &cfg.syscall_nrs,
+                deny,
+                cfg.syscall_errno,
+                &extra_deny,
+                af,
+                cfg.memory_deny_write_execute,
+            );
             ops.push(Op::Seccomp(program));
         }
     }
@@ -646,8 +654,9 @@ fn build_seccomp(
     errno: u32,
     extra_deny: &[u32],
     af: Option<AfGate<'_>>,
+    wx: bool,
 ) -> Vec<libc::sock_filter> {
-    seccomp::build(nrs, deny, errno, extra_deny, af)
+    seccomp::build(nrs, deny, errno, extra_deny, af, wx)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -725,6 +734,7 @@ mod seccomp {
         errno: u32,
         extra_deny: &[u32],
         af: Option<super::AfGate<'_>>,
+        wx: bool,
     ) -> Vec<libc::sock_filter> {
         let errno = if errno == 0 {
             libc::EPERM as u32
@@ -736,13 +746,29 @@ mod seccomp {
 
         let socket = syscall_nr("socket");
         let socketpair = syscall_nr("socketpair");
+        // `MemoryDenyWriteExecute=`-gated syscalls: create/transition a mapping
+        // to writable+executable. On x86_64 these are `mmap`, `mprotect` and
+        // `pkey_mprotect`, and all three take `prot` as argument 2.
+        let wx_nrs: Vec<u32> = if wx {
+            ["mmap", "mprotect", "pkey_mprotect"]
+                .into_iter()
+                .filter_map(syscall_nr)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        // Plain entries: everything except the family-gated socket/socketpair,
-        // which are dispatched to the address-family gate instead.
+        // Plain entries: everything except the gated socket/socketpair and the
+        // gated WX syscalls, which are dispatched to their argument gates.
         let mut entries: Vec<u32> = nrs.to_vec();
         if af.is_some() {
             for s in [socket, socketpair].into_iter().flatten() {
                 entries.retain(|e| *e != s);
+            }
+        }
+        if wx {
+            for s in &wx_nrs {
+                entries.retain(|e| e != s);
             }
         }
         if !deny {
@@ -765,7 +791,9 @@ mod seccomp {
         entries.sort_unstable();
         entries.dedup();
 
-        use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
+        use libc::{
+            BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_RET, BPF_W,
+        };
         // Forward jump targets, resolved once the full layout is known.
         // jt/jf are unsigned 8-bit *relative* offsets in the emitted program,
         // so we assemble against absolute indices and convert at the end.
@@ -778,6 +806,9 @@ mod seccomp {
             Errno,
             Allow,
             Famarg,
+            /// A `MemoryDenyWriteExecute=`-gated syscall that needs its `prot`
+            /// argument (arg2) checked for writable+executable.
+            WxArg,
             /// The "not a gated socket" path: continue as an ordinary syscall
             /// through the plain entries (falling back to `default_t` when
             /// there are none). Never falls into the family-arg block.
@@ -817,12 +848,34 @@ mod seccomp {
         push!(prog, jeq(AUDIT_ARCH_X86_64), Tgt::I(2), Tgt::Allow);
         push!(prog, ld(0), Tgt::None, Tgt::None);
 
-        // `RestrictAddressFamilies=`: socket(2)/socketpair(2) are intercepted
-        // here and dispatched to the family gate. The SystemCallFilter list is
-        // the more restrictive of the two independent filters: a socket that
-        // the list already denies stays denied (the family gate can only
-        // *allow* families on a socket the list lets through).
+        // Gateway to the argument gates: `RestrictAddressFamilies=`
+        // (socket/socketpair) and `MemoryDenyWriteExecute=` (mmap/mprotect/
+        // pkey_mprotect) intercept their syscalls here and route each match to
+        // an argument-check block below. The SystemCallFilter list is always
+        // the more restrictive of the two independent filters: a syscall the
+        // list already denies stays denied, and a gate can only *allow* a
+        // call the list lets through.
         let mut need_famarg = false;
+        let mut need_wxarg = false;
+        // Build the ordered gate set — WX syscalls first, then the AF
+        // socket/socketpair — each with the decision to take on a match.
+        let mut gates: Vec<(u32, Tgt, usize)> = Vec::new();
+        if wx {
+            for s in &wx_nrs {
+                let list_denies = if deny {
+                    nrs.contains(s)
+                } else {
+                    !nrs.contains(s)
+                };
+                let jt = if list_denies {
+                    Tgt::Errno
+                } else {
+                    need_wxarg = true;
+                    Tgt::WxArg
+                };
+                gates.push((*s, jt, 0));
+            }
+        }
         if let Some(af) = af.as_ref() {
             let fam_default_errno = if af.deny_all { af.deny } else { !af.deny };
             // `~all`/`all` degenerate straight to a constant decision (no
@@ -842,23 +895,37 @@ mod seccomp {
                     need_famarg = true;
                     Tgt::Famarg
                 };
-                push!(prog, jeq(s), jt, Tgt::Plain);
+                gates.push((s, jt, 0));
             }
-            // A syscall that is not socket/socketpair must continue through the
-            // plain entries (or straight to the default when there are none) —
-            // it must NOT fall into the family-arg block below.
-            let plain_tgt = if entries.is_empty() {
-                default_t
-            } else {
-                Tgt::I(prog.len()) // index of the first plain entry
-            };
-            for i in &mut prog {
-                if i.jt == Tgt::Plain {
-                    i.jt = plain_tgt;
-                }
-                if i.jf == Tgt::Plain {
-                    i.jf = plain_tgt;
-                }
+        }
+        // Emit the jeq chain with proper fall-through: each gate's non-match
+        // falls to the *next* gate (a non-mmap syscall can still be mprotect,
+        // and a non-socket syscall can still be socketpair), so only the final
+        // gate routes a non-match onward (Plain → plain entries/default). A
+        // single jump-to-plain from an early gate would leak later gated
+        // syscalls through the filter.
+        for k in 0..gates.len() {
+            let idx = push!(prog, jeq(gates[k].0), gates[k].1, Tgt::Plain);
+            if k > 0 {
+                prog[gates[k - 1].2].jf = Tgt::I(idx);
+            }
+            gates[k].2 = idx;
+        }
+        // The final gate keeps jf = Plain (patched to the plain path below).
+        // A syscall that matches no gate must continue through the plain
+        // entries (or straight to the default when there are none) — it must
+        // NOT fall into either argument-gate block below.
+        let plain_tgt = if entries.is_empty() {
+            default_t
+        } else {
+            Tgt::I(prog.len()) // index of the first plain entry
+        };
+        for i in &mut prog {
+            if i.jt == Tgt::Plain {
+                i.jt = plain_tgt;
+            }
+            if i.jf == Tgt::Plain {
+                i.jf = plain_tgt;
             }
         }
 
@@ -897,6 +964,49 @@ mod seccomp {
             }
         }
 
+        // `MemoryDenyWriteExecute=`-gate block (only when a WX syscall needs
+        // its `prot` argument checked). Deny when
+        // `(prot & (PROT_WRITE|PROT_EXEC)) == (PROT_WRITE|PROT_EXEC)`:
+        // PROT_WRITE=0x2, PROT_EXEC=0x4, so mask to 0x6 and reject only when
+        // both bits are set. `prot` is argument 2 (byte offset 32) for
+        // mmap/mprotect/pkey_mprotect alike.
+        if need_wxarg {
+            let wx_idx = push!(prog, ld(32), Tgt::None, Tgt::None) /* load arg2 */;
+            // A = prot & 0x6
+            push!(
+                prog,
+                ((BPF_ALU | BPF_AND | BPF_K) as u16, 0x6),
+                Tgt::None,
+                Tgt::None
+            );
+            // If the WRITE bit is clear, the mapping can't be W+X: allow.
+            // BPF_JSET takes `jt` when A & K != 0.
+            let js_w = push!(
+                prog,
+                ((BPF_JMP | BPF_JSET | BPF_K) as u16, 2),
+                Tgt::None,
+                Tgt::Allow
+            );
+            // With WRITE set, deny only when EXEC is also set (jt), else allow
+            // (a writable-only mapping).
+            let js_x = push!(
+                prog,
+                ((BPF_JMP | BPF_JSET | BPF_K) as u16, 4),
+                Tgt::Errno,
+                Tgt::Allow
+            );
+            prog[js_w].jt = Tgt::I(js_x);
+            // Point every pending WxArg jump at the block's start.
+            for i in &mut prog {
+                if matches!(i.jt, Tgt::WxArg) {
+                    i.jt = Tgt::I(wx_idx);
+                }
+                if matches!(i.jf, Tgt::WxArg) {
+                    i.jf = Tgt::I(wx_idx);
+                }
+            }
+        }
+
         // Terminal returns (shared). Patched targets reference these indices.
         let errno_i = push!(
             prog,
@@ -918,8 +1028,9 @@ mod seccomp {
                 Tgt::I(i) => Some(i),
                 Tgt::Errno => Some(errno_i),
                 Tgt::Allow => Some(allow_i),
-                // Resolved to a concrete target in the socket-dispatch block.
+                // Resolved to a concrete target in the dispatch/arg blocks.
                 Tgt::Famarg => unreachable!("Famarg forwarded"),
+                Tgt::WxArg => unreachable!("WxArg forwarded"),
                 Tgt::Plain => unreachable!("Plain forwarded"),
             }
         };
@@ -1920,7 +2031,7 @@ mod tests {
         // Allow-list of a single syscall → the ALLOW_BASE is auto-added, so
         // expect >3 entries. Deny-list blocks `quotactl` (179).
         let nrs = seccomp::resolve(&["quotactl".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 1, &[], None);
+        let prog = build_seccomp(&nrs, true, 1, &[], None, false);
         let n = nrs.len(); // 1
         // Layout: 3 prologue (arch load, arch jeq, nr load) + n compare
         // entries + 2 returns = 5 + n. (index of allow = 4 + n).
@@ -1955,7 +2066,7 @@ mod tests {
         // base), i.e. the built program must include the base numbers. Check
         // structurally: any number not in entries refers to `den`.
         let nrs = seccomp::resolve(&["read".into()]).unwrap();
-        let prog = build_seccomp(&nrs, false, 1, &[], None);
+        let prog = build_seccomp(&nrs, false, 1, &[], None, false);
         // The allow-list's JEQ table covers all entries (base included); the
         // exit_group (231) must be present among the JEQ k values.
         let ks: Vec<u32> = prog.iter().map(|s| s.k).collect();
@@ -2010,7 +2121,7 @@ mod tests {
         // syscalls "succeed" (ERRNO|0 = success). The build defaults 0 to
         // EPERM (1), so the deny return carries EPERM.
         let nrs = seccomp::resolve(&["mkdirat".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 0, &[], None);
+        let prog = build_seccomp(&nrs, true, 0, &[], None, false);
         // The deny return is the second-to-last instruction (the last is
         // ALLOW); it must carry SECCOMP_RET_ERRNO | EPERM, not | 0.
         let den_ret = &prog[prog.len() - 2];
@@ -2365,11 +2476,88 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn memory_deny_write_execute_forces_nnp_and_checks_prot_arg() {
+        use libc::{BPF_ABS, BPF_ALU, BPF_AND, BPF_JMP, BPF_JSET, BPF_K, BPF_LD, BPF_W};
+        let c = cfg_with(|c| c.memory_deny_write_execute = true);
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("MemoryDenyWriteExecute must force NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("MemoryDenyWriteExecute must install a seccomp op");
+        assert!(
+            nnp < sec,
+            "NNP must precede the MemoryDenyWriteExecute filter"
+        );
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        // The WX gate loads `seccomp_data.args[2]` (byte offset 32): the
+        // `prot` argument shared by mmap/mprotect/pkey_mprotect.
+        assert!(
+            prog.iter()
+                .any(|s| s.code == (BPF_LD | BPF_W | BPF_ABS) as u16 && s.k == 32),
+            "WX gate must read the `prot` argument (arg2@32)"
+        );
+        // ...masks it to the WRITE|EXEC bits (ALU AND 0x6)...
+        assert!(
+            prog.iter()
+                .any(|s| s.code == (BPF_ALU | BPF_AND | BPF_K) as u16 && s.k == 0x6),
+            "WX gate must mask `prot` to PROT_WRITE|PROT_EXEC (0x6)"
+        );
+        // ...then tests the WRITE (0x2) then EXEC (0x4) bits with JSET.
+        let jset: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JSET | BPF_K) as u16)
+            .map(|s| s.k)
+            .collect();
+        assert_eq!(jset, vec![2, 4], "WX gate must test WRITE, then EXEC bits");
+        // Standalone `MemoryDenyWriteExecute=` is a deny-list (default ALLOW):
+        // a service can still `execve` and map ordinary RW/RX pages. It must
+        // not be an allow-list of the whole base set.
+        let allow = prog.last().unwrap();
+        assert_eq!(allow.k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    // End-to-end kernel enforcement of a seccomp deny-list is environment
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn memory_deny_write_execute_gates_mmap_mprotect_pkey() {
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| c.memory_deny_write_execute = true);
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let jeq: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        for nr in [9u32, 10, 329] {
+            // mmap, mprotect, pkey_mprotect
+            assert!(
+                jeq.contains(&nr),
+                "WX-gated syscall {nr} must be dispatched to the prot gate"
+            );
+        }
+    }
+
     // End-to-end kernel enforcement of a seccomp deny-list is environment
     // sensitive: installing a `SECCOMP_MODE_FILTER` inside a container (the
     // typical dev/CI sandbox) is restricted, so a forked-child proof hangs
     // there rather than asserting cleanly. The filter *construction* and
     // syscall resolution are fully covered by the pure tests above
-    // (`build_*`, `resolve_*`), which is where the logic lives; actual
-    // enforcement is verified manually on a real host as root.
+    // (`build_*`, `resolve_*`), plus the real-daemon e2e in
+    // `tests/seccomp.rs::memory_deny_write_execute_blocks_wx_protect`; actual
+    // enforcement is otherwise verified manually on a real host as root.
 }

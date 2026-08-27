@@ -403,3 +403,78 @@ fn restrict_address_families_allows_only_unix() {
         }
     }
 }
+
+/// `MemoryDenyWriteExecute=yes` blocks creating or transitioning a mapping to
+/// *writable+executable*. We probe with Python's `ctypes` calling `mmap(2)`
+/// for a read-write page and then `mprotect(2)` to add `PROT_EXEC`
+/// (RW → RWX). Without the filter this succeeds for an unprivileged process;
+/// under `MemoryDenyWriteExecute=` the seccomp WX gate makes the `mprotect`
+/// with `PROT_WRITE|PROT_EXEC` return `EPERM`, the probe exits non-zero, and
+/// the marker records it. Both units run the same Python probe (no JIT, so
+/// startup creates no RWX mapping), so the unrestricted control passing `0`
+/// doubles as proof the probe logic itself is sound. Needs no root (the
+/// manager forces `NoNewPrivileges=` and installs the filter in the forked
+/// child); self-skips where a container forbids `prctl(PR_SET_SECCOMP)`.
+#[test]
+fn memory_deny_write_execute_blocks_wx_protect() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping memory_deny_write_execute_blocks_wx_protect: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two unit runs: an unrestricted control and a `MemoryDenyWriteExecute=yes`
+    // unit, each recording the probe's exit code to its own marker. The probe
+    // mmaps a R|W (prot=3) page, then mprotects it to R|W|X (prot=7).
+    let mut units = Vec::new();
+    for (i, name) in ["wx-allow.service", "wx-deny.service"].iter().enumerate() {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let cmd = format!(
+            "/usr/bin/python3 -c \"import ctypes,sys; \
+             libc=ctypes.CDLL(None); \
+             libc.mmap.restype=ctypes.c_void_p; \
+             libc.mmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_size_t]; \
+             libc.mprotect.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int]; \
+             libc.mprotect.restype=ctypes.c_int; \
+             a=libc.mmap(None,0x1000,3,0x22,-1,0); \
+             sys.exit(0 if libc.mprotect(a,0x1000,7)==0 else 1)\"; echo $? > {m}",
+            m = marker.display()
+        );
+        let sandbox = if i == 0 {
+            ""
+        } else {
+            "MemoryDenyWriteExecute=yes\n"
+        };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(
+                code, 0,
+                "unrestricted RW->RWX mprotect should succeed (got {code})"
+            );
+        } else {
+            assert_ne!(
+                code, 0,
+                "MemoryDenyWriteExecute=yes should block RW->RWX mprotect (got {code})"
+            );
+        }
+    }
+}

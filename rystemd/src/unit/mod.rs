@@ -361,6 +361,13 @@ pub struct SandboxConfig {
     pub af_deny: bool,
     pub af_families: Vec<u32>,
     pub af_deny_all: bool,
+    /// `MemoryDenyWriteExecute=`: deny via seccomp any attempt to create or
+    /// transition a memory mapping to *both* writable and executable — the
+    /// `mmap(2)`/`mprotect(2)`/`pkey_mprotect(2)` `prot` argument is checked
+    /// for `PROT_WRITE|PROT_EXEC`. Enforced on x86_64 Linux, where the
+    /// syscall-number table lives and the arg-checking seccomp engine runs;
+    /// where it cannot be enforced it is surfaced as a compat warning (below).
+    pub memory_deny_write_execute: bool,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -382,6 +389,7 @@ impl SandboxConfig {
             || self.lock_personality
             || self.restrict_suidsgid
             || self.af_present
+            || self.memory_deny_write_execute
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1316,6 +1324,22 @@ fn parse_sandbox(
                 .push(("RestrictAddressFamilies".to_string(), exp(v)));
         }
     }
+    // MemoryDenyWriteExecute=: deny mapping memory writable + executable
+    // (seccomp arg-gate on mmap/mprotect/pkey_mprotect's `prot`). Implemented
+    // on x86_64 Linux, where the arg-checking seccomp engine lives; elsewhere
+    // it stays a recognized-but-unimplemented compat warning. It also implies
+    // NoNewPrivileges= (a filter must be installed), like SystemCallFilter=.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = unit_scalar(raw, "Service", "MemoryDenyWriteExecute") {
+        s.memory_deny_write_execute = parse_bool(&exp(v))?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for v in raw.list("Service", "MemoryDenyWriteExecute") {
+        if !v.trim().is_empty() {
+            s.compat
+                .push(("MemoryDenyWriteExecute".to_string(), exp(v)));
+        }
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1396,7 +1420,6 @@ fn parse_sandbox(
     // can warn at load rather than silently ignore.
     const COMPAT: &[&str] = &[
         "SystemCallArchitectures",
-        "MemoryDenyWriteExecute",
         "RestrictNamespaces",
         "RemoveIPC",
         "DeviceAllow",
@@ -1865,6 +1888,30 @@ mod tests {
         .unwrap();
         let s2 = &f2.service.as_ref().unwrap().sandbox;
         assert!(s2.af_present && s2.af_deny && s2.af_deny_all);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn memory_deny_write_execute_parses_and_is_not_compat() {
+        let f = build_str(
+            "[Service]\nMemoryDenyWriteExecute=yes\nExecStart=/bin/true\n",
+            "mdwx.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(
+            s.memory_deny_write_execute,
+            "MemoryDenyWriteExecute=yes must be parsed"
+        );
+        // Implemented, so it must not remain a compat warning.
+        assert!(
+            !s.compat.iter().any(|(k, _)| k == "MemoryDenyWriteExecute"),
+            "MemoryDenyWriteExecute must not be flagged as unimplemented"
+        );
+        // Not set -> stays off.
+        let f2 = build_str("[Service]\nExecStart=/bin/true\n", "mdwx2.service").unwrap();
+        let s2 = &f2.service.as_ref().unwrap().sandbox;
+        assert!(!s2.memory_deny_write_execute);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

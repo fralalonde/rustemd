@@ -21,12 +21,14 @@ heavily on slices.
 ## Sandbox directives
 
 Many hardening directives are parsed but not (yet) enforced, and load with a
-warning rather than failing: `SystemCallFilter`, `ProtectKernelModules`,
-`MemoryDenyWriteExecute`, `DeviceAllow`, `RestrictNamespaces`, and others.
-Services that rely on them run but without that particular isolation. Enforced
-now (Linux/x86_64): `SystemCallFilter=`, `PrivateDevices=`,
-`RestrictRealtime=`, `LockPersonality=`, `RestrictSUIDSGID=`, and
-`RestrictAddressFamilies=`.
+warning rather than failing: `ProtectKernelModules`, `DeviceAllow`,
+`RestrictNamespaces`, and others. Services that rely on them run but without
+that particular isolation. Enforced now (Linux/x86_64): the mount-namespace
+set (`PrivateTmp=`, `PrivateDevices=`, `ProtectHome=`, `ProtectSystem=`,
+`ReadOnlyPaths=`), `NoNewPrivileges=`, `CapabilityBoundingSet=`,
+`AmbientCapabilities=`, and the seccomp set (`SystemCallFilter=`,
+`RestrictRealtime=`, `LockPersonality=`, `RestrictSUIDSGID=`,
+`RestrictAddressFamilies=`, `MemoryDenyWriteExecute=`).
 
 ## Condition / assertion support
 
