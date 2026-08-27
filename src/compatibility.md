@@ -22,11 +22,11 @@ heavily on slices.
 
 Many hardening directives are parsed but not (yet) enforced, and load with a
 warning rather than failing: `SystemCallFilter`, `ProtectKernelModules`,
-`PrivateDevices`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`,
-`DeviceAllow`, and others. Services that rely on them run
-but without that particular isolation. Enforced now (Linux/x86_64):
-`SystemCallFilter=`, `PrivateDevices=`, `RestrictRealtime=`, and
-`LockPersonality=`.
+`MemoryDenyWriteExecute`, `DeviceAllow`, `RestrictNamespaces`, and others.
+Services that rely on them run but without that particular isolation. Enforced
+now (Linux/x86_64): `SystemCallFilter=`, `PrivateDevices=`,
+`RestrictRealtime=`, `LockPersonality=`, `RestrictSUIDSGID=`, and
+`RestrictAddressFamilies=`.
 
 ## Condition / assertion support
 

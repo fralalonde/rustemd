@@ -159,7 +159,8 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
         let need_seccomp = !cfg.syscall_nrs.is_empty()
             || cfg.restrict_realtime
             || cfg.lock_personality
-            || cfg.restrict_suidsgid;
+            || cfg.restrict_suidsgid
+            || cfg.af_present;
         if need_seccomp {
             // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
             // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
@@ -198,7 +199,16 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             } else {
                 cfg.syscall_deny
             };
-            let program = build_seccomp(&cfg.syscall_nrs, deny, cfg.syscall_errno, &extra_deny);
+            let af = if cfg.af_present {
+                Some(AfGate {
+                    deny: cfg.af_deny,
+                    families: &cfg.af_families,
+                    deny_all: cfg.af_deny_all,
+                })
+            } else {
+                None
+            };
+            let program = build_seccomp(&cfg.syscall_nrs, deny, cfg.syscall_errno, &extra_deny, af);
             ops.push(Op::Seccomp(program));
         }
     }
@@ -617,14 +627,27 @@ pub fn resolve_syscalls(names: &[String]) -> Result<Vec<u32>, String> {
     seccomp::resolve(names)
 }
 
+/// `RestrictAddressFamilies=` gate passed into the seccomp builder: `socket(2)`
+/// and `socketpair(2)` are allowed only when the requested address family is
+/// permitted. `deny` is the `~`-prefix (deny the listed families, allow all
+/// others); `families` are the listed family numbers; `deny_all` is `~all`
+/// (every family denied when `deny`, or an allow-all no-op when not).
+#[cfg(target_arch = "x86_64")]
+pub struct AfGate<'a> {
+    pub deny: bool,
+    pub families: &'a [u32],
+    pub deny_all: bool,
+}
+
 #[cfg(target_arch = "x86_64")]
 fn build_seccomp(
     nrs: &[u32],
     deny: bool,
     errno: u32,
     extra_deny: &[u32],
+    af: Option<AfGate<'_>>,
 ) -> Vec<libc::sock_filter> {
-    seccomp::build(nrs, deny, errno, extra_deny)
+    seccomp::build(nrs, deny, errno, extra_deny, af)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -701,13 +724,27 @@ mod seccomp {
         deny: bool,
         errno: u32,
         extra_deny: &[u32],
+        af: Option<super::AfGate<'_>>,
     ) -> Vec<libc::sock_filter> {
         let errno = if errno == 0 {
             libc::EPERM as u32
         } else {
             errno
         };
+        let errno_ret = libc::SECCOMP_RET_ERRNO | (errno & 0xFFFF);
+        let allow_ret = libc::SECCOMP_RET_ALLOW;
+
+        let socket = syscall_nr("socket");
+        let socketpair = syscall_nr("socketpair");
+
+        // Plain entries: everything except the family-gated socket/socketpair,
+        // which are dispatched to the address-family gate instead.
         let mut entries: Vec<u32> = nrs.to_vec();
+        if af.is_some() {
+            for s in [socket, socketpair].into_iter().flatten() {
+                entries.retain(|e| *e != s);
+            }
+        }
         if !deny {
             for b in ALLOW_BASE {
                 if let Some(nr) = syscall_nr(b)
@@ -729,59 +766,177 @@ mod seccomp {
         entries.dedup();
 
         use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
-        // BPF_STMT/BPF_JUMP take a u16 code; the libc constants are u32.
-        macro_rules! stmt {
-            ($code:expr, $k:expr) => {
-                unsafe { libc::BPF_STMT(($code) as u16, $k) }
-            };
+        // Forward jump targets, resolved once the full layout is known.
+        // jt/jf are unsigned 8-bit *relative* offsets in the emitted program,
+        // so we assemble against absolute indices and convert at the end.
+        let ld = |k: u32| ((BPF_LD | BPF_W | BPF_ABS) as u16, k);
+        let jeq = |k: u32| ((BPF_JMP | BPF_JEQ | BPF_K) as u16, k);
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Tgt {
+            None,
+            I(usize),
+            Errno,
+            Allow,
+            Famarg,
+            /// The "not a gated socket" path: continue as an ordinary syscall
+            /// through the plain entries (falling back to `default_t` when
+            /// there are none). Never falls into the family-arg block.
+            Plain,
         }
-        macro_rules! jump {
-            ($k:expr, $jt:expr, $jf:expr) => {
-                unsafe { libc::BPF_JUMP((BPF_JMP | BPF_JEQ | BPF_K) as u16, $k, $jt, $jf) }
+        struct I {
+            code: u16,
+            k: u32,
+            jt: Tgt,
+            jf: Tgt,
+        }
+        let mut prog: Vec<I> = Vec::new();
+        // Append `(code,k)` as an instruction, returning its index.
+        macro_rules! push {
+            ($prog:expr, $ck:expr, $jt:expr, $jf:expr) => {{
+                let i = $prog.len();
+                let (code, k) = $ck;
+                $prog.push(I {
+                    code,
+                    k,
+                    jt: $jt,
+                    jf: $jf,
+                });
+                i
+            }};
+        }
+        let pick_t = |errno_side: bool| if errno_side { Tgt::Errno } else { Tgt::Allow };
+
+        // Default and per-entry decisions (from the SystemCallFilter list):
+        //   allow-list (deny=false) -> deny everything not listed
+        //   deny-list / standalone (deny=true) -> allow everything not listed
+        let default_t = pick_t(!deny);
+        let match_t = pick_t(deny);
+
+        // 0..2: arch check (foreign arch is let through), load `nr`.
+        push!(prog, ld(4), Tgt::None, Tgt::None);
+        push!(prog, jeq(AUDIT_ARCH_X86_64), Tgt::I(2), Tgt::Allow);
+        push!(prog, ld(0), Tgt::None, Tgt::None);
+
+        // `RestrictAddressFamilies=`: socket(2)/socketpair(2) are intercepted
+        // here and dispatched to the family gate. The SystemCallFilter list is
+        // the more restrictive of the two independent filters: a socket that
+        // the list already denies stays denied (the family gate can only
+        // *allow* families on a socket the list lets through).
+        let mut need_famarg = false;
+        if let Some(af) = af.as_ref() {
+            let fam_default_errno = if af.deny_all { af.deny } else { !af.deny };
+            // `~all`/`all` degenerate straight to a constant decision (no
+            // arg0 is loaded when every family resolves the same way).
+            let const_errno = af.deny_all || af.families.is_empty();
+            for s in [socket, socketpair].into_iter().flatten() {
+                let list_denies = if deny {
+                    nrs.contains(&s)
+                } else {
+                    !nrs.contains(&s)
+                };
+                let jt = if list_denies {
+                    Tgt::Errno
+                } else if const_errno {
+                    pick_t(fam_default_errno)
+                } else {
+                    need_famarg = true;
+                    Tgt::Famarg
+                };
+                push!(prog, jeq(s), jt, Tgt::Plain);
+            }
+            // A syscall that is not socket/socketpair must continue through the
+            // plain entries (or straight to the default when there are none) —
+            // it must NOT fall into the family-arg block below.
+            let plain_tgt = if entries.is_empty() {
+                default_t
+            } else {
+                Tgt::I(prog.len()) // index of the first plain entry
             };
+            for i in &mut prog {
+                if i.jt == Tgt::Plain {
+                    i.jt = plain_tgt;
+                }
+                if i.jf == Tgt::Plain {
+                    i.jf = plain_tgt;
+                }
+            }
         }
 
-        let n = entries.len();
-        let den = 3 + n; // index of the return-errno instruction
-        let ok = 4 + n; // index of the return-allow instruction
-        // jf of the arch check jumps to `ok` (foreign arch is let through).
-        let arch_jf = (ok - 2) as u8;
-        let mut prog = Vec::with_capacity(6 + n);
-
-        // 0: arch check
-        prog.push(stmt!(BPF_LD | BPF_W | BPF_ABS, 4));
-        // jt=0 → arch match falls through to the nr load at [2]. (A nonzero
-        // jump here would skip the nr load, leaving an undefined nr and never
-        // matching.)
-        prog.push(jump!(AUDIT_ARCH_X86_64, 0, arch_jf));
-        // 2: load nr
-        prog.push(stmt!(BPF_LD | BPF_W | BPF_ABS, 0));
-        // 3..3+n: compare each number. Equal → jump to `ok` for allow-list,
-        // `den` for deny-list. Non-match falls through to the next compare; for
-        // a deny-list the final non-match must jump to `ok` (allow), otherwise
-        // it falls into `den` and blocks *everything* not matching (the bug
-        // that made the fork e2e hang on `write`).
+        // Plain entries: equal -> match action; non-equal falls through to the next
+        // entry so a later (deny-list) entry can still match. Only the final entry's
+        // `jf` targets the default action.
         for (i, nr) in entries.iter().enumerate() {
-            let target = if deny {
-                den - (3 + i) - 1
+            // Fall through to the next entry's compare; the last entry targets the
+            // default return.
+            let jf = if i + 1 == entries.len() {
+                default_t
             } else {
-                ok - (3 + i) - 1
+                Tgt::I(prog.len() + 1)
             };
-            let fall_through = if deny && i + 1 == entries.len() {
-                (ok - (3 + i) - 1) as u8
-            } else {
-                0u8
-            };
-            prog.push(jump!(*nr, target as u8, fall_through));
+            push!(prog, jeq(*nr), match_t, jf);
         }
-        // den: return errno.
-        prog.push(stmt!(
-            BPF_RET | BPF_K,
-            libc::SECCOMP_RET_ERRNO | (errno & 0xFFFF)
-        ));
-        // ok: allow.
-        prog.push(stmt!(BPF_RET | BPF_K, libc::SECCOMP_RET_ALLOW));
-        prog
+
+        // Family-gate block (only when a socket compare needs arg0's family).
+        if need_famarg {
+            let famarg_idx = push!(prog, ld(16), Tgt::None, Tgt::None) /* load arg0 */;
+            let af = af.as_ref().unwrap();
+            // A listed family follows the `~`/allow decision; a family not
+            // listed takes the inferred default for this directive.
+            for f in af.families {
+                let fam_default_errno = if af.deny_all { af.deny } else { !af.deny };
+                push!(prog, jeq(*f), pick_t(af.deny), pick_t(fam_default_errno));
+            }
+            // Point every pending Famarg jump at the block's start.
+            for i in &mut prog {
+                if matches!(i.jt, Tgt::Famarg) {
+                    i.jt = Tgt::I(famarg_idx);
+                }
+                if matches!(i.jf, Tgt::Famarg) {
+                    i.jf = Tgt::I(famarg_idx);
+                }
+            }
+        }
+
+        // Terminal returns (shared). Patched targets reference these indices.
+        let errno_i = push!(
+            prog,
+            ((BPF_RET | BPF_K) as u16, errno_ret),
+            Tgt::None,
+            Tgt::None
+        );
+        let allow_i = push!(
+            prog,
+            ((BPF_RET | BPF_K) as u16, allow_ret),
+            Tgt::None,
+            Tgt::None
+        );
+
+        // Resolve targets to absolute indices, then to relative offsets.
+        let resolve = |t: Tgt| -> Option<usize> {
+            match t {
+                Tgt::None => None,
+                Tgt::I(i) => Some(i),
+                Tgt::Errno => Some(errno_i),
+                Tgt::Allow => Some(allow_i),
+                // Resolved to a concrete target in the socket-dispatch block.
+                Tgt::Famarg => unreachable!("Famarg forwarded"),
+                Tgt::Plain => unreachable!("Plain forwarded"),
+            }
+        };
+        prog.iter()
+            .enumerate()
+            .map(|(i, ins)| {
+                let jt = resolve(ins.jt).map(|t| (t - i - 1) as u8).unwrap_or(0);
+                let jf = resolve(ins.jf).map(|t| (t - i - 1) as u8).unwrap_or(0);
+                // A plain struct construction; no `unsafe` is needed.
+                libc::sock_filter {
+                    code: ins.code,
+                    jt,
+                    jf,
+                    k: ins.k,
+                }
+            })
+            .collect()
     }
 
     /// `(name, number)` for the syscalls rystemd can name. A curated but broad
@@ -1765,7 +1920,7 @@ mod tests {
         // Allow-list of a single syscall → the ALLOW_BASE is auto-added, so
         // expect >3 entries. Deny-list blocks `quotactl` (179).
         let nrs = seccomp::resolve(&["quotactl".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 1, &[]);
+        let prog = build_seccomp(&nrs, true, 1, &[], None);
         let n = nrs.len(); // 1
         // Layout: 3 prologue (arch load, arch jeq, nr load) + n compare
         // entries + 2 returns = 5 + n. (index of allow = 4 + n).
@@ -1800,7 +1955,7 @@ mod tests {
         // base), i.e. the built program must include the base numbers. Check
         // structurally: any number not in entries refers to `den`.
         let nrs = seccomp::resolve(&["read".into()]).unwrap();
-        let prog = build_seccomp(&nrs, false, 1, &[]);
+        let prog = build_seccomp(&nrs, false, 1, &[], None);
         // The allow-list's JEQ table covers all entries (base included); the
         // exit_group (231) must be present among the JEQ k values.
         let ks: Vec<u32> = prog.iter().map(|s| s.k).collect();
@@ -1855,7 +2010,7 @@ mod tests {
         // syscalls "succeed" (ERRNO|0 = success). The build defaults 0 to
         // EPERM (1), so the deny return carries EPERM.
         let nrs = seccomp::resolve(&["mkdirat".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 0, &[]);
+        let prog = build_seccomp(&nrs, true, 0, &[], None);
         // The deny return is the second-to-last instruction (the last is
         // ALLOW); it must carry SECCOMP_RET_ERRNO | EPERM, not | 0.
         let den_ret = &prog[prog.len() - 2];
@@ -1866,6 +2021,101 @@ mod tests {
             "deny return must be an ERRNO action"
         );
         assert_eq!(den_ret.k & 0xFFFF, 1, "errno 0 must default to EPERM (1)");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_address_families_gates_socket() {
+        use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_W};
+        // `RestrictAddressFamilies=AF_UNIX` alone (no SystemCallFilter) must
+        // install a seccomp filter that intercepts socket/socketpair and
+        // reads the family argument (offset 16), while allowing every other
+        // syscall through.
+        let c = cfg_with(|c| {
+            c.af_present = true;
+            c.af_families = vec![1]; // AF_UNIX
+        });
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("RestrictAddressFamilies must imply NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("RestrictAddressFamilies must install a seccomp op");
+        assert!(nnp < sec, "NNP must precede the family filter");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        // The family gate loads `seccomp_data.args[0]` (offset 16).
+        assert!(
+            prog.iter()
+                .any(|s| s.code == (BPF_LD | BPF_W | BPF_ABS) as u16 && s.k == 16),
+            "family gate must read the address-family argument"
+        );
+        // socket(41)/socketpair(53) are intercepted; AF_UNIX(1) is the only
+        // allowed family token.
+        let socket = 41u32;
+        let socketpair = 53u32;
+        let jeq: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16)
+            .map(|s| s.k)
+            .collect();
+        assert!(
+            jeq.contains(&socket) && jeq.contains(&socketpair),
+            "socket/socketpair must be dispatched to the family gate"
+        );
+        assert!(
+            jeq.contains(&1),
+            "the allowed family (AF_UNIX) must be compared against"
+        );
+        // Standalone (no SystemCallFilter) default is ALLOW: a non-matching
+        // syscall must not be blocked.
+        let allow = prog.last().unwrap();
+        assert_eq!(allow.k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_address_families_deny_all_blocks_socket_directly() {
+        // `RestrictAddressFamilies=~all` is a constant deny: no arg0 load is
+        // emitted; socket/socketpair jump straight to the errno return.
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| {
+            c.af_present = true;
+            c.af_deny = true;
+            c.af_deny_all = true;
+        });
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let (sock_i, sock_jeq) = prog
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k == 41)
+            .expect("socket must be intercepted");
+        // The intercept jumps straight to the ERRNO return (there is no
+        // family-arg block for `~all`).
+        let jt = sock_jeq.jt as usize;
+        let den = prog
+            .iter()
+            .position(|s| {
+                s.code == (libc::BPF_RET | libc::BPF_K) as u16
+                    && s.k & !0xFFFF == libc::SECCOMP_RET_ERRNO
+            })
+            .expect("a deny return must exist");
+        assert_eq!(
+            sock_i + jt + 1,
+            den,
+            "socket under `~all` must jump to the deny return"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

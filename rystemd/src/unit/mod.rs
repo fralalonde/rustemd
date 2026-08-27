@@ -350,6 +350,17 @@ pub struct SandboxConfig {
     /// binaries or relabel ownership. Enforced on x86_64 Linux; where it
     /// cannot be enforced it is a compat warning (below).
     pub restrict_suidsgid: bool,
+    /// `RestrictAddressFamilies=` (seccomp): gate `socket(2)`/`socketpair(2)`
+    /// on the address-family argument. `af_present` distinguishes a set
+    /// directive from `~all` (deny every family); `af_deny` is the `~`-prefix
+    /// (deny the listed families, allow all others); `af_families` are the
+    /// resolved socket-address-family numbers; `af_deny_all` is set by
+    /// `~all` (every family denied). Enforced on x86_64 Linux; where it
+    /// cannot be enforced it is surfaced as a compat warning (below).
+    pub af_present: bool,
+    pub af_deny: bool,
+    pub af_families: Vec<u32>,
+    pub af_deny_all: bool,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -370,6 +381,7 @@ impl SandboxConfig {
             || self.restrict_realtime
             || self.lock_personality
             || self.restrict_suidsgid
+            || self.af_present
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1280,6 +1292,30 @@ fn parse_sandbox(
             s.compat.push(("RestrictSUIDSGID".to_string(), exp(v)));
         }
     }
+    // RestrictAddressFamilies= (seccomp): gate `socket(2)`/`socketpair(2)` on
+    // the address-family argument. The family numbers themselves are
+    // architecture-independent, but the whole seccomp engine is x86_64-only,
+    // so the directive is parsed/enforced there and left as a compat warning
+    // everywhere else. `~`-prefixed lists deny the named families (all others
+    // allowed); an un-prefixed list allows only the named families.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = unit_scalar(raw, "Service", "RestrictAddressFamilies") {
+        let e = exp(v);
+        if !e.trim().is_empty() {
+            let (deny, families, deny_all) = parse_address_families(&e)?;
+            s.af_present = true;
+            s.af_deny = deny;
+            s.af_families = families;
+            s.af_deny_all = deny_all;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for v in raw.list("Service", "RestrictAddressFamilies") {
+        if !v.trim().is_empty() {
+            s.compat
+                .push(("RestrictAddressFamilies".to_string(), exp(v)));
+        }
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1360,7 +1396,6 @@ fn parse_sandbox(
     // can warn at load rather than silently ignore.
     const COMPAT: &[&str] = &[
         "SystemCallArchitectures",
-        "RestrictAddressFamilies",
         "MemoryDenyWriteExecute",
         "RestrictNamespaces",
         "RemoveIPC",
@@ -1390,6 +1425,98 @@ fn parse_sandbox(
         }
     }
     Ok(())
+}
+
+/// Parse `RestrictAddressFamilies=`, resolving name/number tokens to Linux
+/// `AF_*` values. Returns `(~ deny-list, family numbers, ~all-deny)`. A `~`
+/// prefix marks a deny-list (deny the listed families, allow all others); an
+/// ung-prefixed list allows only the listed families. `all` covers every
+/// family — meaning "deny all" under `~` and a (no-op) allow-all otherwise.
+/// Enforced only where the seccomp engine lives (Linux/x86_64), so this is
+/// `cfg`'d to that target to avoid an unused helper elsewhere.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn parse_address_families(v: &str) -> Result<(bool, Vec<u32>, bool), String> {
+    let mut deny = false;
+    let mut deny_all = false;
+    let mut families = Vec::new();
+    for tok in v.split_whitespace().filter(|t| !t.is_empty()) {
+        if tok.starts_with('~') {
+            deny = true;
+        }
+        let name = tok.trim_start_matches('~');
+        if name.eq_ignore_ascii_case("all") {
+            deny_all = true;
+            continue;
+        }
+        let n = address_family_number(name)
+            .ok_or_else(|| format!("RestrictAddressFamilies: unknown family `{name}`"))?;
+        families.push(n);
+    }
+    families.sort_unstable();
+    families.dedup();
+    Ok((deny, families, deny_all))
+}
+
+/// Map an `AF_*`-style name (optionally `AF_`-prefixed, case-insensitive) to a
+/// Linux socket-address-family number, parsing a bare integer as itself.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn address_family_number(name: &str) -> Option<u32> {
+    if let Ok(n) = name.parse::<u32>() {
+        return Some(n);
+    }
+    let up = name.to_ascii_uppercase();
+    let up = up.strip_prefix("AF_").unwrap_or(&up);
+    let fam = [
+        ("UNSPEC", 0),
+        ("UNIX", 1),
+        ("LOCAL", 1),
+        ("FILE", 1),
+        ("INET", 2),
+        ("AX25", 3),
+        ("IPX", 4),
+        ("APPLETALK", 5),
+        ("NETROM", 6),
+        ("BRIDGE", 7),
+        ("ATMPVC", 8),
+        ("X25", 9),
+        ("INET6", 10),
+        ("ROSE", 11),
+        ("DECnet", 12),
+        ("NETBEUI", 13),
+        ("SECURITY", 14),
+        ("KEY", 15),
+        ("NETLINK", 16),
+        ("ROUTE", 16),
+        ("PACKET", 17),
+        ("ASH", 18),
+        ("ECONET", 19),
+        ("ATMSVC", 20),
+        ("RDS", 21),
+        ("SNA", 22),
+        ("IRDA", 23),
+        ("PPPOX", 24),
+        ("WANPIPE", 25),
+        ("LLC", 26),
+        ("IB", 27),
+        ("MPLS", 28),
+        ("CAN", 29),
+        ("TIPC", 30),
+        ("BLUETOOTH", 31),
+        ("IUCV", 32),
+        ("RX", 33),
+        ("ISDN", 34),
+        ("PHONET", 35),
+        ("IEEE802154", 36),
+        ("CAIF", 37),
+        ("ALG", 38),
+        ("NFC", 39),
+        ("VSOCK", 40),
+        ("KCM", 41),
+        ("QIPCRTR", 42),
+        ("XDP", 44),
+        ("MCTP", 45),
+    ];
+    fam.iter().find(|(n, _)| *n == up).map(|(_, num)| *num)
 }
 
 /// Parse `ProtectHome=` values (`yes`, `read-only`, `tmpfs`, `no`).
@@ -1698,6 +1825,56 @@ mod tests {
         assert!(s.syscall_nrs.contains(&0)); // read
         assert!(s.syscall_nrs.contains(&1)); // write
         assert!(!s.syscall_nrs.contains(&231)); // exit_group is auto-added only in build(), not here
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn restrict_address_families_allow_list_parses() {
+        let f = build_str(
+            "[Service]\nRestrictAddressFamilies=AF_UNIX AF_INET\nExecStart=/bin/true\n",
+            "af.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(s.af_present);
+        assert!(!s.af_deny);
+        assert!(!s.af_deny_all);
+        assert_eq!(s.af_families, vec![1, 2]); // AF_UNIX, AF_INET (sorted)
+        // Implemented, so it must not remain a compat warning.
+        assert!(!s.compat.iter().any(|(k, _)| k == "RestrictAddressFamilies"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn restrict_address_families_deny_list_and_all_parse() {
+        // `~` prefix marks a deny-list.
+        let f = build_str(
+            "[Service]\nRestrictAddressFamilies=~AF_NETLINK\nExecStart=/bin/true\n",
+            "afd.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(s.af_present);
+        assert!(s.af_deny);
+        assert_eq!(s.af_families, vec![16]); // AF_NETLINK
+        // Numeric tokens and `~all` (deny every family).
+        let f2 = build_str(
+            "[Service]\nRestrictAddressFamilies=~all\nExecStart=/bin/true\n",
+            "afd2.service",
+        )
+        .unwrap();
+        let s2 = &f2.service.as_ref().unwrap().sandbox;
+        assert!(s2.af_present && s2.af_deny && s2.af_deny_all);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn restrict_address_families_unknown_rejected() {
+        let f = build_str(
+            "[Service]\nRestrictAddressFamilies=AF_FAKE\nExecStart=/bin/true\n",
+            "afx.service",
+        );
+        assert!(f.is_err(), "unknown family must fail the unit at load");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

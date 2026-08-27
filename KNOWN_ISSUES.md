@@ -33,7 +33,8 @@
   control** (mount namespace, `PrivateTmp=`, `ProtectHome=`, `ProtectSystem=`,
   `ReadOnlyPaths=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`,
   `AmbientCapabilities=`, `SystemCallFilter=`, `PrivateDevices=`,
-  `RestrictRealtime=`, `LockPersonality=`) — no
+  `RestrictRealtime=`, `LockPersonality=`, `RestrictSUIDSGID=`,
+  `RestrictAddressFamilies=`) — no
   `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
@@ -167,8 +168,13 @@ folding it into a `SystemCallFilter=` deny-list and an `e2e` test
 file-mode syscalls that could set an SUID/SGID bit or relabel ownership
 (`chmod`/`fchmod`/`fchmodat`/`chown`/`fchown`/`lchown`/`fchownat`), with unit
 tests and an `e2e` test (`restrict_suidsgid_blocks_chmod`) that has coreutils
-`chmod 6755` fail under the filter. Still unimplemented: the rest of the
-Phase-2/3 family — `MemoryDenyWriteExecute=`, `DynamicUser=`,
+`chmod 6755` fail under the filter. `RestrictAddressFamilies=` is enforced as
+a seccomp gate on `socket(2)`/`socketpair(2)`: the family argument is compared
+against the directive's list (`~`-prefixed lists deny the named families, an
+un-prefixed list allows only those), with unit tests on the BPF layout and an
+`e2e` test (`restrict_address_families_allows_only_unix`) covering the
+allow-list form against a real `socket(AF_INET)` probe. Still unimplemented:
+the rest of the Phase-2/3 family — `MemoryDenyWriteExecute=`, `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`, `IPAddress*`,
 `RemoveIPC=`. All of the latter are **parsed and emit a per-unit compat
 warning at load** rather than being silently ignored.

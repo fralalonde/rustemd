@@ -336,3 +336,70 @@ fn restrict_suidsgid_blocks_chmod() {
         }
     }
 }
+
+/// `RestrictAddressFamilies=AF_UNIX` (an allow-list of a single family) blocks
+/// creation of sockets in any other family. We probe with Python opening an
+/// `AF_INET`/`SOCK_STREAM` socket — a *privilege-free* call that succeeds for
+/// an unprivileged process — while under the directive the seccomp family gate
+/// makes the `socket(2)` syscall return `EPERM`, the interpreter raises, and
+/// `python3` exits non-zero. The probe needs no root (the manager forces
+/// `NoNewPrivileges=` and installs the filter in the forked child); it
+/// self-skips where a container forbids `prctl(PR_SET_SECCOMP)` altogether.
+#[test]
+fn restrict_address_families_allows_only_unix() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping restrict_address_families_allows_only_unix: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two unit runs: an unrestricted control and a `RestrictAddressFamilies=`
+    // unit, each recording the probe's exit code to its own marker. The probe
+    // opens an AF_INET stream socket; importing python's `socket` module
+    // creates no sockets of its own.
+    let mut units = Vec::new();
+    for (i, name) in ["af-allow.service", "af-deny.service"].iter().enumerate() {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let cmd = format!(
+            "/usr/bin/python3 -c \"import socket;socket.socket(socket.AF_INET, \
+             socket.SOCK_STREAM)\"; echo $? > {m}",
+            m = marker.display()
+        );
+        let sandbox = if i == 0 {
+            ""
+        } else {
+            "RestrictAddressFamilies=AF_UNIX\n"
+        };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(
+                code, 0,
+                "unrestricted AF_INET socket should be created (got {code})"
+            );
+        } else {
+            assert_ne!(
+                code, 0,
+                "RestrictAddressFamilies=AF_UNIX should block AF_INET sockets (got {code})"
+            );
+        }
+    }
+}
