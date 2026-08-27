@@ -110,7 +110,7 @@ On Linux (e.g. an immutable Bazzite/Fedora-Atomic image) install from a tap
 without layering via `rpm-ostree`:
 
 ```sh
-brew tap fralalonde/rystemd
+brew tap rystemd/rystemd
 brew install rystemd
 ```
 
