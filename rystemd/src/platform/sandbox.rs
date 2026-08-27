@@ -149,7 +149,11 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     {
         // x86_64 syscall numbers for the `RestrictRealtime=` deny set.
         const RT_DENY: [u32; 3] = [144, 314, 142]; // sched_setscheduler, sched_setattr, sched_setparam
-        let need_seccomp = !cfg.syscall_nrs.is_empty() || cfg.restrict_realtime;
+        // `LockPersonality=` denies `personality(2)` entirely (syscall 135 on
+        // x86_64), so the service cannot switch execution domains or drop ASLR.
+        const PERSONALITY: u32 = 135;
+        let need_seccomp =
+            !cfg.syscall_nrs.is_empty() || cfg.restrict_realtime || cfg.lock_personality;
         if need_seccomp {
             // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
             // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
@@ -166,11 +170,13 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             if !cfg.no_new_privileges {
                 ops.push(Op::NoNewPrivileges);
             }
-            let extra_deny: Vec<u32> = if cfg.restrict_realtime {
-                RT_DENY.to_vec()
-            } else {
-                Vec::new()
-            };
+            let mut extra_deny: Vec<u32> = Vec::new();
+            if cfg.restrict_realtime {
+                extra_deny.extend_from_slice(&RT_DENY);
+            }
+            if cfg.lock_personality {
+                extra_deny.push(PERSONALITY);
+            }
             // `RestrictRealtime=` is inherently a *deny* of a few syscalls.
             // When it stands alone (no `SystemCallFilter=`), a deny-list is the
             // only correct interpretation (deny the RT calls, allow everything
@@ -1942,6 +1948,70 @@ mod tests {
                 "RT syscall {nr} must be a deny entry"
             );
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lock_personality_forces_nnp_and_denies_personality() {
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| c.lock_personality = true);
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("LockPersonality must force NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("LockPersonality must install a seccomp op");
+        assert!(nnp < sec, "NNP must precede the LockPersonality filter");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        // Standalone `LockPersonality=` is a *deny*-list (deny `personality`,
+        // allow everything else, incl. `execve`), so `personality` (135) must
+        // be an explicit deny entry but the table must stay small.
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        assert!(
+            entries.contains(&135),
+            "personality(2) must be denied by LockPersonality"
+        );
+        assert!(
+            entries.len() <= 5,
+            "standalone LockPersonality must be a deny-list ({} entries)",
+            entries.len()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lock_personality_folds_into_deny_list() {
+        // Combined with a `SystemCallFilter=~` deny-list, `personality` is
+        // merged into the deny entries rather than swallowed by the passive
+        // allow-everything tail.
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| {
+            c.lock_personality = true;
+            c.syscall_deny = true;
+        });
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        assert!(entries.contains(&135), "personality must be a deny entry");
     }
 
     // End-to-end kernel enforcement of a seccomp deny-list is environment

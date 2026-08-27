@@ -339,6 +339,11 @@ pub struct SandboxConfig {
     /// Enforced on x86_64 Linux, where the syscall-number table lives; where
     /// it cannot be enforced it is surfaced as a compat warning (below).
     pub restrict_realtime: bool,
+    /// `LockPersonality=`: deny the `personality(2)` syscall via seccomp, so
+    /// the process (and any setuid/exec'd child) cannot switch execution
+    /// domains or drop ASLR hardening. Enforced on x86_64 Linux; where it
+    /// cannot be enforced it is a compat warning (below).
+    pub lock_personality: bool,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -357,6 +362,7 @@ impl SandboxConfig {
             || !self.ambient_set.is_empty()
             || !self.syscall_nrs.is_empty()
             || self.restrict_realtime
+            || self.lock_personality
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1239,6 +1245,19 @@ fn parse_sandbox(
             s.compat.push(("RestrictRealtime".to_string(), exp(v)));
         }
     }
+    // LockPersonality=: a pure deny of the `personality(2)` syscall (reuses
+    // the seccomp machinery). Enforced on x86_64 Linux; elsewhere a compat
+    // warning.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = unit_scalar(raw, "Service", "LockPersonality") {
+        s.lock_personality = parse_bool(&exp(v))?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for v in raw.list("Service", "LockPersonality") {
+        if !v.trim().is_empty() {
+            s.compat.push(("LockPersonality".to_string(), exp(v)));
+        }
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1321,7 +1340,6 @@ fn parse_sandbox(
         "SystemCallArchitectures",
         "RestrictAddressFamilies",
         "MemoryDenyWriteExecute",
-        "LockPersonality",
         "RestrictNamespaces",
         "RestrictSUIDSGID",
         "RemoveIPC",
@@ -1748,6 +1766,24 @@ mod tests {
         // The default (unset) is off.
         let f2 = build_str("[Service]\nExecStart=/bin/true\n", "rr2.service").unwrap();
         assert!(!f2.service.as_ref().unwrap().sandbox.restrict_realtime);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn lock_personality_parses_and_is_implemented() {
+        let f = build_str(
+            "[Service]\nLockPersonality=yes\nExecStart=/bin/true\n",
+            "lp.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(s.lock_personality, "LockPersonality=yes should be recorded");
+        assert!(s.has_sandbox());
+        // It must not masquerade as recognized-but-unimplemented compat.
+        assert!(!s.compat.iter().any(|(k, _)| k == "LockPersonality"));
+        // The default (unset) is off.
+        let f2 = build_str("[Service]\nExecStart=/bin/true\n", "lp2.service").unwrap();
+        assert!(!f2.service.as_ref().unwrap().sandbox.lock_personality);
     }
 
     #[test]

@@ -34,6 +34,25 @@ derived from Git tags via `build.rs` (never hardcoded).
   syscall while an unfiltered control succeeds — the sandbox-isolation e2e gap.
   Unit tests cover the `NoNewPrivileges` implication, the `EPERM` default, and
   the errno-0 builder guard.
+- **`LockPersonality=`** (Linux/x86_64) now enforces: it denies the
+  `personality(2)` syscall outright via the seccomp BPF machinery, so a managed
+  service cannot switch execution domains or drop ASLR hardening. It implies
+  `NoNewPrivileges=` and composes with `SystemCallFilter=` (merged into a
+  deny-list as an extra deny entry; harmless alone under an allow-list).
+  Enforced by an e2e test (`lock_personality_blocks_personality`) that probes
+  the syscall through Python `ctypes` — version-proof across Python releases —
+  plus unit tests for parsing, the `NoNewPrivileges` implication, and deny-list
+  folding.
+- **`PrivateDevices=`** (Linux) now enforces: it shadows `/dev` with a fresh
+  tmpfs holding a minimal core device tree (null/zero/full/random/urandom/tty,
+  `devpts`, `/dev/shm`, `/dev/fd` symlinks), hiding host devices. A user-mode
+  manager degrades best-effort (warns, runs with `/dev` unsandboxed) because
+  `mknod` is refused in an unprivileged user namespace; the privileged e2e test
+  runs only under real root.
+- **`CapabilityBoundingSet=` and `AmbientCapabilities=`** (Linux/x86_64,
+  phase-2c) now enforce: `drop-from` or `~`-inverted bounding-set reduction via
+  `prctl(PR_CAPBSET_DROP)`, and best-effort `PR_CAP_AMBIENT_RAISE` for the
+  ambient set.
 
 ## [0.1.0] — Unreleased
 

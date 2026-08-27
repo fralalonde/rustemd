@@ -32,7 +32,8 @@
   is Phase-1 plus capability/seccomp/private-device
   control** (mount namespace, `PrivateTmp=`, `ProtectHome=`, `ProtectSystem=`,
   `ReadOnlyPaths=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`,
-  `AmbientCapabilities=`, `SystemCallFilter=`, `PrivateDevices=`) — no
+  `AmbientCapabilities=`, `SystemCallFilter=`, `PrivateDevices=`,
+  `RestrictRealtime=`, `LockPersonality=`) — no
   `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
@@ -159,11 +160,15 @@ unsandboxed) and the privileged e2e test only runs under real root.
 scheduler syscalls (`sched_setscheduler`/`sched_setattr`/`sched_setparam`) with
 an `e2e` test (`restrict_realtime_denies_sched_setscheduler`) probing via a
 privilege-free `os.sched_setscheduler`; it also implies `NoNewPrivileges=` (it
-needs a filter installed). Still
+needs a filter installed). `LockPersonality=` has the same seccomp shape: it
+denies `personality(2)` outright (so a service cannot switch execution domains
+or drop ASLR hardening), with unit tests folding it into a `SystemCallFilter=`
+deny-list and an `e2e` test (`lock_personality_blocks_personality`) probing the
+syscall through `ctypes` (version-proof across Python releases). Still
 unimplemented: the rest of the Phase-2/3 family —
 `MemoryDenyWriteExecute=`, `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
-`RestrictSUIDSGID`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
+`RestrictSUIDSGID`, `IPAddress*`, `RemoveIPC=`. All of the latter
 are **parsed and emit a per-unit compat warning at load** rather than being
 silently ignored.
 

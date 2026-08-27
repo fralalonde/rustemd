@@ -207,3 +207,66 @@ fn restrict_realtime_denies_sched_setscheduler() {
         }
     }
 }
+
+/// `LockPersonality=yes` blocks the `personality(2)` syscall. We probe with
+/// Python's `ctypes` to call libc's `personality(0)` directly — a
+/// *privilege-free* no-change query that returns the current persona (`0` for
+/// `PER_LINUX`) for an unprivileged process already on that persona, without
+/// an argument-dependent error. (The higher-level `os.personality` is used
+/// elsewhere, but was removed in Python 3.13, so `ctypes` keeps this probe
+/// version-proof.) Under `LockPersonality=` the seccomp filter denies
+/// `personality` with `EPERM`, so `ctypes` returns `-1`, the probe exits
+/// non-zero, and `python3` records a non-zero marker. Needs no root (the
+/// manager forces `NoNewPrivileges=` and installs the filter in the forked
+/// child); self-skips where a container forbids `prctl(PR_SET_SECCOMP)`.
+#[test]
+fn lock_personality_blocks_personality() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping lock_personality_blocks_personality: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two unit runs: an unrestricted control and a `LockPersonality=yes` unit,
+    // each recording the probe's exit code to its own marker.
+    let mut units = Vec::new();
+    for (i, name) in ["lp-allow.service", "lp-deny.service"].iter().enumerate() {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let cmd = format!(
+            "/usr/bin/python3 -c \"import ctypes,sys;sys.exit(0 if ctypes.CDLL(None).personality(0) >= 0 else 1)\"; echo $? > {m}",
+            m = marker.display()
+        );
+        let sandbox = if i == 0 { "" } else { "LockPersonality=yes\n" };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(
+                code, 0,
+                "unrestricted personality query should succeed (got {code})"
+            );
+        } else {
+            assert_ne!(
+                code, 0,
+                "LockPersonality=yes should block personality(2) (got {code})"
+            );
+        }
+    }
+}
