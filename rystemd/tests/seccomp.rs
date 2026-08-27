@@ -146,3 +146,64 @@ fn systemcallfilter_denylist_blocks_syscall() {
         }
     }
 }
+
+/// `RestrictRealtime=yes` blocks the realtime-scheduler syscalls. We probe
+/// with Python's `os.sched_setscheduler` — a *privilege-free* call to
+/// `sched_setscheduler(0, SCHED_OTHER, prio 0)` succeeds for an unprivileged
+/// process (verified), while under `RestrictRealtime=` the seccomp filter
+/// makes it fail with `EPERM`, so the interpreted `os.sched_setscheduler` call
+/// raises and `python3` exits non-zero. Like the `SystemCallFilter=` case,
+/// this needs no root: the manager forces `NoNewPrivileges=` and installs the
+/// filter in the forked child; it still self-skips if the container forbids
+/// `prctl(PR_SET_SECCOMP)` altogether.
+#[test]
+fn restrict_realtime_denies_sched_setscheduler() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping restrict_realtime_denies_sched_setscheduler: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two unit runs: an unrestricted control and a `RestrictRealtime=yes`
+    // unit, each recording the probe's exit code to its own marker.
+    let mut units = Vec::new();
+    for (i, name) in ["rr-allow.service", "rr-deny.service"].iter().enumerate() {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let cmd = format!(
+            "/usr/bin/python3 -c \"import os;os.sched_setscheduler(0,os.SCHED_OTHER,os.sched_param(0))\"; echo $? > {m}",
+            m = marker.display()
+        );
+        let sandbox = if i == 0 { "" } else { "RestrictRealtime=yes\n" };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(
+                code, 0,
+                "unrestricted sched_setscheduler should succeed (got {code})"
+            );
+        } else {
+            assert_ne!(
+                code, 0,
+                "RestrictRealtime=yes should block sched_setscheduler (got {code})"
+            );
+        }
+    }
+}

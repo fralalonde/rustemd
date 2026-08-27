@@ -24,7 +24,8 @@ Many hardening directives are parsed but not (yet) enforced, and load with a
 warning rather than failing: `SystemCallFilter`, `ProtectKernelModules`,
 `PrivateDevices`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`,
 `LockPersonality`, `DeviceAllow`, and others. Services that rely on them run
-but without that particular isolation.
+but without that particular isolation. Enforced now (Linux/x86_64):
+`SystemCallFilter=`, `PrivateDevices=`, and `RestrictRealtime=`.
 
 ## Condition / assertion support
 

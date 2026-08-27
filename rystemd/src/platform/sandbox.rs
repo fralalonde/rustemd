@@ -137,29 +137,55 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             ops.push(Op::AmbientRaise(caps));
         }
     }
-    // SystemCallFilter=: the syscall numbers are pre-resolved at parse time
-    // (so unknown names fail the unit at load, not spawn); here we just build
-    // the pure BPF program and hand it to the child. Only meaningful on
-    // x86_64, where the syscall-number table lives (other arches keep the
-    // directive as a parse-time compat warning).
+    // SystemCallFilter= (seccomp): the syscall numbers are pre-resolved at
+    // parse time (so unknown names fail the unit at load, not spawn); here we
+    // just build the pure BPF program and hand it to the child. Only
+    // meaningful on x86_64, where the syscall-number table lives (other arches
+    // keep the directive as a parse-time compat warning). `RestrictRealtime=`
+    // rides the same machinery: a pure deny of the realtime-scheduler syscalls
+    // (`sched_setscheduler`/`sched_setattr`/`sched_setparam`), so both share
+    // one install.
     #[cfg(target_arch = "x86_64")]
-    if !cfg.syscall_nrs.is_empty() {
-        // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
-        // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
-        // A user-mode manager has neither, so without this a
-        // `SystemCallFilter=` unit would refuse to spawn with EACCES.
-        // systemd draws the same conclusion (systemd.exec: `SystemCallFilter=`
-        // overrides/implies `NoNewPrivileges=`), so we force it whenever a
-        // filter is going to be installed — unless the unit already asked.
-        // Push it *before* the Seccomp op. Note AmbientCapabilities raising
-        // needs no_new_privs OFF, so a unit that sets both degrades to
-        // ambient best-effort (warned at apply) — the seccomp requirement
-        // always wins, matching systemd's inability to combine them.
-        if !cfg.no_new_privileges {
-            ops.push(Op::NoNewPrivileges);
+    {
+        // x86_64 syscall numbers for the `RestrictRealtime=` deny set.
+        const RT_DENY: [u32; 3] = [144, 314, 142]; // sched_setscheduler, sched_setattr, sched_setparam
+        let need_seccomp = !cfg.syscall_nrs.is_empty() || cfg.restrict_realtime;
+        if need_seccomp {
+            // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
+            // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
+            // A user-mode manager has neither, so without this a
+            // `SystemCallFilter=`/`RestrictRealtime=` unit would refuse to
+            // spawn with EACCES. systemd draws the same conclusion
+            // (systemd.exec: `SystemCallFilter=` overrides/implies
+            // `NoNewPrivileges=`), so we force it whenever a filter is going to
+            // be installed — unless the unit already asked. Push it *before*
+            // the Seccomp op. Note AmbientCapabilities raising needs
+            // no_new_privs OFF, so a unit that sets both degrades to ambient
+            // best-effort (warned at apply) — the seccomp requirement always
+            // wins, matching systemd's inability to combine them.
+            if !cfg.no_new_privileges {
+                ops.push(Op::NoNewPrivileges);
+            }
+            let extra_deny: Vec<u32> = if cfg.restrict_realtime {
+                RT_DENY.to_vec()
+            } else {
+                Vec::new()
+            };
+            // `RestrictRealtime=` is inherently a *deny* of a few syscalls.
+            // When it stands alone (no `SystemCallFilter=`), a deny-list is the
+            // only correct interpretation (deny the RT calls, allow everything
+            // else) — an allow-list would permit only [`ALLOW_BASE`] and refuse
+            // to even `execve` the service. When combined with a
+            // `SystemCallFilter=` the caller's mode wins (an allow-list denies
+            // the RT calls implicitly; a deny-list folds them into its entries).
+            let deny = if cfg.syscall_nrs.is_empty() {
+                true
+            } else {
+                cfg.syscall_deny
+            };
+            let program = build_seccomp(&cfg.syscall_nrs, deny, cfg.syscall_errno, &extra_deny);
+            ops.push(Op::Seccomp(program));
         }
-        let program = build_seccomp(&cfg.syscall_nrs, cfg.syscall_deny, cfg.syscall_errno);
-        ops.push(Op::Seccomp(program));
     }
     Some(ops)
 }
@@ -577,8 +603,13 @@ pub fn resolve_syscalls(names: &[String]) -> Result<Vec<u32>, String> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn build_seccomp(nrs: &[u32], deny: bool, errno: u32) -> Vec<libc::sock_filter> {
-    seccomp::build(nrs, deny, errno)
+fn build_seccomp(
+    nrs: &[u32],
+    deny: bool,
+    errno: u32,
+    extra_deny: &[u32],
+) -> Vec<libc::sock_filter> {
+    seccomp::build(nrs, deny, errno, extra_deny)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -624,12 +655,19 @@ mod seccomp {
     /// through untouched. Then load `nr` (offset 0) and linearly compare
     /// against each listed number. An allow-list denies everything not listed
     /// (plus [`ALLOW_BASE`]); a deny-list allows everything not listed.
-    pub fn build(nrs: &[u32], deny: bool, errno: u32) -> Vec<libc::sock_filter> {
-        // A blocked syscall must fail with a real error. `errno == 0` would
-        // make the kernel return 0 — indistinguishable from success (the bug
-        // that let a `~mkdir` deny-list "allow" mkdirat). systemd's default
-        // is EPERM; guard against 0 here too, so programmatic configs that
-        // skip the parser can't silently weaken the filter.
+    ///
+    /// `extra_deny` is a set of syscall numbers that must *always* be denied
+    /// (used by `RestrictRealtime=`), independent of the `SystemCallFilter=`
+    /// mode. For an allow-list these are already denied by the default
+    /// deny-action; for a deny-list they are merged into the entries so they
+    /// keep their errno response rather than being swallowed by the passive
+    /// "allow everything else" tail.
+    pub fn build(
+        nrs: &[u32],
+        deny: bool,
+        errno: u32,
+        extra_deny: &[u32],
+    ) -> Vec<libc::sock_filter> {
         let errno = if errno == 0 {
             libc::EPERM as u32
         } else {
@@ -644,8 +682,17 @@ mod seccomp {
                     entries.push(nr);
                 }
             }
-            entries.sort_unstable();
+        } else {
+            // A deny-list's tail allows everything unmatched; fold the
+            // hard-deny extras in so they hit the errno return instead.
+            for nr in extra_deny {
+                if !entries.contains(nr) {
+                    entries.push(*nr);
+                }
+            }
         }
+        entries.sort_unstable();
+        entries.dedup();
 
         use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
         // BPF_STMT/BPF_JUMP take a u16 code; the libc constants are u32.
@@ -1684,7 +1731,7 @@ mod tests {
         // Allow-list of a single syscall → the ALLOW_BASE is auto-added, so
         // expect >3 entries. Deny-list blocks `quotactl` (179).
         let nrs = seccomp::resolve(&["quotactl".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 1);
+        let prog = build_seccomp(&nrs, true, 1, &[]);
         let n = nrs.len(); // 1
         // Layout: 3 prologue (arch load, arch jeq, nr load) + n compare
         // entries + 2 returns = 5 + n. (index of allow = 4 + n).
@@ -1719,7 +1766,7 @@ mod tests {
         // base), i.e. the built program must include the base numbers. Check
         // structurally: any number not in entries refers to `den`.
         let nrs = seccomp::resolve(&["read".into()]).unwrap();
-        let prog = build_seccomp(&nrs, false, 1);
+        let prog = build_seccomp(&nrs, false, 1, &[]);
         // The allow-list's JEQ table covers all entries (base included); the
         // exit_group (231) must be present among the JEQ k values.
         let ks: Vec<u32> = prog.iter().map(|s| s.k).collect();
@@ -1774,7 +1821,7 @@ mod tests {
         // syscalls "succeed" (ERRNO|0 = success). The build defaults 0 to
         // EPERM (1), so the deny return carries EPERM.
         let nrs = seccomp::resolve(&["mkdirat".into()]).unwrap();
-        let prog = build_seccomp(&nrs, true, 0);
+        let prog = build_seccomp(&nrs, true, 0, &[]);
         // The deny return is the second-to-last instruction (the last is
         // ALLOW); it must carry SECCOMP_RET_ERRNO | EPERM, not | 0.
         let den_ret = &prog[prog.len() - 2];
@@ -1785,6 +1832,116 @@ mod tests {
             "deny return must be an ERRNO action"
         );
         assert_eq!(den_ret.k & 0xFFFF, 1, "errno 0 must default to EPERM (1)");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_realtime_forces_nnp_and_denies_scheduler_syscalls() {
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| c.restrict_realtime = true);
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("RestrictRealtime must force NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("RestrictRealtime must install a seccomp op");
+        assert!(nnp < sec, "NNP must precede the RestrictRealtime filter");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        // Standalone `RestrictRealtime=` (no `SystemCallFilter=`) is a
+        // *deny*-list: the RT syscalls are explicit deny entries (so execve
+        // and everything else still work), not an allow-list that would permit
+        // only the base set. Collect the JEQ entries (excluding the arch
+        // probe) and require the RT numbers among them.
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        for nr in [144u32, 314, 142] {
+            // sched_setscheduler, sched_setattr, sched_setparam
+            assert!(
+                entries.contains(&nr),
+                "RestrictRealtime syscall {nr} must be denied"
+            );
+        }
+        // A deny-of-a-few means a small entry count (not the whole table),
+        // confirming the deny-list reading the service can still `execve`.
+        assert!(
+            entries.len() <= 10,
+            "standalone RestrictRealtime must be a deny-list ({} entries)",
+            entries.len()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_realtime_respects_systemcallfilter_allow_list() {
+        // Combined with an *allow*-list `SystemCallFilter=`, the caller's mode
+        // wins: the allow entries stay, and the RT syscalls are denied
+        // implicitly (they are simply not in the allowed set).
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| {
+            c.restrict_realtime = true;
+            c.syscall_nrs = vec![0]; // an allow-list of `read`
+            c.syscall_deny = false;
+        });
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let allowed: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        assert!(allowed.contains(&0), "`read` must remain allowed");
+        for nr in [144u32, 314, 142] {
+            assert!(
+                !allowed.contains(&nr),
+                "RT syscall {nr} must not be allowed"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_realtime_folds_into_deny_list() {
+        // Combined with a `SystemCallFilter=~` deny-list, the RT syscalls are
+        // merged into the deny entries so they hit the errno return rather
+        // than falling through the allow-everything tail.
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| {
+            c.restrict_realtime = true;
+            c.syscall_deny = true;
+        });
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        for nr in [144u32, 314, 142] {
+            assert!(
+                entries.contains(&nr),
+                "RT syscall {nr} must be a deny entry"
+            );
+        }
     }
 
     // End-to-end kernel enforcement of a seccomp deny-list is environment

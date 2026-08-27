@@ -334,6 +334,11 @@ pub struct SandboxConfig {
     /// `SystemCallErrorNumber=`: errno returned for filtered calls (default
     /// `EPERM`).
     pub syscall_errno: u32,
+    /// `RestrictRealtime=`: deny the realtime-scheduler syscalls
+    /// (`sched_setscheduler`/`sched_setattr`/`sched_setparam`) via seccomp.
+    /// Enforced on x86_64 Linux, where the syscall-number table lives; where
+    /// it cannot be enforced it is surfaced as a compat warning (below).
+    pub restrict_realtime: bool,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -351,6 +356,7 @@ impl SandboxConfig {
             || !self.bounding_set.is_empty()
             || !self.ambient_set.is_empty()
             || !self.syscall_nrs.is_empty()
+            || self.restrict_realtime
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1219,6 +1225,20 @@ fn parse_sandbox(
     if let Some(v) = unit_scalar(raw, "Service", "PrivateDevices") {
         s.private_devices = parse_bool(&exp(v))?;
     }
+    // RestrictRealtime=: a pure syscall deny (sched_setscheduler/sched_setattr/
+    // sched_setparam) enforced via the seccomp BPF machinery. Only meaningful
+    // on x86_64 Linux, where the syscall-number table lives; elsewhere it stays
+    // a recognized-but-unimplemented compat warning (below).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = unit_scalar(raw, "Service", "RestrictRealtime") {
+        s.restrict_realtime = parse_bool(&exp(v))?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for v in raw.list("Service", "RestrictRealtime") {
+        if !v.trim().is_empty() {
+            s.compat.push(("RestrictRealtime".to_string(), exp(v)));
+        }
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1303,7 +1323,6 @@ fn parse_sandbox(
         "MemoryDenyWriteExecute",
         "LockPersonality",
         "RestrictNamespaces",
-        "RestrictRealtime",
         "RestrictSUIDSGID",
         "RemoveIPC",
         "DeviceAllow",
@@ -1708,6 +1727,27 @@ mod tests {
         // The default (unset) is off.
         let f2 = build_str("[Service]\nExecStart=/bin/true\n", "pd2.service").unwrap();
         assert!(!f2.service.as_ref().unwrap().sandbox.private_devices);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn restrict_realtime_parses_and_is_implemented() {
+        let f = build_str(
+            "[Service]\nRestrictRealtime=yes\nExecStart=/bin/true\n",
+            "rr.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(
+            s.restrict_realtime,
+            "RestrictRealtime=yes should be recorded"
+        );
+        assert!(s.has_sandbox());
+        // It must not masquerade as recognized-but-unimplemented compat.
+        assert!(!s.compat.iter().any(|(k, _)| k == "RestrictRealtime"));
+        // The default (unset) is off.
+        let f2 = build_str("[Service]\nExecStart=/bin/true\n", "rr2.service").unwrap();
+        assert!(!f2.service.as_ref().unwrap().sandbox.restrict_realtime);
     }
 
     #[test]

@@ -154,11 +154,16 @@ tree (null/zero/full/random/urandom/tty + private `devpts`/`/dev/shm`, `/dev/fd`
 symlinks), hiding host devices. Because device-node creation (`mknod`) is
 refused inside an unprivileged user namespace, a user-mode manager's
 `PrivateDevices=` degrades best-effort (warns; the unit runs with /dev
-unsandboxed) and the privileged e2e test only runs under real root. Still
+unsandboxed) and the privileged e2e test only runs under real root.
+`RestrictRealtime=` rides the seccomp machinery: it denies the realtime
+scheduler syscalls (`sched_setscheduler`/`sched_setattr`/`sched_setparam`) with
+an `e2e` test (`restrict_realtime_denies_sched_setscheduler`) probing via a
+privilege-free `os.sched_setscheduler`; it also implies `NoNewPrivileges=` (it
+needs a filter installed). Still
 unimplemented: the rest of the Phase-2/3 family —
 `MemoryDenyWriteExecute=`, `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
-`Restrict*`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
+`RestrictSUIDSGID`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
 are **parsed and emit a per-unit compat warning at load** rather than being
 silently ignored.
 

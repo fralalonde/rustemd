@@ -22,6 +22,13 @@ derived from Git tags via `build.rs` (never hardcoded).
 
 ### Added
 
+- **`RestrictRealtime=`** (Linux/x86_64) now enforces: it denies the realtime
+  scheduler syscalls (`sched_setscheduler`/`sched_setattr`/`sched_setparam`)
+  via the seccomp BPF machinery. It implies `NoNewPrivileges=` (needs a filter
+  installed) and composes with `SystemCallFilter=` (standalone it is a
+  deny-list; combined, the filter's allow/deny mode wins and the RT calls are
+  still blocked). Enforced by an e2e test that probes with a privilege-free
+  `os.sched_setscheduler` and a unit test for the deny-list folding.
 - **`SystemCallFilter=` e2e test** (`rystemd/tests/seccomp.rs`): runs the real
   manager unprivileged and asserts a `~mkdir mkdirat` deny-list blocks the
   syscall while an unfiltered control succeeds — the sandbox-isolation e2e gap.
