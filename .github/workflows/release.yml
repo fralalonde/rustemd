@@ -83,7 +83,7 @@ jobs:
       - name: Test native Windows workspace at MSRV
         run: cargo test --workspace --locked
       - run: cargo build --release --locked --target x86_64-pc-windows-msvc
-      - name: Package zip + msi
+      - name: Package zip + msi + nupkg
         shell: pwsh
         run: |
           $ver = $env:VERSION.TrimStart('v')
@@ -109,12 +109,22 @@ jobs:
           wix build -d Version=$ver rystemd.wxs -o "rystemd-$ver-x86_64.msi"
           Pop-Location
           Move-Item "$bin/rystemd-$ver-x86_64.msi" dist/
+
+          # NuGet native tools package (see packaging/nuget/rystemd.nuspec).
+          # NuGet CLI is a standalone nuget.exe (verified locally as v7.9.0), not
+          # a dotnet tool, so fetch it from dist.nuget.org.
+          Invoke-WebRequest -OutFile "$env:TEMP\nuget.exe" `
+            https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
+          & "$env:TEMP\nuget.exe" pack packaging/nuget/rystemd.nuspec `
+            -Version $ver -OutputDirectory dist -NoPackageAnalysis
+          if ($LASTEXITCODE -ne 0) { throw "nuget pack failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
             dist/*.zip
             dist/*.msi
+            dist/*.nupkg
 
   # NOTE: there is no macOS release job. rystemd is a systemd reimplementation
   # and its manager is Linux-native (cgroups v2, netlink/udev, system D-Bus,
@@ -134,3 +144,29 @@ jobs:
         with:
           generate_release_notes: true
           files: release-assets/*
+      # Publish the NuGet package to nuget.org. The .nupkg built by the windows
+      # job arrives in release-assets/ via the download step above. Requires an
+      # API key in the NUGET_API_KEY secret (repo Settings → Secrets Variables →
+      # Actions). When the secret is absent the step skips, so a release without
+      # publish intent (or before the key exists) still completes. --skip-duplicate
+      # keeps a re-run from failing if the version was already pushed.
+      - name: Publish NuGet package
+        shell: bash
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          nupkg="$(ls release-assets/*.nupkg 2>/dev/null | head -n1 || true)"
+          if [ -z "$nupkg" ]; then
+            echo "No .nupkg asset in release-assets/; skipping publish."
+            exit 0
+          fi
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "NUGET_API_KEY secret is not set; skipping publish."
+            exit 0
+          fi
+          dotnet nuget push "$nupkg" \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+          echo "Published $nupkg to nuget.org."

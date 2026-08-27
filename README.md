@@ -84,8 +84,8 @@ Each process tree is placed in a kill-on-close Job Object before its primary
 thread is resumed. `MemoryMax=` and `TasksMax=` map to Job Object limits.
 `Type=forking`, `notify`, and `dbus`, plus `User=`/`Group=`, fail explicitly.
 
-Windows `.socket` units support TCP `ListenStream=host:port` and consume one pending connection and start the
-matching service. The MVP does **not** pass
+Windows `.socket` units support TCP `ListenStream=host:port` and consume one
+pending connection and start the matching service. The MVP does **not** pass
 the listening socket into the child; it is a launch trigger rather than full
 `LISTEN_FDS` handoff. Unix-domain `ListenStream=` values are rejected on
 Windows.
@@ -104,21 +104,51 @@ rystemctl completions powershell   # pipe into Register-ArgumentCompleter
 rystemctl completions nushell
 ```
 
-## Windows (Scoop)
+## Installing
+
+Build from source (see [Quick start](#quick-start)) or install a packaged
+binary from a system package manager / release tool.
+
+### Windows (Scoop)
 
 The portable Windows release is packaged as a [Scoop](https://scoop.sh)
-manifest in `scoop/rystemd.json`. Install it additively (add the dir as a
-local bucket, or just `scoop install <path-to-manifest>`):
+manifest in `scoop/rystemd.json`. Install it additively (add the directory as
+a local bucket, or point `scoop install` straight at the manifest):
 
 ```powershell
-scoop install ./scoop/rystemd.json    # installs rystemd, rystemctl, rystemd-tui
+scoop install ./scoop/rystemd.json     # installs rystemd, rystemctl, rystemd-tui
 ```
 
 `checkver`/`autoupdate` are wired to the GitHub release stream, so bucket
 maintainers get new versions automatically on tag pushes. The same release
-zip is what the wix MSI installer wraps.
+zip backs the WiX MSI and the NuGet package (below).
 
-## Homebrew
+### Windows (NuGet)
+
+The Windows release also includes a [NuGet](https://learn.microsoft.com/nuget/)
+package for private feeds and automation. Download the `rystemd.<ver>.nupkg`
+asset from the GitHub release, then install it from the directory containing
+the package:
+
+```powershell
+nuget install rystemd -Source . -OutputDirectory ./rystemd-pkg
+# exes land under ./rystemd-pkg/rystemd.<ver>/tools/*
+```
+
+It is a **native tools package** — it ships the three executables but does not
+shim `PATH` or register a service. Prefer [Scoop](#windows-scoop) for a
+PATH-installed end-user setup; choose the [MSI](#windows-msi) for a
+machine-wide install. Publishing to nuget.org requires a separate API-key
+configuration and is not implied by the GitHub release asset.
+
+### Windows (MSI)
+
+A per-machine [WiX](https://wixtoolset.org) MSI installer is published to every
+release as `rystemd-<ver>-x86_64.msi`. It installs the three executables under
+`%ProgramFiles%\rystemd` and registers them with the Windows Installer for
+upgrade/removal.
+
+### Homebrew
 
 On Linux (e.g. an immutable Bazzite/Fedora-Atomic image) install from a tap
 without layering via `rpm-ostree`:

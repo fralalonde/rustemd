@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>rystemd</id>
+    <version>$version$</version>
+    <authors>rystemd</authors>
+    <owners>rystemd</owners>
+    <description>Systemd unit-manager reimplementation in Rust: daemon (rystemd), systemctl-compatible CLI (rystemctl), and a terminal UI (rystemd-tui). Native Windows binaries as a tools package.</description>
+    <copyright>MIT</copyright>
+    <projectUrl>https://github.com/rystemd/rystemd</projectUrl>
+    <repository type="git" url="https://github.com/rystemd/rystemd.git" />
+    <license type="expression">MIT</license>
+    <tags>systemd service-manager windows rystemd rystemctl</tags>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+  </metadata>
+  <files>
+    <!-- Native tools package: the three executables land in \tools -->
+    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemd.exe" target="tools\rystemd.exe" />
+    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemctl.exe" target="tools\rystemctl.exe" />
+    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemd-tui.exe" target="tools\rystemd-tui.exe" />
+  </files>
+</package>
