@@ -99,9 +99,11 @@ jobs:
           Set-Content -Path "$stage/VERSION.txt" -Value $ver
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/rystemd-$ver-x86_64-pc-windows-msvc.zip"
 
-          # MSI via WiX 4 (.NET tool). Build from the bin dir so relative
+          # MSI via WiX. Pin to WiX v4: newer WiX Toolset v6+/v7 requires
+          # accepting the OSMF fee EULA at build time (WIX7015), which fails
+          # non-interactively. v4 is free. Build from the bin dir so relative
           # Source= paths in the .wxs resolve against the .exe files.
-          dotnet tool install --global wix
+          dotnet tool install --global wix --version 4.*
           Copy-Item packaging/windows/rystemd.wxs $bin/
           Push-Location $bin
           wix build -d Version=$ver rystemd.wxs -o "rystemd-$ver-x86_64.msi"

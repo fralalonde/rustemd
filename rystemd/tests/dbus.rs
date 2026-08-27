@@ -88,6 +88,17 @@ fn systemd1_manager_surface_is_live_over_bus() {
 
     let daemon = Daemon::start_with_dbus();
 
+    // The manager thread runs udev_init (device enumeration) *before*
+    // start_dbus, so the systemd1 name is only owned some seconds in. Wait for
+    // the manager to be up, then give its monitor thread time to register.
+    assert!(
+        wait_for(Duration::from_secs(15), || std::path::Path::new(
+            &daemon.socket
+        )
+        .exists()),
+        "manager should come up"
+    );
+
     // The test-side client on the same bus.
     let conn = zbus::blocking::Connection::session().unwrap();
     let proxy = zbus::blocking::Proxy::new(
@@ -99,7 +110,7 @@ fn systemd1_manager_surface_is_live_over_bus() {
     .unwrap();
 
     // Version property — proves the systemd1 surface is live and reachable.
-    let live = wait_for(Duration::from_secs(5), || {
+    let live = wait_for(Duration::from_secs(20), || {
         proxy
             .get_property::<zbus::zvariant::OwnedValue>("Version")
             .is_ok()

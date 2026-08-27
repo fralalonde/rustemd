@@ -5,7 +5,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
       Name="rystemd"
-      Manufacturer="fralalonde"
+      Manufacturer="rystemd"
       Version="$(Version)"
       UpgradeCode="6882fed4-7c00-432d-989d-7f886f127b6d"
       Scope="perMachine">
