@@ -344,6 +344,12 @@ pub struct SandboxConfig {
     /// domains or drop ASLR hardening. Enforced on x86_64 Linux; where it
     /// cannot be enforced it is a compat warning (below).
     pub lock_personality: bool,
+    /// `RestrictSUIDSGID=`: deny the file-mode syscalls that could set an SUID
+    /// or SGID bit (`chmod`/`fchmod`/`fchmodat`/`chown`/`fchown`/`lchown`/
+    /// `fchownat`) via seccomp, so a service cannot install setuid/setgid
+    /// binaries or relabel ownership. Enforced on x86_64 Linux; where it
+    /// cannot be enforced it is a compat warning (below).
+    pub restrict_suidsgid: bool,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -363,6 +369,7 @@ impl SandboxConfig {
             || !self.syscall_nrs.is_empty()
             || self.restrict_realtime
             || self.lock_personality
+            || self.restrict_suidsgid
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1258,6 +1265,21 @@ fn parse_sandbox(
             s.compat.push(("LockPersonality".to_string(), exp(v)));
         }
     }
+    // RestrictSUIDSGID=: a pure deny of the file-mode syscalls that could set
+    // an SUID/SGID bit (chmod/fchmod/fchmodat/chown/fchown/lchown/fchownat).
+    // Reuses the seccomp machinery (like `RestrictRealtime=`). Enforced on
+    // x86_64 Linux; elsewhere a compat warning, since the syscall table lives
+    // only there.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(v) = unit_scalar(raw, "Service", "RestrictSUIDSGID") {
+        s.restrict_suidsgid = parse_bool(&exp(v))?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    for v in raw.list("Service", "RestrictSUIDSGID") {
+        if !v.trim().is_empty() {
+            s.compat.push(("RestrictSUIDSGID".to_string(), exp(v)));
+        }
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1341,7 +1363,6 @@ fn parse_sandbox(
         "RestrictAddressFamilies",
         "MemoryDenyWriteExecute",
         "RestrictNamespaces",
-        "RestrictSUIDSGID",
         "RemoveIPC",
         "DeviceAllow",
         "DevicePolicy",

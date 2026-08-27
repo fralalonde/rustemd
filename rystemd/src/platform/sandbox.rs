@@ -152,8 +152,14 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
         // `LockPersonality=` denies `personality(2)` entirely (syscall 135 on
         // x86_64), so the service cannot switch execution domains or drop ASLR.
         const PERSONALITY: u32 = 135;
-        let need_seccomp =
-            !cfg.syscall_nrs.is_empty() || cfg.restrict_realtime || cfg.lock_personality;
+        // `RestrictSUIDSGID=` denies the file-mode syscalls that could set an
+        // SUID/SGID bit or relabel ownership, resolved by name through the
+        // same syscall table that backs `SystemCallFilter=` (see
+        // `seccomp::suidsgid_nrs`).
+        let need_seccomp = !cfg.syscall_nrs.is_empty()
+            || cfg.restrict_realtime
+            || cfg.lock_personality
+            || cfg.restrict_suidsgid;
         if need_seccomp {
             // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
             // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
@@ -176,6 +182,9 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
             }
             if cfg.lock_personality {
                 extra_deny.push(PERSONALITY);
+            }
+            if cfg.restrict_suidsgid {
+                extra_deny.extend(seccomp::suidsgid_nrs());
             }
             // `RestrictRealtime=` is inherently a *deny* of a few syscalls.
             // When it stands alone (no `SystemCallFilter=`), a deny-list is the
@@ -651,6 +660,25 @@ mod seccomp {
         out.sort_unstable();
         out.dedup();
         Ok(out)
+    }
+
+    /// The `RestrictSUIDSGID=` deny set: the file-mode syscalls that could set
+    /// an SUID/SGID bit or relabel ownership. Resolved by name through the
+    /// table below (so it stays honest to the architecture) and de-duplicated.
+    /// On x86_64 every name resolves; a missing one (should never happen here)
+    /// is skipped rather than failing the unit.
+    pub fn suidsgid_nrs() -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for name in [
+            "chmod", "fchmod", "fchmodat", "chown", "fchown", "lchown", "fchownat",
+        ] {
+            if let Some(nr) = syscall_nr(name) {
+                out.push(nr);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Build the seccomp BPF program.
@@ -2012,6 +2040,79 @@ mod tests {
             .map(|s| s.k)
             .collect();
         assert!(entries.contains(&135), "personality must be a deny entry");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_suidsgid_forces_nnp_and_denies_file_mode_syscalls() {
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| c.restrict_suidsgid = true);
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("RestrictSUIDSGID must force NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("RestrictSUIDSGID must install a seccomp op");
+        assert!(nnp < sec, "NNP must precede the RestrictSUIDSGID filter");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        // Standalone `RestrictSUIDSGID=` is a *deny*-list (deny exactly the
+        // file-mode syscalls, allow everything else incl. `execve`): each of
+        // the chmod/chown family must be an explicit deny entry but the table
+        // stays small (it is not an allow-list of the whole base set).
+        let expected = seccomp::suidsgid_nrs();
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        for nr in &expected {
+            assert!(
+                entries.contains(nr),
+                "RestrictSUIDSGID syscall {nr} must be denied"
+            );
+        }
+        assert!(
+            entries.len() <= 10,
+            "standalone RestrictSUIDSGID must be a deny-list ({} entries)",
+            entries.len()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restrict_suidsgid_folds_into_deny_list() {
+        // Combined with a `SystemCallFilter=~` deny-list, the file-mode
+        // syscalls are merged into the deny entries rather than swallowed by
+        // the passive allow-everything tail. Every deny name must resolve.
+        use libc::{BPF_JEQ, BPF_JMP, BPF_K};
+        let c = cfg_with(|c| {
+            c.restrict_suidsgid = true;
+            c.syscall_deny = true;
+        });
+        let ops = plan(&c).unwrap();
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        let Op::Seccomp(prog) = &ops[sec] else {
+            unreachable!()
+        };
+        let entries: Vec<u32> = prog
+            .iter()
+            .filter(|s| s.code == (BPF_JMP | BPF_JEQ | BPF_K) as u16 && s.k != AUDIT_ARCH_X86_64)
+            .map(|s| s.k)
+            .collect();
+        for nr in seccomp::suidsgid_nrs() {
+            assert!(
+                entries.contains(&nr),
+                "file-mode syscall {nr} must be denied"
+            );
+        }
     }
 
     // End-to-end kernel enforcement of a seccomp deny-list is environment

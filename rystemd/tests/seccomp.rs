@@ -270,3 +270,69 @@ fn lock_personality_blocks_personality() {
         }
     }
 }
+
+/// `RestrictSUIDSGID=yes` blocks the file-mode syscalls that could set an
+/// SUID/SGID bit. We probe with the `chmod` binary trying to set SGID on a
+/// scratch file (`chmod 6755`): without the restriction it succeeds (exit 0),
+/// while under `RestrictSUIDSGID=yes` the seccomp filter makes `chmod(2)`
+/// (and any `fchmodat`/`chmodat` fallback coreutils uses) return `EPERM`, so
+/// `/usr/bin/chmod` exits non-zero and the marker records it. The coreutils
+/// `chmod` is used in preference to a Python `os.chmod` probe because the
+/// interpreter's own startup path is free of chmod — the probe is exactly the
+/// syscall under test. Needs no root (the manager forces `NoNewPrivileges=`
+/// and installs the filter in the forked child); self-skips where a container
+/// forbids `prctl(PR_SET_SECCOMP)`.
+#[test]
+fn restrict_suidsgid_blocks_chmod() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping restrict_suidsgid_blocks_chmod: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two unit runs: an unrestricted control and a `RestrictSUIDSGID=yes`
+    // unit, each recording the probe's exit code to its own marker.
+    let mut units = Vec::new();
+    for (i, name) in ["sg-allow.service", "sg-deny.service"].iter().enumerate() {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let target = scratch.dir.path().join(format!("probe-file-{i}"));
+        // `touch` the target (create is fine), then try to set SUID+SGID.
+        let cmd = format!(
+            "rm -f {t} {m}; : > {t}; /usr/bin/chmod 6755 {t} 2>/dev/null; echo $? > {m}",
+            t = target.display(),
+            m = marker.display()
+        );
+        let sandbox = if i == 0 { "" } else { "RestrictSUIDSGID=yes\n" };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(
+                code, 0,
+                "unrestricted chmod 6755 should succeed (got {code})"
+            );
+        } else {
+            assert_ne!(
+                code, 0,
+                "RestrictSUIDSGID=yes should block chmod (got {code})"
+            );
+        }
+    }
+}

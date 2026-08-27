@@ -138,39 +138,43 @@ or `CLONE_NEWUSER|CLONE_NEWNS` + uid_map (user), `PrivateTmp=`, `ProtectHome=`
 (read-only or tmpfs), `ProtectSystem=` (yes/full/strict), `ReadOnlyPaths=`,
 `NoNewPrivileges=`, `CapabilityBoundingSet=` (drop-from or `~` inverted
 bounding set) and `AmbientCapabilities=` (best-effort `PR_CAP_AMBIENT_RAISE`). A
-user-mode manager cannot read-only-relabel pre-existing
-host mounts (needs `CAP_SYS_ADMIN` over them, which a userns doesn't confer) —
-those ops degrade to a visible warning rather than failing the unit, matching
-systemd's tolerance. Implemented now (Linux/x86_64): `CapabilityBoundingSet=`
-(drop-from or `~` inverted), `AmbientCapabilities=` (best-effort
-`PR_CAP_AMBIENT_RAISE`), and `SystemCallFilter=` — a seccomp BPF program
-(allow-list or `~` deny-list) built from a syscall-number table with `@group`
-expansion, `SystemCallArchitectures=`, and `SystemCallErrorNumber=`. As in
-systemd, `SystemCallFilter=` **implies `NoNewPrivileges=`** (required for an
-unprivileged manager to install the filter), and a deny-list's blocked syscall
-fails with `EPERM` by default (`SystemCallErrorNumber=` is respected if set,
-rather than silently returning 0 — see the seccomp e2e test). Also implemented:
-`PrivateDevices=` shadows `/dev` with a fresh tmpfs and a minimal core device
-tree (null/zero/full/random/urandom/tty + private `devpts`/`/dev/shm`, `/dev/fd`
+user-mode manager cannot read-only relabel host mounts (needs `CAP_SYS_ADMIN` over them, which a userns
+doesn't confer) — those ops degrade to a visible warning rather than failing
+the unit, matching systemd's tolerance. Implemented now (Linux/x86_64):
+`CapabilityBoundingSet=` (drop-from or `~` inverted), `AmbientCapabilities=`
+(best-effort `PR_CAP_AMBIENT_RAISE`), `SystemCallFilter=` — a seccomp BPF
+program (allow-list or `~` deny-list) built from a syscall-number table with
+`@group` expansion, `SystemCallArchitectures=`, and
+`SystemCallErrorNumber=` — and `RestrictRealtime=`, `LockPersonality=`, and
+`RestrictSUIDSGID=`, which all ride the same seccomp machinery as pure deny
+sets. As in systemd, `SystemCallFilter=` **implies `NoNewPrivileges=`**
+(required for an unprivileged manager to install the filter), and a
+deny-list's blocked syscall fails with `EPERM` by default
+(`SystemCallErrorNumber=` is respected if set, rather than silently returning
+0 — see the seccomp e2e test). Also implemented: `PrivateDevices=` shadows
+`/dev` with a fresh tmpfs and a minimal core device tree
+(null/zero/full/random/urandom/tty + private `devpts`/`/dev/shm`, `/dev/fd`
 symlinks), hiding host devices. Because device-node creation (`mknod`) is
 refused inside an unprivileged user namespace, a user-mode manager's
 `PrivateDevices=` degrades best-effort (warns; the unit runs with /dev
 unsandboxed) and the privileged e2e test only runs under real root.
-`RestrictRealtime=` rides the seccomp machinery: it denies the realtime
-scheduler syscalls (`sched_setscheduler`/`sched_setattr`/`sched_setparam`) with
-an `e2e` test (`restrict_realtime_denies_sched_setscheduler`) probing via a
-privilege-free `os.sched_setscheduler`; it also implies `NoNewPrivileges=` (it
-needs a filter installed). `LockPersonality=` has the same seccomp shape: it
-denies `personality(2)` outright (so a service cannot switch execution domains
-or drop ASLR hardening), with unit tests folding it into a `SystemCallFilter=`
-deny-list and an `e2e` test (`lock_personality_blocks_personality`) probing the
-syscall through `ctypes` (version-proof across Python releases). Still
-unimplemented: the rest of the Phase-2/3 family —
-`MemoryDenyWriteExecute=`, `DynamicUser=`,
-`DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
-`RestrictSUIDSGID`, `IPAddress*`, `RemoveIPC=`. All of the latter
-are **parsed and emit a per-unit compat warning at load** rather than being
-silently ignored.
+`RestrictRealtime=` denies the realtime scheduler syscalls
+(`sched_setscheduler`/`sched_setattr`/`sched_setparam`) with an `e2e` test
+(`restrict_realtime_denies_sched_setscheduler`) probing via a privilege-free
+`os.sched_setscheduler`; it also implies `NoNewPrivileges=` (it needs a filter
+installed). `LockPersonality=` denies `personality(2)` outright (so a service
+cannot switch execution domains or drop ASLR hardening), with unit tests
+folding it into a `SystemCallFilter=` deny-list and an `e2e` test
+(`lock_personality_blocks_personality`) probing the syscall through `ctypes`
+(version-proof across Python releases). `RestrictSUIDSGID=` denies the
+file-mode syscalls that could set an SUID/SGID bit or relabel ownership
+(`chmod`/`fchmod`/`fchmodat`/`chown`/`fchown`/`lchown`/`fchownat`), with unit
+tests and an `e2e` test (`restrict_suidsgid_blocks_chmod`) that has coreutils
+`chmod 6755` fail under the filter. Still unimplemented: the rest of the
+Phase-2/3 family — `MemoryDenyWriteExecute=`, `DynamicUser=`,
+`DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`, `IPAddress*`,
+`RemoveIPC=`. All of the latter are **parsed and emit a per-unit compat
+warning at load** rather than being silently ignored.
 
 ### Partial cgroup resource controls
 `MemoryMax` / `MemoryHigh` / `CPUWeight` / `CPUQuota` / `IOWeight` /
