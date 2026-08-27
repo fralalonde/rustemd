@@ -312,6 +312,10 @@ pub enum ProtectSystemLevel {
 pub struct SandboxConfig {
     pub no_new_privileges: bool,
     pub private_tmp: bool,
+    /// `PrivateDevices=`: shadow `/dev` with a minimal private device tree
+    /// (tmpfs + core nodes, devpts, tmpfs `/dev/shm`) in the private mount
+    /// namespace, hiding host devices (`/dev/sda`, `/dev/mem`, …).
+    pub private_devices: bool,
     pub protect_home: ProtectMode,
     pub protect_system: ProtectSystemLevel,
     /// Read-only paths, in order.
@@ -339,6 +343,7 @@ impl SandboxConfig {
     pub fn has_sandbox(&self) -> bool {
         self.no_new_privileges
             || self.private_tmp
+            || self.private_devices
             || self.protect_home != ProtectMode::No
             || self.protect_system != ProtectSystemLevel::No
             || !self.read_only_paths.is_empty()
@@ -1211,6 +1216,9 @@ fn parse_sandbox(
     if let Some(v) = unit_scalar(raw, "Service", "PrivateTmp") {
         s.private_tmp = parse_bool(&exp(v))?;
     }
+    if let Some(v) = unit_scalar(raw, "Service", "PrivateDevices") {
+        s.private_devices = parse_bool(&exp(v))?;
+    }
     if let Some(v) = unit_scalar(raw, "Service", "ProtectHome") {
         s.protect_home = parse_protect(&exp(v))?;
     }
@@ -1298,7 +1306,6 @@ fn parse_sandbox(
         "RestrictRealtime",
         "RestrictSUIDSGID",
         "RemoveIPC",
-        "PrivateDevices",
         "DeviceAllow",
         "DevicePolicy",
         "IPAddressDeny",
@@ -1684,6 +1691,23 @@ mod tests {
         assert!(r.is_err());
         let msg = r.unwrap_err();
         assert!(msg.contains("no_such_syscall"), "got: {msg}");
+    }
+
+    #[test]
+    fn private_devices_parses_and_is_implemented() {
+        let f = build_str(
+            "[Service]\nPrivateDevices=yes\nExecStart=/bin/true\n",
+            "pd.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(s.private_devices, "PrivateDevices=yes should be recorded");
+        assert!(s.has_sandbox());
+        // It must not masquerade as recognized-but-unimplemented compat.
+        assert!(!s.compat.iter().any(|(k, _)| k == "PrivateDevices"));
+        // The default (unset) is off.
+        let f2 = build_str("[Service]\nExecStart=/bin/true\n", "pd2.service").unwrap();
+        assert!(!f2.service.as_ref().unwrap().sandbox.private_devices);
     }
 
     #[test]

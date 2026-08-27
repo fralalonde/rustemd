@@ -32,6 +32,12 @@ pub enum Op {
     MountTmpfs(PathBuf),
     /// Bind-mount `path` over itself then remount read-only.
     BindReadOnly(PathBuf),
+    /// `PrivateDevices=`: shadow `/dev` with a minimal tmpfs + core device
+    /// nodes (null/zero/full/random/urandom/tty), a private `devpts` at
+    /// `/dev/pts`, and a tmpfs `/dev/shm`, hiding the host's devices. Must run
+    /// inside the private mount namespace. Best-effort — each step warns on
+    /// failure and continues, matching systemd's tolerance.
+    PrivateDevices,
     /// `prctl(PR_SET_NO_NEW_PRIVS)`.
     NoNewPrivileges,
     /// `CapabilityBoundingSet=`: drop the given capabilities from the
@@ -60,6 +66,7 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     let mut ops = Vec::new();
 
     let need_mountns = cfg.private_tmp
+        || cfg.private_devices
         || cfg.protect_home != ProtectMode::No
         || cfg.protect_system != ProtectSystemLevel::No
         || !cfg.read_only_paths.is_empty();
@@ -100,6 +107,9 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     }
     for p in &cfg.read_only_paths {
         ops.push(Op::BindReadOnly(PathBuf::from(p)));
+    }
+    if cfg.private_devices {
+        ops.push(Op::PrivateDevices);
     }
     if cfg.no_new_privileges {
         ops.push(Op::NoNewPrivileges);
@@ -259,6 +269,95 @@ pub fn apply(ops: &[Op]) -> Result<Option<()>, String> {
                 } != 0
                 {
                     return Err(fmt("remount-ro", &std::io::Error::last_os_error()));
+                }
+            }
+            Op::PrivateDevices => {
+                // Shadow `/dev` with a fresh tmpfs and a minimal device tree.
+                // Best-effort: each step warns and continues on failure,
+                // matching systemd's tolerance for unprivileged managers; only
+                // a unit that *needs* a missing node is affected.
+                // SAFETY: tmpfs mount over the `/dev` mount point; children
+                // of a containerized root mount and the (empty) target.
+                if unsafe {
+                    libc::mount(
+                        c"tmpfs".as_ptr(),
+                        c"/dev".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NODEV,
+                        c"mode=0755".as_ptr().cast(),
+                    )
+                } != 0
+                {
+                    let e = std::io::Error::last_os_error();
+                    eprintln!("rystemd: [sandbox] private /dev not mounted: {e}");
+                } else {
+                    // Core device nodes (mknod), matching systemd's minimal set.
+                    for (name, maj, min) in [
+                        ("null", 1, 3),
+                        ("zero", 1, 5),
+                        ("full", 1, 7),
+                        ("random", 1, 8),
+                        ("urandom", 1, 9),
+                        ("tty", 5, 0),
+                    ] {
+                        let path = format!("/dev/{name}");
+                        let cpath = cstr(Path::new(&path));
+                        // SAFETY: valid path and char-device mode.
+                        if unsafe {
+                            libc::mknod(
+                                cpath.as_ptr(),
+                                libc::S_IFCHR | 0o666,
+                                libc::makedev(maj, min),
+                            )
+                        } != 0
+                        {
+                            let e = std::io::Error::last_os_error();
+                            eprintln!("rystemd: [sandbox] mknod /dev/{name}: {e}");
+                        }
+                    }
+                    // Private pseudo-terminal + POSIX-shm mounts.
+                    let _ = std::fs::create_dir_all("/dev/pts");
+                    let _ = std::fs::create_dir_all("/dev/shm");
+                    // SAFETY: devpts over the private `/dev/pts` dir.
+                    if unsafe {
+                        libc::mount(
+                            c"devpts".as_ptr(),
+                            c"/dev/pts".as_ptr(),
+                            c"devpts".as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NOEXEC,
+                            std::ptr::null(),
+                        )
+                    } != 0
+                    {
+                        let e = std::io::Error::last_os_error();
+                        eprintln!("rystemd: [sandbox] private /dev/pts: {e}");
+                    }
+                    let _ = std::fs::remove_file("/dev/ptmx");
+                    let _ = std::os::unix::fs::symlink("/dev/pts/ptmx", "/dev/ptmx");
+                    // SAFETY: tmpfs over the private `/dev/shm` dir.
+                    if unsafe {
+                        libc::mount(
+                            c"tmpfs".as_ptr(),
+                            c"/dev/shm".as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NODEV,
+                            c"mode=1777".as_ptr().cast(),
+                        )
+                    } != 0
+                    {
+                        let e = std::io::Error::last_os_error();
+                        eprintln!("rystemd: [sandbox] private /dev/shm: {e}");
+                    }
+                    // Standard /proc-backed symlinks kept for compat.
+                    for (link, target) in [
+                        ("/dev/fd", "/proc/self/fd"),
+                        ("/dev/stdin", "/proc/self/fd/0"),
+                        ("/dev/stdout", "/proc/self/fd/1"),
+                        ("/dev/stderr", "/proc/self/fd/2"),
+                    ] {
+                        let _ = std::fs::remove_file(link);
+                        let _ = std::os::unix::fs::symlink(target, link);
+                    }
                 }
             }
             Op::NoNewPrivileges => {

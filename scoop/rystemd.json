@@ -1,0 +1,23 @@
+{
+    "version": "0.1.4",
+    "description": "rystemd — a systemd-compatible service manager, with rystemctl (systemctl-compatible CLI) and rystemd-tui (terminal client). Linux is the primary target; Windows is a supported compatibility port.",
+    "homepage": "https://github.com/rystemd/rystemd",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/rystemd/rystemd/releases/download/v0.1.4/rystemd-0.1.4-x86_64-pc-windows-msvc.zip",
+            "hash": "9fdaad94945fcbf55acd8fc6865af180ab4500c0c7d0e94915a9a67907fab718"
+        }
+    },
+    "bin": [
+        "rystemd.exe",
+        "rystemctl.exe",
+        "rystemd-tui.exe"
+    ],
+    "checkver": {
+        "github": "https://github.com/rystemd/rystemd"
+    },
+    "autoupdate": {
+        "url": "https://github.com/rystemd/rystemd/releases/download/v$version/rystemd-$version-x86_64-pc-windows-msvc.zip"
+    }
+}

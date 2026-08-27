@@ -104,6 +104,20 @@ rystemctl completions powershell   # pipe into Register-ArgumentCompleter
 rystemctl completions nushell
 ```
 
+## Windows (Scoop)
+
+The portable Windows release is packaged as a [Scoop](https://scoop.sh)
+manifest in `scoop/rystemd.json`. Install it additively (add the dir as a
+local bucket, or just `scoop install <path-to-manifest>`):
+
+```powershell
+scoop install ./scoop/rystemd.json    # installs rystemd, rystemctl, rystemd-tui
+```
+
+`checkver`/`autoupdate` are wired to the GitHub release stream, so bucket
+maintainers get new versions automatically on tag pushes. The same release
+zip is what the wix MSI installer wraps.
+
 ## Homebrew
 
 On Linux (e.g. an immutable Bazzite/Fedora-Atomic image) install from a tap

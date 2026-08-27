@@ -130,3 +130,57 @@ fn private_tmp_is_isolated_from_real_tmp() {
         "PrivateTmp should isolate the service's /tmp from the real /tmp"
     );
 }
+
+/// `PrivateDevices=yes` must shadow the host `/dev` with a minimal private
+/// device tree: the core nodes the runtime needs (`/dev/urandom`) are present,
+/// while host devices like `/dev/sda` are not visible. Exercises the tmpfs +
+/// `mknod` + devpts path in `platform::sandbox`. Requires real root (device
+/// nodes cannot be created in an unprivileged user namespace), so it self-skips
+/// otherwise.
+fn is_real_root() -> bool {
+    std::fs::read_to_string("/proc/self/uid_map")
+        .map(|s| s.lines().any(|l| l.starts_with("0 0 ")))
+        .unwrap_or(false)
+}
+
+#[test]
+fn private_devices_isolate_host_devices() {
+    if euid() != 0 || !is_real_root() {
+        eprintln!(
+            "skipping private_devices_isolate_host_devices: needs real root \
+             (device nodes cannot be created in an unprivileged user namespace)"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+    let marker = format!("/tmp/rystemd-pd-{}", std::process::id());
+    // The service confirms from inside its private /dev that the core node it
+    // needs is present and a representative host device is gone.
+    scratch.write_unit(
+        "sandboxed-dev.service",
+        &format!(
+            "[Service]\nType=oneshot\nPrivateDevices=yes\n\
+             ExecStart=/bin/sh -c 'if [ -e /dev/urandom ] && [ ! -e /dev/sda ]; \
+             then echo private-dev-ok > {marker}; fi'\n"
+        ),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+    ctl.start(&["sandboxed-dev.service"]).unwrap();
+
+    let ok = wait_for(Duration::from_secs(5), || {
+        std::fs::read_to_string(&marker)
+            .map(|s| s.contains("private-dev-ok"))
+            .unwrap_or(false)
+    });
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        ok,
+        "PrivateDevices should keep core device nodes but hide host devices"
+    );
+}

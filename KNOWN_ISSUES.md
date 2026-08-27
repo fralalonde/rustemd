@@ -29,8 +29,11 @@
 - **Journaling is a plain store, not journald** — per-unit on-disk journal
   under `/var/log/rystemd/` with `rystemctl journal`; no `journalctl` binary,
   no journald wire format, no syslog/journald forwarding. **Service sandboxing
-  is Phase-1 plus capability + seccomp control** — no `DynamicUser=`,
-  or `DevicePolicy=`/`DeviceAllow=`
+  is Phase-1 plus capability/seccomp/private-device
+  control** (mount namespace, `PrivateTmp=`, `ProtectHome=`, `ProtectSystem=`,
+  `ReadOnlyPaths=`, `NoNewPrivileges=`, `CapabilityBoundingSet=`,
+  `AmbientCapabilities=`, `SystemCallFilter=`, `PrivateDevices=`) — no
+  `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
 - `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
@@ -129,10 +132,10 @@ parsed. `Restart=` does support `no`/`on-success`/`on-failure`/`on-abnormal`/
 pairs with it is absent.
 
 ### Service sandboxing is partial
-Implemented (Linux, Phase-1): mount-namespace plumbing via `CLONE_NEWNS` (root)
+Implemented (Linux): mount-namespace plumbing via `CLONE_NEWNS` (root)
 or `CLONE_NEWUSER|CLONE_NEWNS` + uid_map (user), `PrivateTmp=`, `ProtectHome=`
 (read-only or tmpfs), `ProtectSystem=` (yes/full/strict), `ReadOnlyPaths=`,
-`NoNewPrivileges=`, and now `CapabilityBoundingSet=` (drop-from or `~` inverted
+`NoNewPrivileges=`, `CapabilityBoundingSet=` (drop-from or `~` inverted
 bounding set) and `AmbientCapabilities=` (best-effort `PR_CAP_AMBIENT_RAISE`). A
 user-mode manager cannot read-only-relabel pre-existing
 host mounts (needs `CAP_SYS_ADMIN` over them, which a userns doesn't confer) —
@@ -145,9 +148,15 @@ expansion, `SystemCallArchitectures=`, and `SystemCallErrorNumber=`. As in
 systemd, `SystemCallFilter=` **implies `NoNewPrivileges=`** (required for an
 unprivileged manager to install the filter), and a deny-list's blocked syscall
 fails with `EPERM` by default (`SystemCallErrorNumber=` is respected if set,
-rather than silently returning 0 — see the seccomp e2e test). Still
+rather than silently returning 0 — see the seccomp e2e test). Also implemented:
+`PrivateDevices=` shadows `/dev` with a fresh tmpfs and a minimal core device
+tree (null/zero/full/random/urandom/tty + private `devpts`/`/dev/shm`, `/dev/fd`
+symlinks), hiding host devices. Because device-node creation (`mknod`) is
+refused inside an unprivileged user namespace, a user-mode manager's
+`PrivateDevices=` degrades best-effort (warns; the unit runs with /dev
+unsandboxed) and the privileged e2e test only runs under real root. Still
 unimplemented: the rest of the Phase-2/3 family —
-`MemoryDenyWriteExecute=`, `PrivateDevices=`, `DynamicUser=`,
+`MemoryDenyWriteExecute=`, `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
 `Restrict*`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
 are **parsed and emit a per-unit compat warning at load** rather than being
@@ -178,7 +187,7 @@ matters for the stated goals:
   (`getty@tty1`→`getty@.service`), restart/`on-failure` policy, or
   timeout/`KillSignal` handling. (Seccomp `SystemCallFilter=` *does* have an
   e2e test — `rystemd/tests/seccomp.rs` — plus the privilege-requiring
-  `PrivateTmp` case in `rystemd/tests/privileged.rs`.)
+  `PrivateTmp` and `PrivateDevices` cases in `rystemd/tests/privileged.rs`.)
 - **No CI on push/PR.** The only workflow (`release.yml`) runs `cargo test`
   (Linux only, no clippy/fmt) *on tag pushes*. The `boot` (PID-1) path, the
   `dbus` feature, and clippy/fmt are gated nowhere except the tag-triggered
