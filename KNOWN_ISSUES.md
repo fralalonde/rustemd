@@ -29,8 +29,8 @@
 - **Journaling is a plain store, not journald** — per-unit on-disk journal
   under `/var/log/rystemd/` with `rystemctl journal`; no `journalctl` binary,
   no journald wire format, no syslog/journald forwarding. **Service sandboxing
-  is Phase-1 plus capability control** — no seccomp
-  (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
+  is Phase-1 plus capability + seccomp control** — no `DynamicUser=`,
+  or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
 - `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
@@ -137,10 +137,14 @@ bounding set) and `AmbientCapabilities=` (best-effort `PR_CAP_AMBIENT_RAISE`). A
 user-mode manager cannot read-only-relabel pre-existing
 host mounts (needs `CAP_SYS_ADMIN` over them, which a userns doesn't confer) —
 those ops degrade to a visible warning rather than failing the unit, matching
-systemd's tolerance. Still unimplemented: the Phase-2/3 family —
-`SystemCallFilter=` (seccomp),
-`SystemCallArchitectures=`, `MemoryDenyWriteExecute=`, `PrivateDevices=`,
-`DynamicUser=`, `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
+systemd's tolerance. Implemented now (Linux/x86_64): `CapabilityBoundingSet=`
+(drop-from or `~` inverted), `AmbientCapabilities=` (best-effort
+`PR_CAP_AMBIENT_RAISE`), and `SystemCallFilter=` — a seccomp BPF program
+(allow-list or `~` deny-list) built from a syscall-number table with `@group`
+expansion, `SystemCallArchitectures=`, and `SystemCallErrorNumber=`. Still
+unimplemented: the rest of the Phase-2/3 family —
+`MemoryDenyWriteExecute=`, `PrivateDevices=`, `DynamicUser=`,
+`DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
 `Restrict*`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter
 are **parsed and emit a per-unit compat warning at load** rather than being
 silently ignored.

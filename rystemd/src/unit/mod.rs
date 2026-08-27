@@ -321,6 +321,15 @@ pub struct SandboxConfig {
     pub bounding_invert: bool,
     pub bounding_set: Vec<String>,
     pub ambient_set: Vec<String>,
+    /// `SystemCallFilter=` (seccomp): true when the list is a deny-list
+    /// (`~` prefix), plus the pre-resolved syscall numbers. Resolved here (on
+    /// x86_64 Linux) so an unknown name fails the unit at load rather than at
+    /// spawn; the BPF program is compiled from these in the parent.
+    pub syscall_deny: bool,
+    pub syscall_nrs: Vec<u32>,
+    /// `SystemCallErrorNumber=`: errno returned for filtered calls (default
+    /// `EPERM`).
+    pub syscall_errno: u32,
     /// `(directive, value)` pairs for recognized-but-unimplemented directives.
     pub compat: Vec<(String, String)>,
 }
@@ -336,6 +345,7 @@ impl SandboxConfig {
             || self.bounding_invert
             || !self.bounding_set.is_empty()
             || !self.ambient_set.is_empty()
+            || !self.syscall_nrs.is_empty()
     }
 
     /// The Phase-2/3 directives that were parsed but not implemented.
@@ -1222,12 +1232,60 @@ fn parse_sandbox(
         .as_deref()
         .unwrap_or("")));
 
+    // SystemCallFilter= + SystemCallErrorNumber= (seccomp). Implemented on
+    // x86_64 Linux (where the syscall-number table lives); elsewhere they
+    // remain recognized-but-unimplemented compat warnings.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let mut lines: Vec<String> = Vec::new();
+        for v in raw.list("Service", "SystemCallFilter") {
+            lines.push(exp(v));
+        }
+        if !lines.is_empty() {
+            let mut tokens: Vec<String> = Vec::new();
+            for line in lines {
+                if line.trim().is_empty() {
+                    tokens.clear(); // empty-value clear
+                    continue;
+                }
+                tokens.extend(line.split_whitespace().map(|t| t.to_string()));
+            }
+            if !tokens.is_empty() {
+                // A leading `~` marks a deny-list (systemd forbids mixing).
+                s.syscall_deny = tokens[0].starts_with('~');
+                s.syscall_nrs = crate::platform::sandbox::resolve_syscalls(
+                    &tokens
+                        .iter()
+                        .map(|t| t.trim_start_matches('~').to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(v) = unit_scalar(raw, "Service", "SystemCallErrorNumber") {
+            // Accept names like `EPERM`/`EPERM ` or a raw number. A missing
+            // name (empty) keeps the default EPERM.
+            let e = exp(v).trim().to_ascii_uppercase();
+            if !e.is_empty() {
+                s.syscall_errno = parse_errno(&e)?;
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        for key in ["SystemCallFilter", "SystemCallErrorNumber"] {
+            for v in raw.list("Service", key) {
+                if !v.trim().is_empty() {
+                    s.compat.push(((*key).to_string(), exp(v)));
+                }
+            }
+        }
+    }
+
     // Phase-2/3 directives: recognized, not implemented. Record so the manager
     // can warn at load rather than silently ignore.
     const COMPAT: &[&str] = &[
-        "SystemCallFilter",
         "SystemCallArchitectures",
-        "SystemCallErrorNumber",
         "RestrictAddressFamilies",
         "MemoryDenyWriteExecute",
         "LockPersonality",
@@ -1291,6 +1349,48 @@ fn parse_protect_system(v: &str) -> Result<ProtectSystemLevel, String> {
             ));
         }
     })
+}
+
+/// Parse `SystemCallErrorNumber=` into an errno number, accepting a name
+/// (`EPERM`, case-insensitive) or a raw decimal. Defaults to `EPERM`. The
+/// errno values are the Linux numbers (the directive is Linux-only anyway);
+/// kept as literals so this module stays platform-independent. Only reachable
+/// (and only compiled) on the Linux/x86_64 seccomp path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn parse_errno(v: &str) -> Result<u32, String> {
+    let v = v.trim();
+    let names = [
+        ("EPERM", 1),
+        ("ENOENT", 2),
+        ("ESRCH", 3),
+        ("EINTR", 4),
+        ("EIO", 5),
+        ("EAGAIN", 11),
+        ("EACCES", 13),
+        ("EFAULT", 14),
+        ("ENOTBLK", 15),
+        ("EBUSY", 16),
+        ("EEXIST", 17),
+        ("ENODEV", 19),
+        ("ENOTDIR", 20),
+        ("EISDIR", 21),
+        ("EINVAL", 22),
+        ("ENFILE", 23),
+        ("ENOSPC", 28),
+        ("EROFS", 30),
+        ("ENOSYS", 38),
+        ("ERESTARTSYS", 85),
+        ("ENOTSUP", 95),
+        ("EUCLEAN", 117),
+    ];
+    if let Some((_, n)) = names
+        .iter()
+        .find(|(name, _)| *name == v.to_ascii_uppercase())
+    {
+        return Ok(*n);
+    }
+    v.parse::<u32>()
+        .map_err(|_| format!("SystemCallErrorNumber: unknown errno `{v}`"))
 }
 
 fn parse_stdio(v: &str) -> Result<StdioTarget, String> {
@@ -1497,6 +1597,67 @@ mod tests {
             f.service.as_ref().unwrap().exec_start[0].argv,
             vec!["/bin/sleep", "100"]
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn syscall_filter_deny_list_resolves() {
+        let f = build_str(
+            "[Service]\nSystemCallFilter=~clone @network-io\nExecStart=/bin/true\n",
+            "sc.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(s.syscall_deny);
+        assert!(s.syscall_nrs.contains(&56)); // clone
+        assert!(s.syscall_nrs.contains(&41)); // socket (from @network-io)
+        // A deny-list must not masquerade as compat (it is implemented).
+        assert!(!s.compat.iter().any(|(k, _)| k == "SystemCallFilter"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn syscall_filter_allow_list_resolves() {
+        let f = build_str(
+            "[Service]\nSystemCallFilter=read write\nExecStart=/bin/true\n",
+            "sc.service",
+        )
+        .unwrap();
+        let s = &f.service.as_ref().unwrap().sandbox;
+        assert!(!s.syscall_deny);
+        assert!(s.syscall_nrs.contains(&0)); // read
+        assert!(s.syscall_nrs.contains(&1)); // write
+        assert!(!s.syscall_nrs.contains(&231)); // exit_group is auto-added only in build(), not here
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn syscall_filter_error_number_parses() {
+        let f = build_str(
+            "[Service]\nSystemCallErrorNumber=EACCES\nExecStart=/bin/true\n",
+            "sc.service",
+        )
+        .unwrap();
+        assert_eq!(f.service.as_ref().unwrap().sandbox.syscall_errno, 13);
+        // Raw numeric form.
+        let f2 = build_str(
+            "[Service]\nSystemCallErrorNumber=22\nExecStart=/bin/true\n",
+            "sc.service",
+        )
+        .unwrap();
+        assert_eq!(f2.service.as_ref().unwrap().sandbox.syscall_errno, 22);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn syscall_filter_unknown_name_fails_load() {
+        let r = build_str(
+            "[Service]\nSystemCallFilter=read no_such_syscall\nExecStart=/bin/true\n",
+            "sc.service",
+        );
+        assert!(r.is_err());
+        let msg = r.unwrap_err();
+        assert!(msg.contains("no_such_syscall"), "got: {msg}");
     }
 
     #[test]
