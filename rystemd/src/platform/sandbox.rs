@@ -134,6 +134,20 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     // directive as a parse-time compat warning).
     #[cfg(target_arch = "x86_64")]
     if !cfg.syscall_nrs.is_empty() {
+        // Implicit NoNewPrivileges: installing a `SECCOMP_MODE_FILTER`
+        // requires either CAP_SYS_ADMIN or PR_SET_NO_NEW_PRIVS (seccomp(2)).
+        // A user-mode manager has neither, so without this a
+        // `SystemCallFilter=` unit would refuse to spawn with EACCES.
+        // systemd draws the same conclusion (systemd.exec: `SystemCallFilter=`
+        // overrides/implies `NoNewPrivileges=`), so we force it whenever a
+        // filter is going to be installed — unless the unit already asked.
+        // Push it *before* the Seccomp op. Note AmbientCapabilities raising
+        // needs no_new_privs OFF, so a unit that sets both degrades to
+        // ambient best-effort (warned at apply) — the seccomp requirement
+        // always wins, matching systemd's inability to combine them.
+        if !cfg.no_new_privileges {
+            ops.push(Op::NoNewPrivileges);
+        }
         let program = build_seccomp(&cfg.syscall_nrs, cfg.syscall_deny, cfg.syscall_errno);
         ops.push(Op::Seccomp(program));
     }
@@ -512,6 +526,16 @@ mod seccomp {
     /// against each listed number. An allow-list denies everything not listed
     /// (plus [`ALLOW_BASE`]); a deny-list allows everything not listed.
     pub fn build(nrs: &[u32], deny: bool, errno: u32) -> Vec<libc::sock_filter> {
+        // A blocked syscall must fail with a real error. `errno == 0` would
+        // make the kernel return 0 — indistinguishable from success (the bug
+        // that let a `~mkdir` deny-list "allow" mkdirat). systemd's default
+        // is EPERM; guard against 0 here too, so programmatic configs that
+        // skip the parser can't silently weaken the filter.
+        let errno = if errno == 0 {
+            libc::EPERM as u32
+        } else {
+            errno
+        };
         let mut entries: Vec<u32> = nrs.to_vec();
         if !deny {
             for b in ALLOW_BASE {
@@ -1605,6 +1629,63 @@ mod tests {
         let last = prog.len();
         assert_eq!(prog[last - 2].k & 0xFFFF_0000, libc::SECCOMP_RET_ERRNO);
         assert_eq!(prog[last - 1].k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn seccomp_implies_no_new_privileges_before_filter() {
+        // SystemCallFilter= must force NoNewPrivileges (installing
+        // SECCOMP_MODE_FILTER needs CAP_SYS_ADMIN or no_new_privs), so an
+        // unprivileged manager can apply the filter. The NNP op must precede
+        // the Seccomp op.
+        let c = cfg_with(|c| c.syscall_nrs = vec![83]); // mkdir
+        let ops = plan(&c).unwrap();
+        let nnp = ops
+            .iter()
+            .position(|o| matches!(o, Op::NoNewPrivileges))
+            .expect("seccomp must imply NoNewPrivileges");
+        let sec = ops
+            .iter()
+            .position(|o| matches!(o, Op::Seccomp(_)))
+            .expect("seccomp op present");
+        assert!(
+            nnp < sec,
+            "NoNewPrivileges must be applied before the filter"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn explicit_no_new_privileges_not_duplicated_for_seccomp() {
+        // When the unit already sets NoNewPrivileges=yes, do not push a second
+        // NNP op.
+        let c = cfg_with(|c| {
+            c.no_new_privileges = true;
+            c.syscall_nrs = vec![83];
+        });
+        let ops = plan(&c).unwrap();
+        let nnps = ops.iter().filter(|o| matches!(o, Op::NoNewPrivileges));
+        assert_eq!(nnps.count(), 1, "NNP must not be duplicated");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn build_deny_errno_zero_guards_to_eperm() {
+        // A deny-list with errno==0 must NOT build a program that lets blocked
+        // syscalls "succeed" (ERRNO|0 = success). The build defaults 0 to
+        // EPERM (1), so the deny return carries EPERM.
+        let nrs = seccomp::resolve(&["mkdirat".into()]).unwrap();
+        let prog = build_seccomp(&nrs, true, 0);
+        // The deny return is the second-to-last instruction (the last is
+        // ALLOW); it must carry SECCOMP_RET_ERRNO | EPERM, not | 0.
+        let den_ret = &prog[prog.len() - 2];
+        assert_eq!(den_ret.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(
+            den_ret.k & !0xFFFF,
+            libc::SECCOMP_RET_ERRNO,
+            "deny return must be an ERRNO action"
+        );
+        assert_eq!(den_ret.k & 0xFFFF, 1, "errno 0 must default to EPERM (1)");
     }
 
     // End-to-end kernel enforcement of a seccomp deny-list is environment

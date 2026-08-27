@@ -141,7 +141,11 @@ systemd's tolerance. Implemented now (Linux/x86_64): `CapabilityBoundingSet=`
 (drop-from or `~` inverted), `AmbientCapabilities=` (best-effort
 `PR_CAP_AMBIENT_RAISE`), and `SystemCallFilter=` — a seccomp BPF program
 (allow-list or `~` deny-list) built from a syscall-number table with `@group`
-expansion, `SystemCallArchitectures=`, and `SystemCallErrorNumber=`. Still
+expansion, `SystemCallArchitectures=`, and `SystemCallErrorNumber=`. As in
+systemd, `SystemCallFilter=` **implies `NoNewPrivileges=`** (required for an
+unprivileged manager to install the filter), and a deny-list's blocked syscall
+fails with `EPERM` by default (`SystemCallErrorNumber=` is respected if set,
+rather than silently returning 0 — see the seccomp e2e test). Still
 unimplemented: the rest of the Phase-2/3 family —
 `MemoryDenyWriteExecute=`, `PrivateDevices=`, `DynamicUser=`,
 `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
@@ -168,11 +172,13 @@ mount lifecycle, timer firing, target `Wants=` pull-in, live demo units, device
 enumeration, journal persistence, and a real-CLI roundtrip — but thin where it
 matters for the stated goals:
 
-- **No e2e coverage for**: sandbox isolation (a `PrivateTmp`/`ProtectSystem`
+- **No e2e coverage for**: mount sandbox isolation (a `PrivateTmp`/`ProtectSystem`
   leak or a read-only write-denial is never asserted), cgroup limit enforcement,
   `enable`/`disable` symlink installation, template instantiation
   (`getty@tty1`→`getty@.service`), restart/`on-failure` policy, or
-  timeout/`KillSignal` handling.
+  timeout/`KillSignal` handling. (Seccomp `SystemCallFilter=` *does* have an
+  e2e test — `rystemd/tests/seccomp.rs` — plus the privilege-requiring
+  `PrivateTmp` case in `rystemd/tests/privileged.rs`.)
 - **No CI on push/PR.** The only workflow (`release.yml`) runs `cargo test`
   (Linux only, no clippy/fmt) *on tag pushes*. The `boot` (PID-1) path, the
   `dbus` feature, and clippy/fmt are gated nowhere except the tag-triggered

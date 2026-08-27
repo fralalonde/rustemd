@@ -1,0 +1,148 @@
+//! End-to-end coverage of `SystemCallFilter=` (seccomp) enforcement over the
+//! real manager — the gap KNOWN_ISSUES.md flags ("no e2e coverage for sandbox
+//! isolation"). Unlike the privileged sandbox suite this needs **no root**:
+//! a `SECCOMP_MODE_FILTER` is installed in the forked child via
+//! `no_new_privs`, which the manager now forces implicitly for such units
+//! (matching systemd, where `SystemCallFilter=` implies `NoNewPrivileges=`).
+//! A container that blocks `prctl(PR_SET_SECCOMP)` cannot run this at all, so
+//! we self-skip when an always-allow filter cannot be installed — the same
+//! principle the mount-op sandbox tests use.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
+mod common;
+
+use std::path::Path;
+use std::time::Duration;
+
+use common::{Daemon, Scratch, wait_for};
+use rystemd::control::{Control, SocketClient};
+
+/// `PR_SET_SECCOMP` is not exported by libc for Linux (see `sandbox.rs`).
+const PR_SET_SECCOMP: libc::c_int = 22;
+
+/// Can this environment actually install a `SECCOMP_MODE_FILTER`? This is the
+/// case on a normal (unprivileged) machine after `no_new_privs`, but denied
+/// (`EPERM`) inside a container that restricts `prctl(PR_SET_SECCOMP)` in its
+/// own seccomp profile. Forked so the probe's no_new_privs/filter state never
+/// leaks back into the test process.
+fn seccomp_installable() -> bool {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // Child: set no_new_privs, then try to install an always-ALLOW filter.
+        // SAFETY: prctl with valid, constant args.
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        let f = libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        };
+        let mut fprog = libc::sock_fprog {
+            len: 1,
+            filter: (&f as *const libc::sock_filter).cast_mut(),
+        };
+        // SAFETY: fprog describes a valid one-instruction filter; prctl copies
+        // it into the kernel before returning.
+        let ok = unsafe {
+            libc::prctl(PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &mut fprog, 0, 0) == 0
+        };
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let mut st: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+    libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0
+}
+
+/// Start the manager and wait for its control socket, returning the client.
+fn start_daemon() -> (Daemon, SocketClient) {
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        Path::new(&daemon.socket).exists()
+    }));
+    let ctl = daemon.client();
+    (daemon, ctl)
+}
+
+/// Start a oneshot service and wait for it to reach `inactive`.
+fn run_oneshot(ctl: &mut SocketClient, name: &str) {
+    ctl.start(&[name])
+        .unwrap_or_else(|e| panic!("start {name}: {e}"));
+    assert!(
+        wait_for(Duration::from_secs(5), || ctl
+            .status(&[name])
+            .ok()
+            .and_then(|v| v.first().map(|s| s.active == "inactive"))
+            .unwrap_or(false)),
+        "{name} should reach inactive; status: {:?}",
+        ctl.status(&[name])
+    );
+}
+
+/// `SystemCallFilter=~mkdir` (a deny-list) really blocks the `mkdir` syscall.
+/// Each unit runs an identical shell command (fresh target + marker per unit)
+/// that records `mkdir`'s exit code; the unfiltered control writes `0`, the
+/// filtered unit writes a non-zero code because seccomp makes the `mkdir`
+/// syscall return EPERM and the `mkdir` binary exits non-zero. The manager
+/// applies the filter under a plain user-mode manager because
+/// `SystemCallFilter=` now implies `NoNewPrivileges=` — without that fix the
+/// unit would refuse to spawn (EACCES).
+#[test]
+fn systemcallfilter_denylist_blocks_syscall() {
+    if !seccomp_installable() {
+        eprintln!(
+            "skipping systemcallfilter_denylist_blocks_syscall: \
+             seccomp filter install is restricted in this environment"
+        );
+        return;
+    }
+
+    let scratch = Scratch::new();
+
+    // Two units, one filtered and one not, writing to independent markers so
+    // neither run can interfere with the other.
+    let mut units = Vec::new();
+    for (i, name) in ["mkdir-allow.service", "mkdir-deny.service"]
+        .iter()
+        .enumerate()
+    {
+        let marker = scratch.dir.path().join(format!("marker-{i}"));
+        let target = scratch.dir.path().join(format!("probe-dir-{i}"));
+        let cmd = format!(
+            "rm -f {m}; mkdir {t}; echo $? > {m}",
+            m = marker.display(),
+            t = target.display()
+        );
+        let sandbox = if i == 0 {
+            ""
+        } else {
+            "SystemCallFilter=~mkdir mkdirat\n"
+        };
+        scratch.write_unit(
+            name,
+            &format!("[Service]\nType=oneshot\n{sandbox}ExecStart=/bin/sh -c '{cmd}'\n"),
+        );
+        units.push((i, name.to_string(), marker));
+    }
+
+    let (_daemon, mut ctl) = start_daemon();
+
+    for (i, name, marker) in units {
+        run_oneshot(&mut ctl, &name);
+        let code: i32 = std::fs::read_to_string(&marker)
+            .unwrap_or_else(|e| panic!("{name}: no marker written: {e}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}: unparsable marker"));
+        if i == 0 {
+            assert_eq!(code, 0, "unfiltered mkdir should succeed (got {code})");
+        } else {
+            assert_ne!(
+                code, 0,
+                "SystemCallFilter=~mkdir should block mkdir (got {code})"
+            );
+        }
+    }
+}

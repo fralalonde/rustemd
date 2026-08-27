@@ -1261,6 +1261,11 @@ fn parse_sandbox(
                 )
                 .map_err(|e| e.to_string())?;
             }
+            // A deny-list's blocked syscall must fail with a real error, or
+            // the process would see a syscall that "succeeded". systemd's
+            // default `SystemCallErrorNumber=` is EPERM; an explicit
+            // `SystemCallErrorNumber=` below overrides it.
+            s.syscall_errno = parse_errno("EPERM")?;
         }
         if let Some(v) = unit_scalar(raw, "Service", "SystemCallErrorNumber") {
             // Accept names like `EPERM`/`EPERM ` or a raw number. A missing
@@ -1628,6 +1633,27 @@ mod tests {
         assert!(s.syscall_nrs.contains(&0)); // read
         assert!(s.syscall_nrs.contains(&1)); // write
         assert!(!s.syscall_nrs.contains(&231)); // exit_group is auto-added only in build(), not here
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn syscall_filter_defaults_errno_to_eperm() {
+        // Without SystemCallErrorNumber=, a deny-list's blocked syscall must
+        // fail with EPERM (systemd's default), not silently "succeed" with
+        // errno 0.
+        let f = build_str(
+            "[Service]\nSystemCallFilter=~mkdir mkdirat\nExecStart=/bin/true\n",
+            "sc2.service",
+        )
+        .unwrap();
+        assert_eq!(f.service.as_ref().unwrap().sandbox.syscall_errno, 1); // EPERM
+        // An explicit value still overrides the default.
+        let f2 = build_str(
+            "[Service]\nSystemCallFilter=~mkdir\nSystemCallErrorNumber=EACCES\nExecStart=/bin/true\n",
+            "sc2.service",
+        )
+        .unwrap();
+        assert_eq!(f2.service.as_ref().unwrap().sandbox.syscall_errno, 13);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
