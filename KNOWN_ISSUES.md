@@ -29,8 +29,8 @@
 - **Journaling is a plain store, not journald** — per-unit on-disk journal
   under `/var/log/rystemd/` with `rystemctl journal`; no `journalctl` binary,
   no journald wire format, no syslog/journald forwarding. **Service sandboxing
-  is Phase-1 only** — no `CapabilityBoundingSet=`/`AmbientCapabilities=`,
-  seccomp (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
+  is Phase-1 plus capability control** — no seccomp
+  (`SystemCallFilter=`), `DynamicUser=`, or `DevicePolicy=`/`DeviceAllow=`
   (eBPF). No `systemd-analyze`-style tooling. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full categorized list.
 - `notify` types are supported (`NOTIFY_SOCKET`), but `sd_notify`'s watchdog is
@@ -132,12 +132,13 @@ pairs with it is absent.
 Implemented (Linux, Phase-1): mount-namespace plumbing via `CLONE_NEWNS` (root)
 or `CLONE_NEWUSER|CLONE_NEWNS` + uid_map (user), `PrivateTmp=`, `ProtectHome=`
 (read-only or tmpfs), `ProtectSystem=` (yes/full/strict), `ReadOnlyPaths=`,
-`NoNewPrivileges=`. A user-mode manager cannot read-only-relabel pre-existing
+`NoNewPrivileges=`, and now `CapabilityBoundingSet=` (drop-from or `~` inverted
+bounding set) and `AmbientCapabilities=` (best-effort `PR_CAP_AMBIENT_RAISE`). A
+user-mode manager cannot read-only-relabel pre-existing
 host mounts (needs `CAP_SYS_ADMIN` over them, which a userns doesn't confer) —
 those ops degrade to a visible warning rather than failing the unit, matching
-systemd's tolerance. Notably unimplemented: `CapabilityBoundingSet=` and
-`AmbientCapabilities=` (dropped from Phase-1; the raw `capset` ABI wasn't in
-`libc`), and the Phase-2/3 family — `SystemCallFilter=` (seccomp),
+systemd's tolerance. Still unimplemented: the Phase-2/3 family —
+`SystemCallFilter=` (seccomp),
 `SystemCallArchitectures=`, `MemoryDenyWriteExecute=`, `PrivateDevices=`,
 `DynamicUser=`, `DeviceAllow=`/`DevicePolicy=` (eBPF), `ProtectKernel*`,
 `Restrict*`, `IPAddress*`, `RemoveIPC=`, `LockPersonality=`. All of the latter

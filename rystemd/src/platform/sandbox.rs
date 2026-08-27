@@ -34,6 +34,16 @@ pub enum Op {
     BindReadOnly(PathBuf),
     /// `prctl(PR_SET_NO_NEW_PRIVS)`.
     NoNewPrivileges,
+    /// `CapabilityBoundingSet=`: drop the given capabilities from the
+    /// process's bounding set via `prctl(PR_CAPBSET_DROP)`. When the config
+    /// used the `~` inversion (`~CAP_...`), `ops` carries the *complement*
+    /// (the caps kept); otherwise it carries the caps to drop.
+    CapBoundingDrop(Vec<u32>, bool /* invert: ops lists kept-caps */),
+    /// `AmbientCapabilities=`: raise the given capabilities in the ambient set
+    /// via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE)`. Best-effort — needs
+    /// the cap in the permitted set and a non-zero bounding set; a failure
+    /// (EPERM) is tolerated and logged.
+    AmbientRaise(Vec<u32>),
 }
 
 /// Build the ordered op list for `cfg`, or `None` if no implemented directive
@@ -88,6 +98,29 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     }
     if cfg.no_new_privileges {
         ops.push(Op::NoNewPrivileges);
+    }
+    // CapabilityBoundingSet=: convert the named caps to numbers. When the set
+    // is inverted (`~`), we drop everything *except* the listed caps.
+    if !cfg.bounding_set.is_empty() {
+        let keep = cfg.bounding_invert;
+        let caps: Vec<u32> = cfg
+            .bounding_set
+            .iter()
+            .filter_map(|s| cap_number(s))
+            .collect();
+        if !caps.is_empty() {
+            ops.push(Op::CapBoundingDrop(caps, keep));
+        }
+    }
+    if !cfg.ambient_set.is_empty() {
+        let caps: Vec<u32> = cfg
+            .ambient_set
+            .iter()
+            .filter_map(|s| cap_number(s))
+            .collect();
+        if !caps.is_empty() {
+            ops.push(Op::AmbientRaise(caps));
+        }
     }
     Some(ops)
 }
@@ -205,6 +238,39 @@ pub fn apply(ops: &[Op]) -> Result<Option<()>, String> {
                     return Err(fmt("no-new-privs", &std::io::Error::last_os_error()));
                 }
             }
+            Op::CapBoundingDrop(caps, invert) => {
+                // PR_CAPBSET_DROP is irreversible and per-capability. To keep
+                // only the listed caps we drop every cap not in the list; to
+                // drop only the listed caps we invert that set. Dropping a cap
+                // that is not currently in the bounding set is harmless (prctl
+                // succeeds), so this is also safe for over-broad names.
+                let drop: Vec<u32> = if *invert {
+                    (0..=LAST_CAP).filter(|c| !caps.contains(c)).collect()
+                } else {
+                    caps.clone()
+                };
+                for cap in &drop {
+                    // SAFETY: PR_CAPBSET_DROP with a valid cap number.
+                    if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, *cap, 0, 0, 0) } != 0 {
+                        return Err(fmt("cap-bounding-drop", &std::io::Error::last_os_error()));
+                    }
+                }
+            }
+            Op::AmbientRaise(caps) => {
+                for cap in caps {
+                    // SAFETY: PR_CAP_AMBIENT with PR_CAP_AMBIENT_RAISE.
+                    let r = unsafe {
+                        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, *cap, 0, 0)
+                    };
+                    if r != 0 {
+                        // Needs the cap in the permitted set, a non-empty
+                        // bounding set holding it, and no_new_privs off.
+                        // Tolerate: ambient caps are best-effort under
+                        // unprivileged managers.
+                        eprintln!("rystemd: [sandbox] ambient CAP_{cap} not raised");
+                    }
+                }
+            }
         }
     }
     Ok(Some(()))
@@ -238,6 +304,60 @@ fn setup_userns_map() -> Result<(), String> {
 fn cstr(p: &Path) -> std::ffi::CString {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap_or_default()
+}
+
+/// Highest defined capability number (Linux 5.11+ has 40, CHECKPOINT_RESTORE).
+const LAST_CAP: u32 = 40;
+
+/// Map a capability name (optionally `CAP_`-prefixed, case-insensitive) to its
+/// number, matching the `capabilities(7)` table. Unknown names return `None`.
+fn cap_number(name: &str) -> Option<u32> {
+    let name = name.to_ascii_uppercase();
+    let name = name.strip_prefix("CAP_").unwrap_or(&name);
+    let caps = [
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "DAC_READ_SEARCH",
+        "FOWNER",
+        "FSETID",
+        "KILL",
+        "SETGID",
+        "SETUID",
+        "SETPCAP",
+        "LINUX_IMMUTABLE",
+        "NET_BIND_SERVICE",
+        "NET_BROADCAST",
+        "NET_ADMIN",
+        "NET_RAW",
+        "IPC_LOCK",
+        "IPC_OWNER",
+        "SYS_MODULE",
+        "SYS_RAWIO",
+        "SYS_CHROOT",
+        "SYS_PTRACE",
+        "SYS_PACCT",
+        "SYS_ADMIN",
+        "SYS_BOOT",
+        "SYS_NICE",
+        "SYS_RESOURCE",
+        "SYS_TIME",
+        "SYS_TTY_CONFIG",
+        "MKNOD",
+        "LEASE",
+        "AUDIT_WRITE",
+        "AUDIT_CONTROL",
+        "SETFCAP",
+        "MAC_OVERRIDE",
+        "MAC_ADMIN",
+        "SYSLOG",
+        "WAKE_ALARM",
+        "BLOCK_SUSPEND",
+        "AUDIT_READ",
+        "PERFMON",
+        "BPF",
+        "CHECKPOINT_RESTORE",
+    ];
+    caps.iter().position(|c| *c == name).map(|i| i as u32)
 }
 
 fn fmt(op: &str, e: &std::io::Error) -> String {
@@ -280,6 +400,37 @@ mod tests {
         let ops = plan(&c).unwrap();
         assert!(ops.contains(&Op::MountTmpfs(PathBuf::from("/tmp"))));
         assert!(ops.contains(&Op::MountTmpfs(PathBuf::from("/var/tmp"))));
+    }
+
+    #[test]
+    fn cap_names_resolve_to_numbers() {
+        assert_eq!(cap_number("CHOWN"), Some(0));
+        assert_eq!(cap_number("CAP_NET_BIND_SERVICE"), Some(10));
+        assert_eq!(cap_number("SYS_ADMIN"), Some(21));
+        assert_eq!(cap_number("cap_setuid"), Some(7)); // case-insensitive
+        assert_eq!(cap_number("BPF"), Some(39));
+        assert_eq!(cap_number("NOT_A_CAP"), None);
+    }
+
+    #[test]
+    fn plan_adds_bounding_and_ambient_ops() {
+        let c = cfg_with(|c| {
+            c.bounding_set = vec!["CAP_NET_BIND_SERVICE".into(), "SYS_ADMIN".into()];
+            c.ambient_set = vec!["CAP_NET_RAW".into()];
+        });
+        let ops = plan(&c).unwrap();
+        assert!(ops.contains(&Op::CapBoundingDrop(vec![10, 21], false)));
+        assert!(ops.contains(&Op::AmbientRaise(vec![13])));
+    }
+
+    #[test]
+    fn inverted_bounding_keeps_only_listed() {
+        let c = cfg_with(|c| {
+            c.bounding_invert = true;
+            c.bounding_set = vec!["CAP_KILL".into()];
+        });
+        let ops = plan(&c).unwrap();
+        assert!(ops.contains(&Op::CapBoundingDrop(vec![5], true)));
     }
 
     #[test]
