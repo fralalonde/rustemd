@@ -8,6 +8,13 @@ derived from Git tags via `build.rs` (never hardcoded).
 
 ### Fixed
 
+- **`OnUnitInactiveSec=`/`OnUnitActiveSec=` no longer fire units that were
+  never activated.** `rearm_timer` took the inactive branch for any non-active
+  target, so a timer whose only elapse source is `OnUnitInactiveSec=` spuriously
+  started a service that had never run this boot. The inactive branch is now
+  gated on the target having passed through `Active` (systemd semantics: these
+  directives only arm once the unit has actually been activated/deactivated).
+  Regression coverage: `timer_onunitinactive_requires_prior_activation` (e2e).
 - **`SystemCallFilter=` (seccomp) now actually blocks.** Before, a deny-list
   built its BPF program with `SystemCallErrorNumber=` defaulting to `0`, so a
   blocked syscall returned `-0` — indistinguishable from success — and the

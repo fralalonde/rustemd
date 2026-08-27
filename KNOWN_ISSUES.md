@@ -42,19 +42,16 @@
 
 ## Bugs
 
-### Timer re-arm fires units that were never started
-`OnUnitActiveSec` / `OnUnitInactiveSec` / `OnCalendar` re-arm and fire even
-when the timer's target unit is not in the started state, whereas systemd only
-arms these once the unit is activated. Causes spurious firings. The demo works
-around it with `OnBootSec`. Location: `manager/timer.rs` re-arm path.
-
-### `try-restart` always restarts
-`Command::RestartOrStart` (`rystemctl/src/cli.rs:215`) dispatches `restart`,
-not a `try-restart` op, so `rystemctl try-restart` restarts a unit *even when
-it is inactive* — the documented "restart if running, otherwise just start"
-contract is broken, and it always stops an inactive unit's `ExecStop` (which
-should not run). No `try_restart` IPC op exists; `restart_or_start`/`try-restart`
-semantics are unimplemented.
+### `OnUnitInactiveSec`/`OnUnitActiveSec` no longer fire un-activated targets
+`OnUnitInactiveSec=` (and by symmetry `OnUnitActiveSec=`) no longer arm while
+the timer's target has never been activated this boot — previously `rearm_timer`
+took the inactive branch for any non-active target, so a `OnUnitInactiveSec`
+timer spuriously fired a unit that had never run. Now the inactive branch is
+gated on the target having passed through `Active` (`active_enter`). Note that
+`Type=oneshot` services never reach `Active` in this implementation, so
+`OnUnitInactiveSec=` keyed on a oneshot target will not re-fire; use a
+long-running service as the reference transition. Coverage:
+`timer_onunitinactive_requires_prior_activation` (e2e).
 
 ### resume_primary_thread can leave a service stuck in START_PENDING
 Location: `rystemd/src/platform/windows/process.rs:299-334`. The thread-resume
@@ -97,12 +94,12 @@ no field filters (`-u`, `-p`, `-S`), no boot/session disambiguation.
 (`StandardOutput=journal` backs onto that capture.)
 
 ### `systemctl` CLI surface is incomplete
-Implemented: start/stop/restart/reload/status/kill/is-active/is-failed/
+Implemented: start/stop/restart/try-restart/reload/status/kill/is-active/is-failed/
 is-enabled/enable/disable/daemon-reload/list-units/list-unit-files/list-timers/
 cat/show/get-default/set-default/isolate/is-system-running/poweroff/journal.
 Missing for drop-in use: `mask`/`unmask`, `edit`, `list-dependencies`,
 `list-sockets`, `reset-failed`, `clean`, `preset`, `reenable`, `link`, `revert`,
-`cancel`, `list-machines`, and a correct `try-restart` (see bug above).
+`cancel`, `list-machines`.
 `isolate` exists but its stop-others semantics are untested.
 
 ### No `Condition*`/`Assert*` directives

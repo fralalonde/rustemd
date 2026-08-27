@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Daemon, Scratch, wait_for};
-use rystemd::control::Control;
+use rystemd::control::{Control, SocketClient};
 
 #[test]
 fn start_status_stop_lifecycle() {
@@ -521,6 +521,82 @@ fn timer_activates_target_on_schedule() {
         last_set,
         "list_timers should record the timer's last elapse"
     );
+}
+
+/// Regression test for the KNOWN_ISSUES timer bug: `OnUnitInactiveSec=` must
+/// not spuriously fire a target that has never been activated this boot
+/// (systemd only arms it once the unit has actually been deactivated), but it
+/// must re-arm and re-fire after a real activation→deactivation cycle.
+///
+/// The target is a long-running `Type=simple` service rather than a oneshot:
+/// a oneshot unit is parked `Inactive` on completion without ever passing
+/// through the `Active` state in this implementation, so it cannot be the
+/// reference for an active→inactive transition. A `Type=simple` unit goes
+/// `Active` on spawn (setting `active_enter`) and back to `Inactive` when
+/// stopped.
+#[test]
+fn timer_onunitinactive_requires_prior_activation() {
+    let scratch = Scratch::new();
+    // Type=simple, long-running: the target genuinely reaches Active then
+    // returns to Inactive on stop — the transition OnUnitInactiveSec keys on.
+    scratch.write_unit(
+        "gated.service",
+        "[Unit]\nDescription=gated\n[Service]\nType=simple\nExecStart=/bin/sleep 60\n",
+    );
+    // No OnCalendar/OnBootSec: OnUnitInactiveSec is the ONLY elapse source.
+    scratch.write_unit(
+        "gated.timer",
+        "[Unit]\nDescription=gated timer\n[Timer]\nOnUnitInactiveSec=1s\nUnit=gated.service\n",
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut ctl = daemon.client();
+
+    let target_active = |c: &mut SocketClient| {
+        c.is_active(&["gated.service"])
+            .map(|v| v == vec!["active"])
+            .unwrap_or(false)
+    };
+
+    // Arm the timer while the target is inactive and has never been started.
+    ctl.start(&["gated.timer"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.is_active(&["gated.timer"])
+            .map(|v| v == vec!["active"])
+            .unwrap_or(false)
+    }));
+
+    // The never-activated target must NOT be fired within a generous window.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !target_active(&mut ctl),
+        "OnUnitInactiveSec must not fire a target that was never activated"
+    );
+
+    // Now give it a real activation, then deactivation: the long-running
+    // service starts (Active) and is stopped (Inactive), after which
+    // OnUnitInactiveSec legitimately re-arms and re-fires it.
+    ctl.start(&["gated.service"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || target_active(&mut ctl)));
+    ctl.stop(&["gated.service"]).unwrap();
+    assert!(wait_for(Duration::from_secs(3), || !target_active(
+        &mut ctl
+    )));
+
+    let re_fired = wait_for(Duration::from_secs(6), || {
+        // 1s after the deactivation, the timer starts the target again.
+        target_active(&mut ctl)
+    });
+    assert!(
+        re_fired,
+        "OnUnitInactiveSec should re-fire after a real activation→deactivation"
+    );
+    // The re-fired target is again long-running, so it stays active; clean it
+    // up so the daemon shuts down without a lingering process.
+    let _ = ctl.stop(&["gated.service"]);
 }
 
 /// A `.target` is a pure grouping unit: starting it pulls in (and orders) its

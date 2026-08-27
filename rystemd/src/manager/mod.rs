@@ -2516,7 +2516,10 @@ impl Manager {
                         next_mono = min_of(next_mono, Instant::now() + d);
                     }
                 }
-            } else {
+            } else if tu.active_enter.is_some() {
+                // `OnUnitInactiveSec=` only arms once the target has actually
+                // been activated and then deactivated — never for a unit that
+                // has not been started this boot (spurious fire at load).
                 for ts in tc.on_inactive_sec.iter() {
                     if let Some(d) = ts.as_duration() {
                         next_mono = min_of(next_mono, Instant::now() + d);
