@@ -1,6 +1,6 @@
 [package]
 name = "rystemd-tui"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Terminal UI client for a running rystemd unit manager."
 license = "MIT"
