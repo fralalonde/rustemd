@@ -27,13 +27,13 @@ Initial release of rystemd: a systemd / `systemctl` reimplementation in Rust.
 - **Process supervision:** cgroup v2 isolation (process-group fallback),
   `User=`/`Group=` privilege dropping, journal capture, `Restart=` policies,
   and daemonization/orphan sweeping.
-- **D-Bus (opt-in `dbus` feature):** a native `org.rystemd.Manager1` interface
-  plus an `org.freedesktop.systemd1`-compatible read surface, served only when
-  that well-known name is free (so it drops in where systemd is absent).
+- **D-Bus (default-on for Linux `dbus` feature):** a native `org.rystemd.Manager1`
+  interface plus an `org.freedesktop.systemd1`-compatible read surface, served
+  only when that well-known name is free (so it drops in where systemd is absent).
 - **PID-1 boot (opt-in `boot` feature):** mount API filesystems, early-boot
   configuration, and shutdown.
-- **Packaging:** Homebrew (`fralalonde/rystemd` tap), `.deb` / `.rpm`, portable
-  `.tar.gz`, Windows `.zip` / `.msi`, and macOS `.tar.gz` / `.dmg`.
+- **Packaging:** Homebrew tap, `.deb` / `.rpm`, portable `.tar.gz`, and Windows
+  `.zip` / `.msi`. (Linux + Windows targets; macOS is not supported.)
 
 ### Known limitations
 

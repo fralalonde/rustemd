@@ -14,7 +14,7 @@ which depends on the library's `Control` API).
 | `manager::deps` | Dependency graph (start/stop ordering) |
 | `manager::timer` | Cancelable timer wheel |
 | `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
-| `dbus` | zbus bridge for the `org.rystemd.Manager1.Manager` interface (Linux, opt-in `dbus` feature) |
+| `dbus` | zbus bridge for the `org.rystemd.Manager1.Manager` interface (Linux, default-on `dbus` feature) |
 | `ipc` / `client` | JSON wire protocol + client |
 | `control` | The `Control` trait + in-process/remote implementations |
 | `daemon` | The PID-1 manager entry point (`rystemd daemon`) |
@@ -126,7 +126,6 @@ artifacts on every `v*` tag push:
 | `x86_64-unknown-linux-gnu`   | `ubuntu-22.04`     | tar.gz, deb, rpm |
 | `aarch64-unknown-linux-gnu`  | `ubuntu-24.04-arm` | tar.gz, deb, rpm |
 | `x86_64-pc-windows-msvc`     | `windows-2022`     | tests, zip, msi |
-| `aarch64-apple-darwin`       | `macos-14`         | tar.gz, dmg   |
 
 The package version comes from the git tag at build time (see
 `rystemd/build.rs`); `Cargo.toml`/`Cargo.lock` are kept in sync by `release.sh`

@@ -11,18 +11,21 @@
   `scripts/ns-boot-test.sh` (unprivileged namespaces, no qemu),
   `scripts/vm-test.sh` (qemu + initramfs, automated), or drive it
   interactively with `scripts/live-vm.sh` (see [DEMO.md](DEMO.md)).
-- **D-Bus is opt-in** — the `dbus` cargo feature pulls in zbus for
-  `Type=dbus`/`BusName=` activation and the `org.rystemd.Manager1.Manager`
-  control interface. Off by default to keep the default build free of the
-  zbus/zvariant/async-executor dependency tree (and ~48% smaller). Build with
-  `--features dbus` to enable it.
+- **D-Bus is on by default on Linux** — the `dbus` feature (default on Linux)
+  pulls in zbus for `Type=dbus`/`BusName=` activation and the
+  `org.rystemd.Manager1.Manager` control interface, plus a systemd1-compatible
+  surface when the name is free. To keep a build free of the
+  zbus/zvariant/async-executor dependency tree, build with
+  `--no-default-features` or opt out of `dbus` specifically.
 - **Windows socket activation is trigger-only** — TCP listeners activate the
   service but are not inherited by it. Unix sockets and `LISTEN_FDS` handoff
   remain Unix-only.
 - **Windows service-type subset** — `forking`, `notify`, `dbus`, `User=`,
   `Group=`, `MemoryHigh=`, `CPUWeight=`, and `KillMode=process` fail explicitly. Windows has no
   generic POSIX-signal equivalent; stop/kill terminate the unit Job Object.
-- **macOS is not yet a supported manager target.**
+- **macOS is not a supported target.** rustemd reimplements systemd, whose
+  manager is Linux-native (cgroups v2, udev/netlink, system D-Bus); a macOS
+  build was never validated and there is no macOS release artifact.
 - **Journaling is a plain store, not journald** — per-unit on-disk journal
   under `/var/log/rystemd/` with `rystemctl journal`; no `journalctl` binary,
   no journald wire format, no syslog/journald forwarding. **Service sandboxing
@@ -73,9 +76,9 @@ signals. Still missing: the **control methods** (`StartUnit`/`StopUnit`/
 `RestartUnit`/`ReloadUnit` returning job object paths), the **job object model**
 and `JobNew`/`JobRemoved` signals, and `PropertiesChanged` emission. Until the
 control surface lands, real D-Bus consumers — `logind`/seat management, desktop
-portals, `systemctl --user` over the bus — cannot be driven drop-in. D-Bus is
-opt-in (the `dbus` cargo feature, off by default): builds without it omit the
-zbus dependency tree entirely.
+portal, `systemctl --user` over the bus — cannot be driven drop-in. The
+`dbus` feature is default-on for Linux; builds without it omit the zbus
+dependency tree entirely.
 
 ### journald drop-in is incomplete
 Service stdout/stderr are captured to a per-unit in-memory ring (`status`) and
@@ -212,9 +215,10 @@ the rystemd API boundary and are binding-only declarations. Retain both until
 an upstream `colored` upgrade naturally unifies them; forcing Cargo to do so
 would require an incompatible dependency override.
 
-### macOS build path unverified
-The release workflow builds a macOS artifact, but macOS does not yet have a
-supported manager platform implementation.
+### macOS support removed
+There is no macOS release job. rustemd reimplements systemd, which is
+Linux-native; the formerly-untested macOS build entry was dropped. Windows
+remains the supported compatibility target.
 
 ### Live VM has no standard shutdown commands
 Inside the live env, `shutdown` / `halt` / `poweroff` / `init 0` don't exist
