@@ -1,19 +1,27 @@
 # rystemd
 
-A **systemd unit-manager reimplementation in Rust** — a `systemctl`-compatible
-CLI with a built-in manager for unit files, user services, timers, socket
-triggers, and dependency-driven lifecycle. Linux uses cgroups v2 with process
-groups as a fallback; Windows uses native Win32 Job Objects.
+<p align="center">
+  <img src="assets/rystemd-logo.svg" alt="rystemd logo" width="140"/>
+</p>
 
-> **Status:** functional core on Linux and Windows. Linux additionally supports
-> PID-1 boot, D-Bus (opt-in), udev `.device` units, `.mount` units, an
-> on-disk journal (`rystemctl journal`), and Phase-1 service sandboxing
-> (`PrivateTmp=`, `ProtectHome=`/`ProtectSystem=`, `ReadOnlyPaths=`,
-> `NoNewPrivileges=`). Windows supports `.service`, `.socket` (TCP trigger
-> activation), `.timer`, and `.target` units in SCM system mode or interactive
-> `--user` mode. There is no journald/syslog forwarding or `journalctl`
-> drop-in, no seccomp/`DynamicUser=`/`DevicePolicy=` hardening, and no
-> `systemd1` D-Bus interface yet.
+A **systemd unit-manager reimplementation in Rust** — a `systemctl`-compatible
+CLI with a built-in manager for unit files, user services, timers, socket and
+path triggers, and dependency-driven lifecycle. Linux is the primary target
+(cgroups v2, udev/netlink, D-Bus); Windows runs a compatibility port of the
+manager and CLI (Win32 Job Objects, named pipes, Service Control Manager).
+
+📖 Read the [handbook](https://github.com/rystemd/rystemd/blob/main/src/SUMMARY.md)
+or the [built site](https://rystemd.github.io/rystemd/).
+
+> **Status:** Linux is the fully-featured target — `.service`, `.socket`
+> (all `Listen*` types), `.timer`, `.target`, `.mount`, `.path`, `.device`,
+> PID-1 boot, an on-disk journal (`rystemctl journal`), and D-Bus
+> (default-on Linux) exposing both `org.rystemd.Manager1` and an
+> `org.freedesktop.systemd1`-compatible surface. Windows supports `.service`
+> (simple/exec/idle/oneshot), `.socket` (TCP trigger), `.timer`, and `.target`
+> in SCM system mode or interactive `--user` mode. Not yet: `.slice`/`.scope`
+> unit types and some sandbox directives are parsed-but-unenforced (see
+> [Compatibility](https://rystemd.github.io/rystemd/compatibility.html)).
 
 ---
 
@@ -22,7 +30,7 @@ groups as a fallback; Windows uses native Win32 Job Objects.
 ```sh
 cargo build --release
 
-# Linux/macOS user manager:
+# Linux user manager:
 ./target/release/rystemd daemon --user
 ./target/release/rystemctl --user list-units
 
@@ -31,12 +39,12 @@ cargo build --release
 .\target\release\rystemctl.exe --user list-units
 ```
 
-Two binaries split the work: `rystemd` is the PID-1 manager daemon, and
-`rystemctl` is the `systemctl`-compatible CLI that talks to it. To make
-existing `systemctl` scripts work unchanged, symlink the CLI under that name:
+Three binaries split the work: `rystemd` is the manager daemon, `rystemctl`
+is the `systemctl`-compatible CLI that talks to it, and `rystemd-tui` is a
+live terminal client. To make existing `systemctl` scripts work unchanged,
+symlink the CLI under that name:
 
 ```sh
-ln -s /path/to/rystemd /usr/local/bin/rystemd
 ln -s /path/to/rystemctl /usr/local/bin/systemctl
 ```
 
@@ -98,8 +106,8 @@ rystemctl completions nushell
 
 ## Homebrew
 
-On Linux (e.g. Bazzite) or macOS, install from a tap without layering via
-`rpm-ostree`:
+On Linux (e.g. an immutable Bazzite/Fedora-Atomic image) install from a tap
+without layering via `rpm-ostree`:
 
 ```sh
 brew tap fralalonde/rystemd
@@ -176,16 +184,22 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
 - `OnBootSec=`, `OnUnitActiveSec=`, `OnUnitInactiveSec=`, `OnStartupSec=`
 - `Persistent=`, `AccuracySec=`
 
-**Socket activation, mounts, & devices**
-- `.socket` units — `ListenStream=`/`ListenDatagram=`, inetd-style activation
-  via `LISTEN_FDS`, `Service=` target (the `socket` feature, default-on)
+**Socket activation, mounts, paths, & devices**
+- `.socket` units — `ListenStream=`, `ListenDatagram=`, `ListenSequentialPacket=`,
+  and `ListenNetlink=` (unix, TCP, UDP; inetd-style activation via `LISTEN_FDS`,
+  `Service=` target; the `socket` feature, default-on)
+- `.path` units — path-based activation (`PathExists=`, `PathExistsGlob=`,
+  `PathChanged=`, `DirectoryNotEmpty=`, `MakeDirectory=`) that starts a
+  matching service
 - `.mount` units — `[Mount]` `What=`/`Where=`/`Type=`/`Options=`, mount on
   start / unmount on stop (Linux only)
 - `.device` units — runtime-generated from sysfs + netlink uevents (the
   `udev` feature, default-on); no unit file, matching systemd
-- D-Bus — `org.rystemd.Manager1.Manager` (`ListUnits`/`GetUnit`/`StartUnit`/
-  `StopUnit`/`Version`) plus `Type=dbus`/`BusName=` activation (Linux only;
-  behind the opt-in `dbus` feature, not in `default`; not a `systemd1` drop-in)
+- D-Bus (Linux, default-on `dbus` feature) — `org.rystemd.Manager1.Manager`
+  (`ListUnits`/`GetUnit`/`StartUnit`/`StopUnit`/`Version`) plus, when the
+  name is free, an `org.freedesktop.systemd1`-compatible surface (`ListUnits`,
+  `GetUnit`/`LoadUnit`, `ListJobs`, `GetUnitProcesses`, per-unit `Unit`
+  objects, `UnitNew`/`UnitRemoved`), and `Type=dbus`/`BusName=` activation
 
 **Lifecycle & supervision**
 - Dependency graph (start order from `After`/`Requires`, stop order reversed)
@@ -204,7 +218,9 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
 
 ---
 
-See [`docs/handbook.md`](docs/handbook.md) for worked examples.
+See [`src/`](src/) for the multipage handbook source, or read the
+[handbook](https://github.com/rystemd/rystemd/blob/main/src/SUMMARY.md) /
+[built site](https://rystemd.github.io/rystemd/) for worked examples.
 
 ## License
 

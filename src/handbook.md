@@ -5,9 +5,8 @@ On Linux, `rystemctl` may be symlinked as `systemctl`; the examples use that
 compatibility name.
 
 Linux examples assume `./target/release/rystemd daemon --user` is running.
-Windows examples use either `rystemd.exe daemon --user` or the native SCM host.
-
----
+Windows examples use either `rystemd.exe daemon --user` or the native
+SCM host.
 
 ## 1. A basic service
 
@@ -23,18 +22,15 @@ ExecStart=/usr/bin/env sh -c 'while true; do echo hello; sleep 5; done'
 Restart=on-failure
 ```
 
-Start it and watch its captured output:
-
 ```sh
 systemctl --user start hello
-systemctl --user status hello      # shows the log ring
+systemctl --user status hello   # shows the captured log ring
 systemctl --user stop hello
 ```
 
-`Type=simple` goes active immediately after spawning; the unit's **cgroup**
-(Linux cgroup v2) is the supervision boundary, so `stop` SIGTERMs (then
-SIGKILLs) the whole tree — even children that double-fork out of their process
-group.
+`Type=simple` goes active immediately after spawning. On Linux the unit's
+**cgroup v2** is the supervision boundary, so `stop` SIGTERMs (then SIGKILLs)
+the whole tree — even children that double-fork out of their process group.
 
 ## 2. A oneshot "state" service
 
@@ -133,14 +129,13 @@ After=postgres.service
 ExecStart=/usr/local/bin/webapp
 ```
 
-`Requires` starts the dependency (and pulls it down if it fails);
-`Wants` starts it but ignores failure; `After` only orders, it doesn't imply
-a start. `Conflicts` stops the named unit when this one starts.
+`Requires` starts the dependency (and pulls it down if it fails); `Wants`
+starts it but ignores failure; `After` only orders, it doesn't imply a start.
+`Conflicts` stops the named unit when this one starts.
 
 ## 7. Drop-ins and specifiers
 
-Override a stock unit without editing it — put a file in
-`hello.service.d/`:
+Override a stock unit without editing it — put a file in `hello.service.d/`:
 
 ```ini
 # ~/.config/systemd/user/hello.service.d/override.conf
@@ -148,9 +143,9 @@ Override a stock unit without editing it — put a file in
 Environment=GREETING=howdy
 ```
 
-Specifiers expand at load time: `%n` (name), `%p` (prefix before `@`),
-`%i` (instance after `@`), `%u`/`%g` (user/group), `%h` (home), `%t` (runtime
-dir), `%%` (literal `%`). Instanced units (`web@1.service`) use `%i`.
+Specifiers expand at load time: `%n` (name), `%p` (prefix before `@`), `%i`
+(instance), `%u`/`%g` (user/group), `%h` (home), `%t` (runtime dir), `%%`
+(literal `%`). Instanced units (`web@1.service`) use `%i`.
 
 ## 8. Programmatic control (no shell, no D-Bus)
 
@@ -164,13 +159,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ctl.start(&["hello.service"])?;
     ctl.restart(&["hello.service"])?;
 
-    // Typed, owned status records.
     for s in ctl.status(&["hello.service"])? {
         println!("{}: {}/{}", s.name, s.active, s.sub);
-    }
-
-    for t in ctl.list_timers()? {
-        println!("timer {} activates {:?}", t.unit, t.next);
     }
 
     ctl.stop(&["hello.service"])?;
@@ -180,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Both `Manager` (in-process) and `SocketClient` (remote) implement the same
 `Control` trait, so you can write against `&mut dyn Control` and swap the
-backend freely. This is the library alternative to `systemctl` or D-Bus.
+backend freely.
 
 ---
 
@@ -195,8 +185,6 @@ backend freely. This is the library alternative to `systemctl` or D-Bus.
 Every path is overridable for tests via `RYSTEMD_UNIT_PATH`,
 `RYSTEMD_CONFIG_DIR`, `RYSTEMD_RUNTIME_DIR`, and `RYSTEMD_SOCKET`.
 
----
-
 ## TUI + shell completions
 
 - **TUI** — `rystemd-tui --user` connects to a running manager over the
@@ -204,103 +192,4 @@ Every path is overridable for tests via `RYSTEMD_UNIT_PATH`,
   shows tabbed live views: Units / Services / Timers / Unit files, with a
   status pane and single-key actions (`s` start, `x` stop, `r` restart, …).
 - **Completions** — `rystemctl completions <bash|fish|zsh|powershell|nushell>`
-  emits a completion script for that shell, named after the invoked binary.
-
-
-
----
-
-## Windows manager
-
-### Per-user mode
-
-Build and start the manager from PowerShell:
-
-```powershell
-cargo build --release
-.\target\release\rystemd.exe daemon --user
-```
-
-Place units in either of these directories (higher precedence first):
-
-- `%LOCALAPPDATA%\rystemd\config`
-- `%LOCALAPPDATA%\rystemd\units`
-
-Then use the normal client from another terminal:
-
-```powershell
-.\target\release\rystemctl.exe --user daemon-reload
-.\target\release\rystemctl.exe --user start hello.service
-.\target\release\rystemctl.exe --user status hello.service
-```
-
-A minimal Windows service unit uses native Windows command-line programs:
-
-```ini
-[Unit]
-Description=Windows worker
-
-[Service]
-Type=simple
-ExecStart=C:\Tools\worker.exe --serve
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-The process and all descendants run in a Win32 Job Object. `stop` terminates
-the Job Object, and manager exit closes every remaining job.
-
-### SCM system mode
-
-From an elevated terminal:
-
-```powershell
-rystemd.exe service install
-sc.exe start rystemd
-rystemctl.exe list-units
-sc.exe stop rystemd
-rystemd.exe service uninstall
-```
-
-Use `service install --manual` for demand start, or `--name` and
-`--display-name` for a custom registration. System units are searched in:
-
-- `%ProgramData%\rystemd\config`
-- `%ProgramData%\rystemd\units`
-
-SCM stop and system-shutdown controls request an orderly manager shutdown;
-the control callback itself does not run unit lifecycle work.
-
-### TCP socket trigger
-
-```ini
-# api.socket
-[Socket]
-ListenStream=127.0.0.1:8080
-Service=api.service
-
-# api.service
-[Service]
-Type=simple
-ExecStart=C:\Tools\api.exe
-```
-
-Starting `api.socket` binds the TCP listener. A pending connection is accepted as the trigger and activates `api.service`.
-For this MVP the listener remains owned by rystemd and is not
-passed to the child, so this is launch-on-connection rather than full systemd
-`LISTEN_FDS` handoff. Unix-domain listeners are not supported on Windows.
-
-### Windows compatibility table
-
-| Capability | Windows MVP |
-| --- | --- |
-| `Type=simple`, `exec`, `idle`, `oneshot` | Supported |
-| `.timer`, `.target` | Supported |
-| TCP `.socket` trigger | Supported; no child socket handoff |
-| `MemoryMax=`, `TasksMax=` | Win32 Job Object limits |
-| `Type=forking`, `notify`, `dbus` | Explicit error |
-| `User=`, `Group=` | Explicit error |
-| `MemoryHigh=`, `CPUWeight=`, `KillMode=process` | Explicit error |
-| Unix sockets, cgroups, mounts, devices, boot | Linux only |
+  emits a completion script for that shell.

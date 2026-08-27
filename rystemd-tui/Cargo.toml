@@ -4,8 +4,8 @@ version = "0.1.2"
 edition = "2024"
 description = "Terminal UI client for a running rystemd unit manager."
 license = "MIT"
-repository = "https://github.com/fralalonde/rystemd"
-homepage = "https://github.com/fralalonde/rystemd"
+repository = "https://github.com/rystemd/rystemd"
+homepage = "https://github.com/rystemd/rystemd"
 rust-version = "1.89"
 
 [dependencies]
