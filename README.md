@@ -10,8 +10,8 @@ path triggers, and dependency-driven lifecycle. Linux is the primary target
 (cgroups v2, udev/netlink, D-Bus); Windows runs a compatibility port of the
 manager and CLI (Win32 Job Objects, named pipes, Service Control Manager).
 
-📖 Read the [handbook](https://github.com/rystemd/rystemd/blob/main/src/SUMMARY.md)
-or the [built site](https://rystemd.github.io/rystemd/).
+📖 Read the [handbook](https://github.com/rystemd/rystemd.github.io/blob/main/src/SUMMARY.md)
+or the [built site](https://rystemd.github.io/).
 
 > **Status:** Linux is the fully-featured target — `.service`, `.socket`
 > (all `Listen*` types), `.timer`, `.target`, `.mount`, `.path`, `.device`,
@@ -21,7 +21,7 @@ or the [built site](https://rystemd.github.io/rystemd/).
 > (simple/exec/idle/oneshot), `.socket` (TCP trigger), `.timer`, and `.target`
 > in SCM system mode or interactive `--user` mode. Not yet: `.slice`/`.scope`
 > unit types and some sandbox directives are parsed-but-unenforced (see
-> [Compatibility](https://rystemd.github.io/rystemd/compatibility.html)).
+> [Compatibility](https://rystemd.github.io/compatibility.html)).
 
 ---
 
@@ -262,9 +262,9 @@ Regenerate the GIF with `sh demo/generate.sh` (needs `vhs` + `ttyd`).
 
 ---
 
-See [`src/`](src/) for the multipage handbook source, or read the
-[handbook](https://github.com/rystemd/rystemd/blob/main/src/SUMMARY.md) /
-[built site](https://rystemd.github.io/rystemd/) for worked examples.
+See the [handbook source](https://github.com/rystemd/rystemd.github.io/tree/main/src) for the multipage handbook, or read the
+[handbook](https://github.com/rystemd/rystemd.github.io/blob/main/src/SUMMARY.md) /
+[built site](https://rystemd.github.io/) for worked examples.
 
 ## License
 
