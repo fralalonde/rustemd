@@ -126,21 +126,20 @@ backs the WiX MSI and the NuGet package (below).
 
 ### Windows (NuGet)
 
-The Windows release also includes a [NuGet](https://learn.microsoft.com/nuget/)
-package for private feeds and automation. Download the `rystemd.<ver>.nupkg`
-asset from the GitHub release, then install it from the directory containing
-the package:
+The Windows release ships a [NuGet](https://www.nuget.org/packages/rystemd)
+package. Each tagged release publishes the `rystemd.<ver>.nupkg` from the
+[GitHub release](https://github.com/rystemd/rystemd/releases) to nuget.org, so
+installing is a single command:
 
 ```powershell
-nuget install rystemd -Source . -OutputDirectory ./rystemd-pkg
+nuget install rystemd -OutputDirectory ./rystemd-pkg
 # exes land under ./rystemd-pkg/rystemd.<ver>/tools/*
 ```
 
 It is a **native tools package** — it ships the three executables but does not
 shim `PATH` or register a service. Prefer [Scoop](#windows-scoop) for a
 PATH-installed end-user setup; choose the [MSI](#windows-msi) for a
-machine-wide install. Publishing to nuget.org requires a separate API-key
-configuration and is not implied by the GitHub release asset.
+machine-wide install.
 
 ### Windows (MSI)
 
