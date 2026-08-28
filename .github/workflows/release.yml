@@ -111,12 +111,16 @@ jobs:
           Move-Item "$bin/rystemd-$ver-x86_64.msi" dist/
 
           # NuGet native tools package (see packaging/nuget/rystemd.nuspec).
+          # Pack from the release staging dir (the same binaries that go into
+          # the released windows zip), NOT from a dev target/ build — so the
+          # .nupkg is built from the released package.
           # NuGet CLI is a standalone nuget.exe (verified locally as v7.9.0), not
           # a dotnet tool, so fetch it from dist.nuget.org.
           Invoke-WebRequest -OutFile "$env:TEMP\nuget.exe" `
             https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
           & "$env:TEMP\nuget.exe" pack packaging/nuget/rystemd.nuspec `
-            -Version $ver -OutputDirectory dist -NoPackageAnalysis
+            -Version $ver -OutputDirectory dist -NoPackageAnalysis `
+            -BasePath "dist/rystemd-$ver-x86_64-pc-windows-msvc"
           if ($LASTEXITCODE -ne 0) { throw "nuget pack failed" }
       - uses: actions/upload-artifact@v4
         with:

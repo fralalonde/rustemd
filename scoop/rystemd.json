@@ -1,12 +1,12 @@
 {
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A systemd init reimplementation in Rust: daemon (rystemd), a systemctl-compatible CLI (rystemctl), and a terminal UI. Windows is a supported compatibility port.",
   "homepage": "https://github.com/rystemd/rystemd",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/rystemd/rystemd/releases/download/v0.1.4/rystemd-0.1.4-x86_64-pc-windows-msvc.zip",
-      "hash": "9fdaad94945fcbf55acd8fc6865af180ab4500c0c7d0e94915a9a67907fab718"
+      "url": "https://github.com/rystemd/rystemd/releases/download/v0.1.5/rystemd-0.1.5-x86_64-pc-windows-msvc.zip",
+      "hash": "ee8593217ebf42c0211e37cb232dcc6379c2c67ca430b628947f26ff49ab4cc8"
     }
   },
   "bin": [

@@ -14,9 +14,12 @@
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
   </metadata>
   <files>
-    <!-- Native tools package: the three executables land in \tools -->
-    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemd.exe" target="tools\rystemd.exe" />
-    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemctl.exe" target="tools\rystemctl.exe" />
-    <file src="..\..\target\x86_64-pc-windows-msvc\release\rystemd-tui.exe" target="tools\rystemd-tui.exe" />
+    <!-- Native tools package: the three executables land in \tools.
+         The file sources are relative names resolved against a -BasePath that
+         points at the RELEASED package's staging directory (the same binaries
+         that go into the released windows zip), never a dev target/ dir. -->
+    <file src="rystemd.exe" target="tools\rystemd.exe" />
+    <file src="rystemctl.exe" target="tools\rystemctl.exe" />
+    <file src="rystemd-tui.exe" target="tools\rystemd-tui.exe" />
   </files>
 </package>
