@@ -111,17 +111,18 @@ binary from a system package manager / release tool.
 
 ### Windows (Scoop)
 
-The portable Windows release is packaged as a [Scoop](https://scoop.sh)
-manifest in `scoop/rystemd.json`. Install it additively (add the directory as
-a local bucket, or point `scoop install` straight at the manifest):
+The portable Windows release is packaged as a [Scoop](https://scoop.sh) bucket
+([`rystemd/scoop-rystemd`](https://github.com/rystemd/scoop-rystemd)). Add the
+bucket, then install:
 
 ```powershell
-scoop install ./scoop/rystemd.json     # installs rystemd, rystemctl, rystemd-tui
+scoop bucket add rystemd https://github.com/rystemd/scoop-rystemd
+scoop install rystemd/rystemd      # installs rystemd, rystemctl, rystemd-tui
 ```
 
-`checkver`/`autoupdate` are wired to the GitHub release stream, so bucket
-maintainers get new versions automatically on tag pushes. The same release
-zip backs the WiX MSI and the NuGet package (below).
+`checkver`/`autoupdate` are wired to the GitHub release stream, so `scoop
+update` pulls new versions automatically on tag pushes. The same release zip
+backs the WiX MSI and the NuGet package (below).
 
 ### Windows (NuGet)
 
