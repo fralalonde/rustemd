@@ -318,3 +318,168 @@ fn reboot_cmd(cmd: libc::c_int) -> ! {
     // it's just a clean exit.
     std::process::exit(0);
 }
+
+// --- real-root handoff (initramfs -> ostree/system deployment) --------------
+//
+// A host boots through an initramfs whose *stage-2* init (us) runs in a
+// throwaway rootfs. To manage the real machine we must pivot out of that
+// rootfs and into the actual deployment before reading any config. This is
+// the classic `switch_root(8)` sequence; `/sysroot` is the canonical mount
+// point an ostree/dracut initramfs prepares for the real root.
+
+/// True when running inside an initramfs — a temporary `rootfs`/`tmpfs` root
+/// rather than the real deployment. The kernel exposes the `rootfs` fstype in
+/// `/proc/self/mounts` for the `/` entry (a real btrfs/xfs/ext4 root reports
+/// its own type). A container or `--user` run reports `overlay`/`btrfs` and
+/// is skipped.
+pub fn in_initramfs() -> bool {
+    match fs::read_to_string("/proc/self/mounts") {
+        Ok(m) => in_initramfs_from_mounts(&m),
+        Err(_) => false,
+    }
+}
+
+// The `/` entry is the line whose mountpoint field (index 1) is exactly "/".
+fn in_initramfs_from_mounts(mounts: &str) -> bool {
+    mounts
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("/"))
+        .and_then(|line| line.split_whitespace().nth(2))
+        .map(|fstype| matches!(fstype, "rootfs" | "tmpfs" | "ramfs"))
+        .unwrap_or(false)
+}
+
+/// The real deployment is staged at `/sysroot` by the upstream initramfs
+/// (ostree/dracut mount the block device + subvols there before exec'ing
+/// stage-2). It is "ready for handoff" when `/sysroot` is its own mountpoint —
+/// a *different* filesystem than `/` — which we detect by it appearing in
+/// `/proc/self/mounts` with mountpoint exactly `/sysroot`.
+pub fn sysroot_mounted() -> bool {
+    match fs::read_to_string("/proc/self/mounts") {
+        Ok(m) => sysroot_mounted_from_mounts(&m),
+        Err(_) => Path::new("/sysroot").is_dir(),
+    }
+}
+
+fn sysroot_mounted_from_mounts(mounts: &str) -> bool {
+    mounts
+        .lines()
+        .any(|l| l.split_whitespace().nth(1) == Some("/sysroot"))
+}
+
+/// Re-exec the manager against the real root after a successful pivot.
+/// `switch_root` semantically "becomes init again"; this never returns on
+/// success.
+fn reexec(argv: &[std::ffi::CString]) -> std::io::Error {
+    // Build a null-terminated array of raw `*const c_char` pointers: execv
+    // needs `char *const argv[]` (an array of pointers), not pointers to &CStr.
+    let ptrs: Vec<*const libc::c_char> = {
+        let mut v: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        v.push(std::ptr::null());
+        v
+    };
+    // SAFETY: argv is valid CStrings; argv[0] points at a NUL-terminated
+    // program path; ptrs is a NULL-terminated vector of pointers.
+    unsafe {
+        libc::execv(argv[0].as_ptr(), ptrs.as_ptr());
+    }
+    std::io::Error::last_os_error()
+}
+
+/// Perform the real-root handoff: pivot the current root onto the deployment
+/// at `/sysroot` and re-exec the manager so it boots against the real `/etc`.
+///
+/// This mirrors `switch_root(8)` order precisely:
+///   1. `chdir("/sysroot")`         — enter the new root
+///   2. `mount(".", "/", MS_MOVE)`  — the cwd *is* the new root; move it onto `/`
+///   3. `chroot(".")`               — make the deployment the process root
+///   4. `chdir("/")`
+///   5. re-`exec` the manager → boots against real config, remains PID 1.
+///
+/// (The MS_MOVE source is the current directory, not a literal "/sysroot"
+/// path — after step 1 the cwd *is* /sysroot, and `mount(MS_MOVE)` requires
+/// source and target to identify the top of the new root mount. This is why
+/// we `chdir` first and pass "." as the source.)
+///
+/// Safety: caller must have already verified `in_initramfs()` and that
+/// `/sysroot` holds a real deployment via [`sysroot_mounted`]. On success this
+/// function never returns (it execs); on failure it returns the first error so
+/// the caller can fall back to the existing in-initramfs boot.
+pub fn handoff() -> Result<(), String> {
+    // 1. Enter the new root.
+    nix::unistd::chdir("/sysroot").map_err(|e| format!("chdir /sysroot: {e}"))?;
+
+    // 2. Move the new root (our cwd) onto "/".
+    nix::mount::mount(
+        Some(std::path::Path::new(".")),
+        std::path::Path::new("/"),
+        None::<&std::path::Path>,
+        nix::mount::MsFlags::MS_MOVE,
+        None::<&std::path::Path>,
+    )
+    .map_err(|e| format!("switch_root: mount --move . onto /: {e}"))?;
+
+    // 3-4. chroot into it and settle at the top.
+    nix::unistd::chroot(".").map_err(|e| format!("switch_root: chroot .: {e}"))?;
+    nix::unistd::chdir("/").map_err(|e| format!("switch_root: chdir /: {e}"))?;
+
+    // Delete the old initramfs root's contents (best-effort; a fresh initrd
+    // holds only what we staged). Rebuild the current argv and exec the real
+    // init — `/proc/self/exe` stays valid across the pivot.
+    let _ = fs::remove_dir_all("/oldinitrd");
+    let argv: Vec<std::ffi::CString> = std::env::args()
+        .map(CString::new)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("argv has NUL: {e}"))?;
+    // execv() terminates on the NULL pointer in `ptrs` (added inside reexec),
+    // so there is NO empty-string argv entry — an empty argument would be
+    // rejected by the CLI parser on the re-exec.
+    let err = reexec(&argv);
+    Err(format!("switch_root: exec /proc/self/exe failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_initramfs_rootfs() {
+        // dev=rootfs, mountpoint=/, fstype=rootfs
+        let mounts = "rootfs / rootfs rw 0 0\n";
+        assert!(in_initramfs_from_mounts(mounts));
+    }
+
+    #[test]
+    fn detects_initramfs_tmpfs_root() {
+        // Kernel exposes the initrd as `/` with fstype tmpfs on some builds.
+        let mounts = "none / tmpfs rw 0 0\n";
+        assert!(in_initramfs_from_mounts(mounts));
+    }
+
+    #[test]
+    fn real_root_is_not_initramfs() {
+        // A btrfs/xfs/ext4/overlay root is the real deployment (host or container).
+        let mounts = "/dev/sda1 / btrfs rw,relatime 0 0\n";
+        assert!(!in_initramfs_from_mounts(mounts));
+        let overlay = "overlay / overlay rw 0 0\n";
+        assert!(!in_initramfs_from_mounts(overlay));
+    }
+
+    #[test]
+    fn empty_or_unreadable_mounts_is_not_initramfs() {
+        assert!(!in_initramfs_from_mounts(""));
+        assert!(!in_initramfs_from_mounts("no-newline"));
+    }
+
+    #[test]
+    fn sysroot_mounted_only_when_real_mountpoint_present() {
+        let with = "rootfs rootfs rootfs rw 0 0\n/dev/sda1 /sysroot btrfs rw 0 0\n";
+        assert!(sysroot_mounted_from_mounts(with));
+        let without = "rootfs rootfs rootfs rw 0 0\n";
+        assert!(!sysroot_mounted_from_mounts(without));
+        // A bare directory under /sysroot without a mount line is not "ready".
+        assert!(!sysroot_mounted_from_mounts(
+            "rootfs rootfs rootfs rw 0 0\n/some /sysroot/x btrfs rw 0 0\n"
+        ));
+    }
+}
