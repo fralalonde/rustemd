@@ -102,6 +102,61 @@ for p in /sys/class/block/vda*; do
   umount /mnt 2>/dev/null
 done
 [ -n "$ROOT_DEV" ] || echo "rystemd: FATAL no root partition found" > /dev/console
+
+# Deterministic console login: override the DEPLOYMENT's default.target and
+# getty units to a slim, rystemd-native chain so we reach a live login: on our
+# own — WITHOUT Fedora's full graphical/service head graph (systemd-journald,
+# machine-id-commit, etc. wedge rystemd's job scheduler and never reach getty).
+# Fedora's /usr/lib/systemd/system/default.target is a symlink to
+# graphical.target; we overwrite that same path with a plain file (cat >
+# truncates), which find_unit() (and /etc not being a mounted subvol here)
+# resolves over everything. getty.target + getty@.service are the console
+# login units. `snapshot=on` keeps the pristine image untouched. Read back.
+USYS="/sysroot/usr/lib/systemd/system"
+mount -o remount,rw /sysroot 2>/dev/null
+mkdir -p "$USYS" "$USYS/default.target.wants" 2>/dev/null
+cat > "$USYS/default.target" <<'DEFAULTEOF'
+[Unit]
+Description=Default (console login)
+Wants=getty@ttyS0.service
+After=getty@ttyS0.service
+DEFAULTEOF
+# Neutralize Fedora's real basic.target (which Wants systemd-journald.service,
+# sysinit.target, ... and would drag the whole head graph into the boot and
+# wedge the job scheduler before any getty runs). This empty override keeps the
+# slim default -> getty chain isolated so login is deterministic.
+cat > "$USYS/basic.target" <<'BASICEOF'
+[Unit]
+Description=Basic System (rystemd milestone override)
+BASICEOF
+cat > "$USYS/getty.target" <<'TARGETEOF'
+[Unit]
+Description=Login Prompts
+TARGETEOF
+cat > "$USYS/getty@.service" <<'GETTYEOF'
+[Unit]
+Description=Getty on %i
+[Service]
+Type=idle
+ExecStart=-/usr/sbin/agetty -L 115200 %i linux
+Restart=always
+TimeoutStopSec=3s
+GETTYEOF
+cat > "$USYS/default.target.wants/getty@ttyS0.service" <<'WANTEOF'
+[Unit]
+Description=Getty on ttyS0
+[Service]
+Type=idle
+ExecStart=-/usr/sbin/agetty -L 115200 ttyS0 linux
+Restart=always
+TimeoutStopSec=3s
+WANTEOF
+if [ -f "$USYS/default.target" ] && grep -q "getty" "$USYS/default.target.wants/getty@ttyS0.service" && grep -q "agetty" "$USYS/getty@.service"; then
+  echo "rystemd: slim default.target + getty installed (verified)" > /dev/console
+else
+  echo "rystemd: WARNING getty override install FAILED" > /dev/console
+fi
+
 # rystemd finds /sysroot already mounted; hand PID 1 to it.
 exec /usr/bin/rystemd daemon
 EOF

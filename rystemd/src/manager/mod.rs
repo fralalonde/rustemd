@@ -503,7 +503,10 @@ impl Manager {
             }
         }
         names.insert("basic.target".into());
+        names.insert("sysinit.target".into());
         names.insert("multi-user.target".into());
+        names.insert("graphical.target".into());
+        names.insert("getty.target".into());
         names.insert("default.target".into());
         if let Ok(md) = std::fs::read_link(self.cfg.paths.default_target())
             && let Some(n) = md.file_name().and_then(|f| f.to_str())
@@ -3483,7 +3486,12 @@ fn read_cmdline(pid: u32) -> String {
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "basic.target" | "multi-user.target" | "default.target"
+        "basic.target"
+            | "sysinit.target" // empty aggregation target (real systemd: pulls in its .wants)
+            | "multi-user.target"
+            | "graphical.target"
+            | "getty.target"
+            | "default.target"
     )
 }
 
@@ -3601,7 +3609,9 @@ fn builtin_target(name: &str) -> Unit {
         unit: crate::unit::UnitConfig {
             description: match name {
                 "basic.target" => "Basic System".into(),
+                "sysinit.target" => "System Initialization".into(),
                 "multi-user.target" => "Multi-User System".into(),
+                "graphical.target" => "Graphical Interface".into(),
                 "default.target" => "Default".into(),
                 _ => String::new(),
             },
