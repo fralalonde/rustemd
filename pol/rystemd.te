@@ -1,0 +1,112 @@
+policy_module(rystemd, 0.1.0)
+
+########################################
+#
+# rystemd — init / systemd-compatible unit manager
+#
+# rystemd reimplements systemd's role: a unit manager that supervises
+# services. This module gives its binaries a dedicated domain (rystemd_t) and
+# the privileges an init needs to bootstrap, run unit files, spawn and
+# supervise children, and manage the unit/pid/run trees — while still keeping
+# the domain confined (no blanket sysadm).
+#
+# CONTRIBUTING A HOST-SPECIFIC RULE:
+#   This is the *base* module. On a real enforcing host, boot/iterate and
+#   fold audit2allow output back in as new allow rules here (audit2allow -a
+#   -M rystemd then review). Distro/version specifics (paths, unit dirs) can
+#   vary; keep this module generic and add a named per-host bolt-on if needed.
+
+########################################
+#
+# Declarations
+#
+
+type rystemd_t;
+type rystemd_exec_t;
+domain_type(rystemd_t)
+domain_entry_file(rystemd_t, rystemd_exec_t)
+
+# Journal / state / runtime under /var and /run.
+type rystemd_var_t;
+files_type(rystemd_var_t)
+type rystemd_run_t;
+files_type(rystemd_run_t)
+
+# The control/notify sockets and the unit search paths.
+type rystemd_socket_t;
+type rystemd_unit_t;
+files_type(rystemd_unit_t)
+
+# Types produced dynamically per-unit that we spawn. Children are confined by
+# their *own* domains when they have them; this is a generic fallback for
+# oneshot scripts run directly.
+type rystemd_child_t;
+domain_type(rystemd_child_t)
+type rystemd_child_exec_t;
+domain_entry_file(rystemd_child_t, rystemd_child_exec_t)
+
+########################################
+#
+# rystemd local policy
+#
+
+# --- init bootstrap: must read pids, kernel images, and manage processes ---
+files_read_all_pids(rystemd_t)
+files_read_kernel_img(rystemd_t)
+files_list_all(rystemd_t)
+
+# Manage own children + process trees (the core of supervision).
+allow rystemd_t self:process { fork sigchld signal getattr getpgid setpgid getsched setsched getrlimit setrlimit };
+allow rystemd_t self:fd use;
+allow rystemd_t self:capability { sys_resource sys_admin sys_ptrace };
+allow rystemd_t self:dir  { read search open };
+allow rystemd_t self:file { read open };
+
+# cgroups v2 + sysfs support the manager needs to place units in their own
+# subtrees (ystemd's process-supervision feature).
+allow rystemd_t rystemd_t:dir { read search open };
+allow rystemd_t rystemd_t:file { read write open unlink manage_file_perms };
+
+# --- own fs trees ---
+manage_dirs_pattern(rystemd_t, rystemd_var_t, rystemd_var_t)
+manage_files_pattern(rystemd_t, rystemd_var_t, rystemd_var_t)
+files_var_filetrans(rystemd_t, rystemd_var_t, dir)
+manage_dirs_pattern(rystemd_t, rystemd_run_t, rystemd_run_t)
+manage_files_pattern(rystemd_t, rystemd_run_t, rystemd_run_t)
+files_pid_filetrans(rystemd_t, rystemd_run_t, dir)
+
+# --- unit path: read system units, write enable/disable symlinks ---
+allow rystemd_t rystemd_unit_t:dir  { search read open add_name remove_name };
+allow rystemd_t rystemd_unit_t:file { read write create unlink getattr open };
+allow rystemd_t rystemd_unit_t:lnk_file { read create unlink getattr };
+
+# --- spawn children: transition into their domain (or the generic fallback) ---
+allow rystemd_t rystemd_child_t:process transition;
+allow rystemd_t rystemd_child_t:file { read execute execute_no_trans getattr open };
+allow rystemd_t rystemd_child_t:fd use;
+allow rystemd_t rystemd_child_t:process { sigchld signal };
+tunable_policy(`use_nfs_home_dirs', `
+    allow rystemd_t rystemd_child_t:process { getsession };',`
+')
+
+# Searching the unit dirs that live under /etc, /usr/lib, /run.
+files_search_etc(rystemd_t)
+files_search_usr(rystemd_t)
+files_search_var(rystemd_t)
+
+# The `--user` manager talks to the per-user bus.
+optional_policy(`
+    dbus_system_bus_client(rystemd_t)
+')
+
+# initramfs / early-boot: mount API filesystems and switch_root (boot feature).
+allow rystemd_t self:capability sys_boot;
+allow rystemd_t self:capability sys_chroot;
+kernel_read_all_proc(rystemd_t)
+kernel_read_all_sysctls(rystemd_t)
+allow rystemd_t self:dir { create mounton rmdir };
+allow rystemd_t self:filesystem mount;
+allow rystemd_t self:file { mounton relabelfrom relabelto };
+
+# exec the CLI/TUI from the same domain (rystemctl, rystemd-tui).
+allow rystemd_t rystemd_exec_t:file { read execute execute_no_trans getattr open };

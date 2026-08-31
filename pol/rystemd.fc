@@ -1,0 +1,9 @@
+/usr/bin/rystemd		--	gen_context(system_u:object_r:rystemd_exec_t,s0)
+/usr/bin/rystemctl		--	gen_context(system_u:object_r:rystemd_exec_t,s0)
+/usr/bin/rystemd-tui		--	gen_context(system_u:object_r:rystemd_exec_t,s0)
+
+/var/lib/rystemd(/.*)?		gen_context(system_u:object_r:rystemd_var_t,s0)
+/var/log/rystemd(/.*)?		gen_context(system_u:object_r:rystemd_var_t,s0)
+/run/rystemd(/.*)?		gen_context(system_u:object_r:rystemd_run_t,s0)
+
+/etc/systemd/system/rystemd\.d(/.*)?	gen_context(system_u:object_r:rystemd_unit_t,s0)
