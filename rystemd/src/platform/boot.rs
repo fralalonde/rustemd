@@ -478,9 +478,21 @@ pub fn find_deployment(sysroot: &Path) -> Option<std::path::PathBuf> {
     candidates.last().cloned().or(Some(sysroot.to_path_buf()))
 }
 
-/// Prepare a real deployment for switch_root: bind the shared `/var` (on ostree
-/// it lives under the sysroot, outside the deployment) into the deployment, so
-/// service state survives. Home-dir/boot mounts are left to userland units.
+/// Prepare a real deployment for switch_root.
+///
+/// Two self-contained bind-mounts so rystemd can boot a *stock, unmodified*
+/// root (e.g. a downloaded cloud image that never had rystemd installed) from
+/// the initramfs alone:
+///
+/// - **`/var`**: on ostree it lives under the sysroot, outside the deployment;
+///   bind it in so service state survives.
+/// - **the runtimes**: bind the initramfs's own `rystemd`/`rystemctl` (+
+///   dynamic libs) into the deployment. After switch_root and re-`exec`, the
+///   manager resolves `/usr/bin/rystemd` against the *deployment* root — which
+///   on a stock image has no rystemd. Binding our copies in makes the pivot
+///   self-contained without touching the disk.
+///
+/// Home-dir/boot mounts are left to userland units.
 pub fn prepare_deployment(sysroot: &Path, deploy: &Path) -> Result<(), String> {
     // /var: on ostree it's a separate subdir of the sysroot, bind it in.
     let sysroot_var = sysroot.join("var");
@@ -495,6 +507,58 @@ pub fn prepare_deployment(sysroot: &Path, deploy: &Path) -> Result<(), String> {
             None::<&std::path::Path>,
         )
         .map_err(|e| format!("bind /var into deployment: {e}"))?;
+    }
+
+    // The runtimes: bind our own rystemd/rystemctl + lib dirs into the
+    // deployment so the post-pivot re-exec is self-contained on a stock root.
+    let bin_dir = deploy.join("usr/bin");
+    fs::create_dir_all(&bin_dir).ok();
+    for name in ["rystemd", "rystemctl"] {
+        let src = Path::new("/usr/bin").join(name);
+        if src.is_file() {
+            let dst = bin_dir.join(name);
+            // Prefer a bind-mount; on a stock root we fall back to a plain
+            // copy (the deployment's own Fedora glibc satisfies deps, so we
+            // only need the two binaries, not our lib tree). Copy is the
+            // reliable path for a fresh, writable root.
+            if let Err(e) = nix::mount::mount(
+                Some(src.as_path()),
+                dst.as_path(),
+                None::<&std::path::Path>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&std::path::Path>,
+            ) {
+                eprintln!("rystemd prep: bind {name} failed ({e}); copying instead");
+                fs::copy(&src, &dst).map_err(|ce| {
+                    format!("copy {name} into deployment failed: {ce} (is /sysroot writable?)")
+                })?;
+            }
+            eprintln!("rystemd prep: rystemd in place as {dst:?}");
+        }
+    }
+    // libs + linker: only bind our initramfs lib tree in if the deployment
+    // LACKS one (e.g. our synthetic fake deployment). A real distro root
+    // (Fedora Cloud etc.) has its own glibc/loader and binding ours over it
+    // would corrupt the runtime — so skip when the deployment has /usr/lib64.
+    let has_libs = ["lib", "lib64", "usr/lib", "usr/lib64"]
+        .iter()
+        .any(|d| deploy.join(d).exists());
+    if !has_libs {
+        for d in ["lib", "lib64", "usr/lib", "usr/lib64"] {
+            let src = Path::new("/").join(d);
+            if src.is_dir() {
+                let dst = deploy.join(d);
+                fs::create_dir_all(&dst).ok();
+                nix::mount::mount(
+                    Some(src.as_path()),
+                    dst.as_path(),
+                    None::<&std::path::Path>,
+                    nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+                    None::<&std::path::Path>,
+                )
+                .map_err(|e| format!("bind {d} into deployment: {e}"))?;
+            }
+        }
     }
     Ok(())
 }
