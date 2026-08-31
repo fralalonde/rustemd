@@ -22,6 +22,18 @@ BIN=${1:-./target/release/rystemd}
 CTL=${CTL:-./target/release/rystemctl}
 OUT=${2:-./target/realroot-initramfs.cpio.gz}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
+# Optional root password for the real-root VM (the Fedora Cloud image locks
+# root). Passed at BUILD time. We compute a sha512 (crypt $6$) hash ON THE HOST
+# with a fixed salt (openssl and busybox produce identical output, verified),
+# and bake the hash — not the plaintext — into the initramfs (target/,
+# gitignored). At boot the shadow field is replaced with this hash via sed, so
+# no runtime chpasswd/crypt is trusted. Plaintext never enters the repo.
+ROOTPW=${REALROOT_ROOT_PW:-}
+ROOTPW_SALT=${REALROOT_ROOT_PW_SALT:-RYSTE0MSALT}
+ROOTPW_HASH=""
+if [ -n "$ROOTPW" ]; then
+  ROOTPW_HASH=$(openssl passwd -6 -salt "$ROOTPW_SALT" "$ROOTPW" 2>/dev/null || busybox cryptpw -m sha512 -S "$ROOTPW_SALT" "$ROOTPW")
+fi
 mkdir -p "$(dirname "$OUT")"
 
 [ -x "$BIN" ] || { echo "error: rystemd binary not found (cargo build --release --features boot)" >&2; exit 2; }
@@ -34,10 +46,17 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE"/{bin,sbin,usr/bin,dev,proc,sys,run,tmp,sysroot,mnt}
 
 cp "$BUSYBOX" "$STAGE/bin/busybox"
-for app in sh mount umount mkdir mknod cp cat echo sleep grep head tail ln blkid basename dirname; do
+for app in sh mount umount mkdir mknod cp cat echo sleep grep head tail ln blkid basename dirname ls rm touch sed; do
   ln -s /bin/busybox "$STAGE/bin/$app"
 done
 ln -s /bin/busybox "$STAGE/sbin/getty"
+
+# Bake the optional root password HASH into the initramfs (target/, gitignored).
+# Only the $6$ hash rides in the image — plaintext stays in the build env only.
+if [ -n "$ROOTPW_HASH" ]; then
+  mkdir -p "$STAGE/etc"
+  printf '%s' "$ROOTPW_HASH" > "$STAGE/etc/rootpw"
+fi
 
 copy_binary() {
   local src=$1 name=$2
@@ -56,6 +75,7 @@ copy_binary "$CTL" rystemctl
 # read-only, at /sysroot, then hand PID 1 to rystemd.
 cat > "$STAGE/init" <<'EOF'
 #!/bin/sh
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
@@ -102,6 +122,26 @@ for p in /sys/class/block/vda*; do
   umount /mnt 2>/dev/null
 done
 [ -n "$ROOT_DEV" ] || echo "rystemd: FATAL no root partition found" > /dev/console
+
+# Set a root password (the Fedora Cloud image locks root and expects SSH).
+# The $6$ hash is baked into /etc/rootpw at build time (see builder; openssl
+# and busybox sha512 crypt agree, verified). Replace the root field in
+# /sysroot/etc/shadow with it via sed — no runtime chpasswd/crypt trusted.
+# /etc exists inside the mounted root subvol; snapshot=on keeps the image clean.
+RH=""
+if [ -r /etc/rootpw ]; then RH=$(cat /etc/rootpw); fi
+if [ -n "$RH" ]; then
+  mount -o remount,rw /sysroot 2>/dev/null
+  if [ -f /sysroot/etc/shadow ] && sed -i "s|^root:[^:]*|root:$RH|" /sysroot/etc/shadow 2>/dev/null; then
+    echo "rystemd: root password hash installed into /sysroot/etc/shadow" > /dev/console
+    echo "rystemd: shadow root line now:" > /dev/console
+    sed -n '1p' /sysroot/etc/shadow > /dev/console
+  else
+    echo "rystemd: WARNING shadow hash install FAILED" > /dev/console
+  fi
+else
+  echo "rystemd: root password unset; root stays locked" > /dev/console
+fi
 
 # Deterministic console login: override the DEPLOYMENT's default.target and
 # getty units to a slim, rystemd-native chain so we reach a live login: on our
