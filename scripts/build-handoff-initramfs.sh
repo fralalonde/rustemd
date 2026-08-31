@@ -88,7 +88,13 @@ EOF
 ln -s ../handoff-marker.service "$DEPLOY/etc/systemd/system/default.target.wants/handoff-marker.service"
 
 mkdir -p "$STAGE/deploy"
-cp -a "$DEPLOY"/. "$STAGE/deploy/"
+# Lay the deployment out like a REAL ostree sysroot: the runnable root is
+# ostree/deploy/<os>/deploy/<commit>, and a shared /var lives at the sysroot
+# (outside the deployment). This exercises rystemd's find_deployment() +
+# prepare_deployment() (Model B), not just the plain /sysroot path (Model A).
+DEPLOYMENT="$STAGE/deploy/ostree/deploy/fedora/deploy/abc123"
+mkdir -p "$(dirname "$DEPLOYMENT")" "$STAGE/deploy/var"
+cp -a "$DEPLOY"/. "$DEPLOYMENT/"
 
 cat > "$STAGE/init" <<'EOF'
 #!/bin/sh
@@ -99,9 +105,10 @@ mkdir -p /sysroot
 # The deployment is its own tmpfs at /sysroot — a DIFFERENT filesystem than the
 # ramfs/rootfs we booted in, mirroring an ostree/dracut initramfs staging the
 # real disk deployment. /init then execs rystemd daemon, which detects the
-# handoff condition and switch_roots into /sysroot.
+# handoff condition, finds the deployment under ostree/deploy/, and switch_roots
+# into it.
 mount -t tmpfs tmpfs /sysroot 2>/dev/null
-# Copy the baked deployment into it, preserving the layout.
+# Copy the baked ostree-layout deployment into /sysroot, preserving the tree.
 cp -a /deploy/. /sysroot/ 2>/dev/null
 exec /usr/bin/rystemd daemon
 EOF

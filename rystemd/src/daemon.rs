@@ -121,20 +121,39 @@ pub(crate) fn run_daemon_with_ready(
     // the real hostname and a mounted /run (needed to bind its control
     // socket). Only compiled with the `boot` feature.
     //
-    // If we are PID 1 inside an initramfs *and* a real deployment is already
-    // staged at /sysroot (an ostree/dracut initramfs mounts it before
-    // exec'ing stage-2), hand off to it first: pivot out of the initramfs
-    // root and re-exec against the real /etc. This must happen before any of
-    // the API-fs mounts or early-boot config below, which must run against
-    // the *real* root.
+    // If we are PID 1 inside an initramfs *and* a real deployment is reachable
+    // (already staged at /sysroot by an ostree/dracut initramfs, OR — when we
+    // ARE the initramfs init — mountable from root= on the kernel cmdline),
+    // hand off to it first: pivot out of the initramfs root and re-exec
+    // against the real /etc. This must happen before any API-fs mounts or
+    // early-boot config below, which must run against the *real* root.
     #[cfg(all(unix, feature = "boot"))]
     if nix::unistd::getpid() == nix::unistd::Pid::from_raw(1) {
-        if crate::platform::boot::in_initramfs() && crate::platform::boot::sysroot_mounted() {
-            eprintln!("rystemd: initramfs detected with a real root at /sysroot — switching root");
-            match crate::platform::boot::handoff() {
-                // handoff() only returns on failure (it execs on success).
-                Err(e) => eprintln!("rystemd: real-root handoff failed, booting in initramfs: {e}"),
-                Ok(()) => unreachable!("handoff() execs on success and never returns Ok"),
+        if crate::platform::boot::in_initramfs() {
+            // Best-effort: (re)mount /sysroot from the kernel cmdline if it
+            // isn't already staged. Harmless if already mounted (idempotent).
+            if let Err(e) = crate::platform::boot::mount_sysroot_from_cmdline() {
+                eprintln!("rystemd: note: could not locate a real root via cmdline: {e}");
+            }
+            if crate::platform::boot::sysroot_mounted() {
+                eprintln!(
+                    "rystemd: initramfs detected with a real root at /sysroot — switching root"
+                );
+                // Resolve the actual deployment under /sysroot (on ostree it is
+                // ostree/deploy/<os>/deploy/<commit>, not /sysroot itself).
+                let sysroot = std::path::Path::new("/sysroot");
+                let deploy = crate::platform::boot::find_deployment(sysroot)
+                    .unwrap_or_else(|| sysroot.to_path_buf());
+                if let Err(e) = crate::platform::boot::prepare_deployment(sysroot, &deploy) {
+                    eprintln!("rystemd: warning: deployment prep failed: {e}");
+                }
+                match crate::platform::boot::handoff(&deploy) {
+                    // handoff() only returns on failure (it execs on success).
+                    Err(e) => {
+                        eprintln!("rystemd: real-root handoff failed, booting in initramfs: {e}")
+                    }
+                    Ok(()) => unreachable!("handoff() execs on success and never returns Ok"),
+                }
             }
         }
         if let Err(e) = crate::platform::boot::mount_api_filesystems() {
