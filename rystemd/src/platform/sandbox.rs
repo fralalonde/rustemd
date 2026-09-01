@@ -435,12 +435,7 @@ pub fn apply(ops: &[Op]) -> Result<Option<()>, String> {
                 // listed capabilities" (drop everything else); a `~`-prefixed
                 // list means "start from the default set, drop only the
                 // listed". `invert` is true for the `~` form.
-                let drop: Vec<u32> = if *invert {
-                    caps.clone()
-                } else {
-                    (0..=LAST_CAP).filter(|c| !caps.contains(c)).collect()
-                };
-                for cap in &drop {
+                for cap in &cap_drop_set(caps, *invert) {
                     // SAFETY: PR_CAPBSET_DROP with a valid cap number.
                     if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, *cap, 0, 0, 0) } != 0 {
                         return Err(fmt("cap-bounding-drop", &std::io::Error::last_os_error()));
@@ -518,6 +513,19 @@ fn cstr(p: &Path) -> std::ffi::CString {
 
 /// Highest defined capability number (Linux 5.11+ has 40, CHECKPOINT_RESTORE).
 const LAST_CAP: u32 = 40;
+
+/// Compute the set of capabilities to drop from the bounding set, applying
+/// systemd.exec(5) semantics: a PLAIN list (`invert=false`) means *keep only
+/// the listed*, so we drop everything else; a `~`-prefixed list
+/// (`invert=true`) means *drop only the listed*. `caps` is always the set of
+/// capabilities named in the unit file.
+fn cap_drop_set(caps: &[u32], invert: bool) -> Vec<u32> {
+    if invert {
+        caps.to_vec()
+    } else {
+        (0..=LAST_CAP).filter(|c| !caps.contains(c)).collect()
+    }
+}
 
 /// Map a capability name (optionally `CAP_`-prefixed, case-insensitive) to its
 /// number, matching the `capabilities(7)` table. Unknown names return `None`.
@@ -1963,6 +1971,31 @@ mod tests {
     }
 
     #[test]
+    fn cap_drop_set_follows_systemd_polarity() {
+        // The regression this guards: CapabilityBoundingSet= polarity was
+        // inverted (a plain list granted nearly everything). These assert the
+        // *actual dropped set*, which is where the mistake lived.
+
+        // PLAIN list: keep only the listed — CAP_KILL and CAP_SETUID survive,
+        // every other cap (0..=40 except 5,7) is dropped.
+        let drop_plain = cap_drop_set(&[5, 7], false);
+        assert!(!drop_plain.contains(&5) && !drop_plain.contains(&7));
+        assert_eq!(drop_plain.len(), LAST_CAP as usize + 1 - 2);
+        assert!(drop_plain.contains(&0) && drop_plain.contains(&21)); // CHOWN, SYS_ADMIN gone
+
+        // `~`-inverted list: drop only the listed — CAP_KILL is dropped,
+        // SYS_ADMIN (21) is preserved.
+        let drop_inv = cap_drop_set(&[5], true);
+        assert_eq!(drop_inv, vec![5]);
+        assert!(!drop_inv.contains(&21));
+
+        // Empty plain list means "drop everything" (keep nothing), matching
+        // `CapabilityBoundingSet=` (empty) clearing the set.
+        let drop_empty = cap_drop_set(&[], false);
+        assert_eq!(drop_empty.len(), LAST_CAP as usize + 1);
+    }
+
+    #[test]
     fn protect_system_strict_readonlys_root() {
         let c = cfg_with(|c| c.protect_system = ProtectSystemLevel::Strict);
         let ops = plan(&c).unwrap();
@@ -2015,6 +2048,19 @@ mod tests {
         let svc = resolve_syscalls(&["@system-service".into()]).unwrap();
         assert!(svc.contains(&0)); // read
         assert!(svc.contains(&57)); // fork
+        // Thread creation (glibc pthread_create) must be permitted, or any
+        // threaded service dies with EPERM on the first thread. Regression for
+        // the missing arch_prctl/set_tid_address/set_robust_list/rseq.
+        for needed in ["arch_prctl", "set_tid_address", "set_robust_list", "rseq"] {
+            let nr = seccomp::resolve(&[needed.into()])
+                .unwrap()
+                .pop()
+                .expect("known syscall");
+            assert!(
+                svc.contains(&nr),
+                "@system-service must allow {needed} (pthread_create)"
+            );
+        }
         let mut sorted = svc.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -2098,6 +2144,42 @@ mod tests {
         assert_eq!(prog[den].code, (BPF_RET | BPF_K) as u16);
         assert_eq!(prog[den].k, libc::SECCOMP_RET_ERRNO | 1);
         assert_eq!(prog[4 + n].k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn foreign_arch_fails_closed_in_every_filter_mode() {
+        use libc::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_W};
+        // Regression for the seccomp foreign-arch bypass: the BPF arch check
+        // (instruction [1], a JEQ AUDIT_ARCH_X86_64) must send a foreign-arch
+        // process to the *errno* return, never to ALLOW — for BOTH an
+        // allow-list and a deny-list. A 32-bit compat process uses syscall
+        // numbers absent from the x86_64 table this policy encodes, so
+        // allowing it through would bypass every filter and gate.
+        for deny in [true, false] {
+            let nrs = seccomp::resolve(&["quotactl".into()]).unwrap();
+            let prog = build_seccomp(&nrs, deny, 1, &[], None, false);
+            // [0] arch load, [1] JEQ native arch, [2] nr load.
+            assert_eq!(prog[0].code, (BPF_LD | BPF_W | BPF_ABS) as u16);
+            assert_eq!(prog[1].code, (BPF_JMP | BPF_JEQ | BPF_K) as u16);
+            assert_eq!(prog[1].k, AUDIT_ARCH_X86_64);
+            // jf: the target when the arch does NOT match. Resolve the
+            // relative offset (from instruction [2]) and assert it points at
+            // an errno return, not the ALLOW return.
+            let jf = prog[1].jf as usize + 2;
+            let jf_target = &prog[jf];
+            // If jf points at the allow return its k == SECCOMP_RET_ALLOW.
+            assert_ne!(
+                jf_target.k,
+                libc::SECCOMP_RET_ALLOW,
+                "deny={deny}: foreign arch must not jump to ALLOW"
+            );
+            assert_eq!(
+                jf_target.k & 0xFFFF_0000,
+                libc::SECCOMP_RET_ERRNO,
+                "deny={deny}: foreign arch must fail closed to errno"
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

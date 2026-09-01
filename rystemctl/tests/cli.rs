@@ -367,6 +367,48 @@ fn mask_unmask_roundtrip() {
     shutdown_daemon(daemon);
 }
 
+/// `kill --signal` must fail on an unknown signal instead of silently
+/// downgrading to SIGTERM, and pass through a valid signal verbatim.
+#[test]
+fn kill_rejects_unknown_signal() {
+    let scratch = Scratch::new();
+    scratch.write_unit(
+        "sleeper.service",
+        "[Service]\nType=simple\nExecStart=/bin/sleep 30\n",
+    );
+    let daemon = spawn_daemon();
+    rystemctl(&["start", "sleeper.service"]);
+    let active = wait_for(Duration::from_secs(5), || {
+        is_active("sleeper.service") == "active"
+    });
+    assert!(active, "sleeper.service should start");
+
+    // Unknown signal: must be a hard error (non-zero exit, no kill issued) —
+    // not silently converted to SIGTERM (regression for the unwrap_or fallback).
+    let bad = rystemctl_raw(&["kill", "--signal=KILLLG", "sleeper.service"]);
+    assert!(
+        !bad.status.success(),
+        "kill --signal=KILLLG must fail: {:?}",
+        bad.status
+    );
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        err.contains("KILLLG") || err.contains("signal"),
+        "kill must report the bad signal, got: {err}"
+    );
+    // The service must still be alive (no bogus SIGTERM was sent).
+    assert_eq!(is_active("sleeper.service"), "active");
+
+    // Valid signal passes through and stops the service.
+    rystemctl(&["kill", "--signal=SIGKILL", "sleeper.service"]);
+    let stopped = wait_for(Duration::from_secs(5), || {
+        matches!(is_active("sleeper.service").as_str(), "inactive" | "failed")
+    });
+    assert!(stopped, "SIGKILL should stop sleeper.service");
+
+    shutdown_daemon(daemon);
+}
+
 /// Exercises the newly-added systemctl surface against the live daemon:
 /// reset-failed, list-dependencies (forward + reverse), list-sockets, and clean.
 #[test]
