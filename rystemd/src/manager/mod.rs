@@ -503,10 +503,13 @@ impl Manager {
             }
         }
         names.insert("basic.target".into());
-        names.insert("sysinit.target".into());
+        #[cfg(feature = "boot")]
+        {
+            names.insert("sysinit.target".into());
+            names.insert("graphical.target".into());
+            names.insert("getty.target".into());
+        }
         names.insert("multi-user.target".into());
-        names.insert("graphical.target".into());
-        names.insert("getty.target".into());
         names.insert("default.target".into());
         if let Ok(md) = std::fs::read_link(self.cfg.paths.default_target())
             && let Some(n) = md.file_name().and_then(|f| f.to_str())
@@ -3484,15 +3487,15 @@ fn read_cmdline(pid: u32) -> String {
 }
 
 fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "basic.target"
-            | "sysinit.target" // empty aggregation target (real systemd: pulls in its .wants)
-            | "multi-user.target"
-            | "graphical.target"
-            | "getty.target"
-            | "default.target"
-    )
+    // Always-resolvable aggregation targets plus the boot-time ones (the
+    // latter are only relevant when rystemd runs as PID 1).
+    name == "basic.target"
+        || name == "multi-user.target"
+        || name == "default.target"
+        || (cfg!(feature = "boot")
+            && (name == "sysinit.target" // empty aggregation target (real systemd: pulls in its .wants)
+                || name == "graphical.target"
+                || name == "getty.target"))
 }
 
 /// Evaluate a `.path` unit's watch conditions against the live filesystem,
@@ -3609,9 +3612,13 @@ fn builtin_target(name: &str) -> Unit {
         unit: crate::unit::UnitConfig {
             description: match name {
                 "basic.target" => "Basic System".into(),
+                #[cfg(feature = "boot")]
                 "sysinit.target" => "System Initialization".into(),
                 "multi-user.target" => "Multi-User System".into(),
+                #[cfg(feature = "boot")]
                 "graphical.target" => "Graphical Interface".into(),
+                #[cfg(feature = "boot")]
+                "getty.target" => "Login Prompts".into(),
                 "default.target" => "Default".into(),
                 _ => String::new(),
             },
@@ -3780,7 +3787,14 @@ mod tests {
         mgr.start("a.target").unwrap();
 
         assert_eq!(mgr.units["a.target"].active, ActiveState::Active);
+        #[cfg(not(feature = "boot"))]
+        // Non-boot: graphical.target is not a known target, so an After= to it
+        // stays dangling (silent). With the boot feature it IS a preseeded
+        // builtin — present but never started (After only orders, never
+        // activates) — so we assert it stayed inactive instead in that build.
         assert!(!mgr.units.contains_key("graphical.target"));
+        #[cfg(feature = "boot")]
+        assert_eq!(mgr.units["graphical.target"].active, ActiveState::Inactive);
         assert!(!mgr.units.contains_key("missing.service"));
     }
 
