@@ -278,8 +278,7 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
         Command::Stop { units } => units_op(cli, "stop", units).map(|_| 0),
         Command::Restart { units } => units_op(cli, "restart", units).map(|_| 0),
         Command::TryRestart { units } => units_op(cli, "try_restart", units).map(|_| 0),
-        // try-restart semantics: restart if active, otherwise start.
-        Command::RestartOrStart { units } => units_op(cli, "try_restart", units).map(|_| 0),
+        Command::RestartOrStart { units } => units_op(cli, "restart_or_start", units).map(|_| 0),
         Command::Reload { units } => units_op(cli, "reload", units).map(|_| 0),
         Command::Mask { units } => units_op(cli, "mask", units).map(|_| 0),
         Command::Unmask { units } => units_op(cli, "unmask", units).map(|_| 0),
@@ -290,10 +289,11 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
         Command::ListSockets { no_legend, all } => cmd_list_sockets(cli, *no_legend, *all),
         Command::Kill { unit, signal } => {
             let client = Client::for_mode(cli.user)?;
-            let sig = signal
-                .as_deref()
-                .and_then(rystemd::unit::sig_from_name)
-                .unwrap_or(rystemd::platform::signal::Signal::SIGTERM);
+            let sig = match signal {
+                None => rystemd::platform::signal::Signal::SIGTERM,
+                Some(s) => rystemd::unit::sig_from_name(s)
+                    .ok_or_else(|| format!("kill: unknown signal \"{s}\""))?,
+            };
             client
                 .op_with(
                     "kill",

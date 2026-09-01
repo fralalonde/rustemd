@@ -251,7 +251,16 @@ impl CalendarSpec {
             }
         }
         let _ = have_date;
-        let _ = have_time;
+        // systemd.timer(5): when an expression specifies no time component
+        // (e.g. `OnCalendar=Mon` or a bare date), the elapse is at 00:00:00 on
+        // the matching day — not "the current time". A Field::Any time would
+        // make next_time(force_gt) pick the current wall-clock +1s on an
+        // already-matching day and re-fire immediately. Default it to midnight.
+        if !have_time {
+            spec.hour = Field::Set(vec![0]);
+            spec.minute = Field::Set(vec![0]);
+            spec.second = Field::Set(vec![0]);
+        }
         Ok(spec)
     }
 
@@ -536,6 +545,28 @@ mod tests {
         assert_eq!(
             next("Mon *-*-* 00:00:00", dt(2026, 1, 1, 0, 0, 0)),
             dt(2026, 1, 5, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn weekday_only_defaults_to_midnight() {
+        // `Mon` with no time component elapses at Monday 00:00:00 — even when
+        // "now" is already Monday (it must advance to midnight, not re-fire at
+        // the current time +1s).
+        // 2026-01-05 is a Monday. 10:00 on that Monday -> next Monday 00:00.
+        assert_eq!(
+            next("Mon", dt(2026, 1, 5, 10, 0, 0)),
+            dt(2026, 1, 12, 0, 0, 0)
+        );
+        // Thursday -> next Monday 00:00.
+        assert_eq!(
+            next("Mon", dt(2026, 1, 1, 0, 0, 0)),
+            dt(2026, 1, 5, 0, 0, 0)
+        );
+        // Bare date likewise elapses at 00:00:00.
+        assert_eq!(
+            next("2026-01-15", dt(2026, 1, 14, 0, 0, 0)),
+            dt(2026, 1, 15, 0, 0, 0)
         );
     }
 

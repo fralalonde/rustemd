@@ -43,6 +43,45 @@
 
 ## Bugs
 
+### Confirmed by code review (2026-08-31) — verified but not yet fixed
+These were flagged by a three-way code review and verified against the source;
+they are recorded so they aren't lost, but were *not* changed in the same pass
+because they touch the job engine or the privilege-drop path and deserve
+focused, live-tested fixes (several need a real-root run) rather than a blind
+edit.
+
+**Job engine / ordering**
+- A `Start` requested on a unit that is mid-stop (or has a pending `Stop` job)
+  spawns a concurrent instance instead of waiting: `start()` only no-ops on a
+  pending *Start*, and `new_job` overwrites `unit_job[name]` without finishing
+  the existing `Stop` job, orphaning it in `self.jobs` (blocks `idle()`/shutdown).
+- `Conflicts=` stops the conflicting unit but adds no wait entry, so the
+  starting unit proceeds while the conflict is still shutting down.
+- Stop order does not mirror start: `Requires=` dependents are killed
+  concurrently with (not after) the unit they require.
+- `.timer` units are not disarmed on stop — `# systemctl stop foo.timer` still
+  fires the elapse.
+- `OnCalendar` elapses are computed with `and_utc()` on a local-naive value,
+  so non-UTC systems fire up to the tz offset early.
+- `OnUnitActiveSec=`/`OnUnitInactiveSec=` rearm on every unit state change and
+  slide the deadline (only monotonic timer that may never fire when another
+  unit churns).
+  Recommend addressing these as one job-engine hardening pass with dedicated
+  ordering tests.
+
+**Sandbox / privilege-drop (need a real-root live test)**
+- `CapabilityBoundingSet=` semantics were inverted vs systemd: FIXED in this
+  pass (see CHANGELOG). Related, still-open: an allow-list `SystemCallFilter=`
+  combined with `User=`/`Group=` fails to spawn, because the seccomp filter is
+  installed *before* the `setgroups`/`setgid`/`setuid` calls and the allow-list
+  doesn't grant those syscalls.
+- `AmbientCapabilities=` is raised before `setuid`, so for any non-root
+  `User=` service the ambient set is wiped by the privilege drop (no-op);
+  needs the raise to move after the uid change.
+- A user-manager namespace failure (`unshare(CLONE_NEWUSER|CLONE_NEWNS)`
+  returning EPERM) aborts the whole op list, silently skipping the seccomp
+  filter and NoNewPrivileges too — should degrade only the mount/namespace ops.
+
 ### `OnUnitInactiveSec`/`OnUnitActiveSec` no longer fire un-activated targets
 `OnUnitInactiveSec=` (and by symmetry `OnUnitActiveSec=`) no longer arm while
 the timer's target has never been activated this boot — previously `rearm_timer`
@@ -99,7 +138,9 @@ list-units/list-unit-files/list-timers/list-dependencies/list-sockets/cat/show/
 get-default/set-default/isolate/is-system-running/poweroff/journal (and a
 `journalctl`-named alias). Still stubbed (explicit "not implemented"): `edit`,
 `preset`, `link`, `revert`, `cancel`. `isolate` exists but its stop-others
-semantics are untested.
+semantics are untested. Several flags are accepted by clap but silently
+ignored: `list-sockets --all`, `status -l/--full`, `list-units --plain`
+(review finding, 2026-08-31).
 
 ### No `Condition*`/`Assert*` directives
 None of `ConditionPathExists=`, `ConditionFileNotEmpty=`, `ConditionUser=`,

@@ -247,11 +247,12 @@ fn journalctl_priority_is_rejected() {
     );
 }
 
-/// `try-restart` of an inactive unit must START it and never run ExecStop
-/// (the `restart` op stops too, which would run ExecStop). On an active unit
-/// it must truly restart (ExecStop runs), proving the two are distinct.
+/// `try-restart` of an inactive unit must do NOTHING (no start, no ExecStop);
+/// `restart-or-start` is the command that starts inactive units. On an active
+/// unit both truly restart (ExecStop runs), proving the three ops are
+/// distinct.
 #[test]
-fn try_restart_starts_inactive_without_stop() {
+fn try_restart_inactive_is_noop_restart_or_start_starts() {
     let scratch = Scratch::new();
     let marker = scratch.dir.path().join("re.stopped");
     scratch.write_unit(
@@ -263,15 +264,27 @@ fn try_restart_starts_inactive_without_stop() {
     );
     let daemon = spawn_daemon();
 
-    // Inactive unit: try-restart starts it, ExecStop must NOT run.
+    // Inactive unit: try-restart must leave it inactive (no start, no stop).
     rystemctl(&["try-restart", "re.service"]);
-    let active = wait_for(Duration::from_secs(5), || {
-        is_active("re.service") == "active"
-    });
-    assert!(active, "try-restart should start an inactive unit");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        is_active("re.service") == "inactive",
+        "try-restart must not start an inactive unit"
+    );
     assert!(
         !marker.exists(),
         "ExecStop must not run on try-restart of an inactive unit"
+    );
+
+    // restart-or-start: starts the inactive unit (ExecStop must NOT run).
+    rystemctl(&["restart-or-start", "re.service"]);
+    let active = wait_for(Duration::from_secs(5), || {
+        is_active("re.service") == "active"
+    });
+    assert!(active, "restart-or-start should start an inactive unit");
+    assert!(
+        !marker.exists(),
+        "ExecStop must not run when restart-or-start starts an inactive unit"
     );
 
     // Active unit: try-restart restarts it (ExecStop runs).

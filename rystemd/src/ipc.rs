@@ -74,6 +74,10 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
             mgr.try_restart_units(&req_units(req))?;
             Ok(Value::Null)
         }
+        "restart_or_start" => {
+            mgr.restart_or_start_units(&req_units(req))?;
+            Ok(Value::Null)
+        }
         "reset_failed" => {
             mgr.reset_failed_units(&req_units(req))?;
             Ok(Value::Null)

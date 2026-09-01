@@ -327,9 +327,24 @@ impl Manager {
         self.start(&name)
     }
 
-    /// `try-restart`: restart units that are active/activating, start the rest.
-    /// Unlike `restart`, a unit that is not active is *started*, never stopped.
+    /// `try-restart`: restart units that are active/activating; *inactive*
+    /// units are left alone (never started).
     pub fn try_restart_units(&mut self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let active = self
+                .units
+                .get(name)
+                .map(|u| u.active)
+                .unwrap_or(ActiveState::Inactive);
+            if active == ActiveState::Active || active == ActiveState::Activating {
+                self.restart(name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `restart-or-start`: restart active/activating units, start the rest.
+    pub fn restart_or_start_units(&mut self, names: &[String]) -> Result<(), String> {
         for name in names {
             let active = self
                 .units

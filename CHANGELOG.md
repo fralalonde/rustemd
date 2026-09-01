@@ -6,6 +6,36 @@ derived from Git tags via `build.rs` (never hardcoded).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CapabilityBoundingSet=` semantics were inverted vs systemd** (review,
+  2026-08-31). A plain list (`CapabilityBoundingSet=CAP_KILL CAP_SETUID`)
+  means *keep only those caps* (drop everything else); a `~`-prefixed list
+  means *drop only the listed*. The implementation had it backwards — a
+  hardening write silently granted nearly the full bounding set. Polarity
+  corrected in the sandbox plan/apply, with the misleading comments and the
+  (equally wrong) unit test updated.
+- **Seccomp no longer auto-allows foreign-architecture processes**
+  (review, 2026-08-31). A 32-bit compat (ia32) process reports a different
+  `seccomp_data.arch`, and the BPF arch check previously jumped to `ALLOW`,
+  bypassing every deny/allow-list and `Restrict*`/seccomp gate the x86_64
+  policy encodes. The unmatched-arch path now fails closed (errno).
+- **`try-restart` no longer starts inactive units** (review, 2026-08-31).
+  `systemctl try-restart` must leave inactive units alone; it had the
+  `restart-or-start` behavior (start inactive). Split into `try_restart`
+  (restart-if-active only) and a new `restart_or_start` op/command.
+- **`kill --signal` with an unknown signal is now a hard error** instead of
+  silently falling back to SIGTERM (review, 2026-08-31).
+- **Calendar expressions with no time component now elapse at 00:00:00**
+  (review, 2026-08-31). `OnCalendar=Mon` (or a bare date) previously re-fired
+  at the current wall-clock +1s on an already-matching day instead of advancing
+  to the next midnight. Covered by a new unit test.
+- **`@system-service` syscall allow-list now permits thread creation**
+  (review, 2026-08-31). glibc `pthread_create` needs `arch_prctl`,
+  `set_tid_address`, `set_robust_list`, `rseq`; without them any threaded
+  service under `SystemCallFilter=@system-service` died with EPERM on the
+  first thread.
+
 ### Added
 
 - **Release automation for package managers.** `release.sh` now calls

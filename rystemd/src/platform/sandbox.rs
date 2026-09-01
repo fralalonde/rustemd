@@ -41,10 +41,11 @@ pub enum Op {
     /// `prctl(PR_SET_NO_NEW_PRIVS)`.
     NoNewPrivileges,
     /// `CapabilityBoundingSet=`: drop the given capabilities from the
-    /// process's bounding set via `prctl(PR_CAPBSET_DROP)`. When the config
-    /// used the `~` inversion (`~CAP_...`), `ops` carries the *complement*
-    /// (the caps kept); otherwise it carries the caps to drop.
-    CapBoundingDrop(Vec<u32>, bool /* invert: ops lists kept-caps */),
+    /// process's bounding set via `prctl(PR_CAPBSET_DROP)`. `caps` always
+    /// lists the capabilities named in the unit; `invert` is true for the
+    /// `~` form (drop only the listed) and false for a plain list (drop
+    /// everything except the listed).
+    CapBoundingDrop(Vec<u32>, bool /* invert: which caps are dropped */),
     /// `AmbientCapabilities=`: raise the given capabilities in the ambient set
     /// via `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE)`. Best-effort — needs
     /// the cap in the permitted set and a non-zero bounding set; a failure
@@ -114,17 +115,19 @@ pub fn plan(cfg: &SandboxConfig) -> Option<Vec<Op>> {
     if cfg.no_new_privileges {
         ops.push(Op::NoNewPrivileges);
     }
-    // CapabilityBoundingSet=: convert the named caps to numbers. When the set
-    // is inverted (`~`), we drop everything *except* the listed caps.
+    // CapabilityBoundingSet=: convert the named caps to numbers. Passing
+    // `invert` (the `~` prefix) means "drop only the listed"; a plain list
+    // means "keep only the listed" (drop everything else). Semantics follow
+    // systemd.exec(5).
     if !cfg.bounding_set.is_empty() {
-        let keep = cfg.bounding_invert;
+        let invert = cfg.bounding_invert;
         let caps: Vec<u32> = cfg
             .bounding_set
             .iter()
             .filter_map(|s| cap_number(s))
             .collect();
         if !caps.is_empty() {
-            ops.push(Op::CapBoundingDrop(caps, keep));
+            ops.push(Op::CapBoundingDrop(caps, invert));
         }
     }
     if !cfg.ambient_set.is_empty() {
@@ -426,15 +429,16 @@ pub fn apply(ops: &[Op]) -> Result<Option<()>, String> {
                 }
             }
             Op::CapBoundingDrop(caps, invert) => {
-                // PR_CAPBSET_DROP is irreversible and per-capability. To keep
-                // only the listed caps we drop every cap not in the list; to
-                // drop only the listed caps we invert that set. Dropping a cap
-                // that is not currently in the bounding set is harmless (prctl
-                // succeeds), so this is also safe for over-broad names.
+                // PR_CAPBSET_DROP is irreversible and per-capability.
+                //
+                // systemd.exec(5) semantics: a PLAIN list means "keep only the
+                // listed capabilities" (drop everything else); a `~`-prefixed
+                // list means "start from the default set, drop only the
+                // listed". `invert` is true for the `~` form.
                 let drop: Vec<u32> = if *invert {
-                    (0..=LAST_CAP).filter(|c| !caps.contains(c)).collect()
-                } else {
                     caps.clone()
+                } else {
+                    (0..=LAST_CAP).filter(|c| !caps.contains(c)).collect()
                 };
                 for cap in &drop {
                     // SAFETY: PR_CAPBSET_DROP with a valid cap number.
@@ -843,9 +847,14 @@ mod seccomp {
         let default_t = pick_t(!deny);
         let match_t = pick_t(deny);
 
-        // 0..2: arch check (foreign arch is let through), load `nr`.
+        // 0..2: arch check, load `nr`. A process running under a different
+        // architecture (e.g. 32-bit compat) uses different syscall numbers,
+        // so none of the x86_64 numbers this policy encodes apply to it —
+        // auto-allowing it would silently bypass every deny/allow-list and
+        // Restrict*/seccomp gate. Fail closed instead (the policy is only
+        // meaningful for the arch it was compiled for).
         push!(prog, ld(4), Tgt::None, Tgt::None);
-        push!(prog, jeq(AUDIT_ARCH_X86_64), Tgt::I(2), Tgt::Allow);
+        push!(prog, jeq(AUDIT_ARCH_X86_64), Tgt::I(2), Tgt::Errno);
         push!(prog, ld(0), Tgt::None, Tgt::None);
 
         // Gateway to the argument gates: `RestrictAddressFamilies=`
@@ -1716,6 +1725,14 @@ mod seccomp {
                 "vfork",
                 "clone",
                 "clone3",
+                // glibc's pthread_create (x86_64) additionally issues these to
+                // set up a new thread; without them a threaded service under
+                // `SystemCallFilter=@system-service` dies on first
+                // pthread_create with EPERM from the filter.
+                "arch_prctl",
+                "set_tid_address",
+                "set_robust_list",
+                "rseq",
                 "execve",
                 "execveat",
                 "exit",
@@ -1914,13 +1931,35 @@ mod tests {
     }
 
     #[test]
-    fn inverted_bounding_keeps_only_listed() {
+    fn inverted_bounding_drops_only_listed() {
+        // `~`-prefixed list (invert=true): systemd drops only the listed caps.
         let c = cfg_with(|c| {
             c.bounding_invert = true;
             c.bounding_set = vec!["CAP_KILL".into()];
         });
         let ops = plan(&c).unwrap();
         assert!(ops.contains(&Op::CapBoundingDrop(vec![5], true)));
+    }
+
+    #[test]
+    fn plain_bounding_drops_complement_and_windows_tolerates_missing() {
+        // A PLAIN list (invert=false) means "keep only the listed", so the
+        // dropped set is every capability NOT in the list.
+        let c = cfg_with(|c| {
+            c.bounding_invert = false;
+            c.bounding_set = vec!["CAP_KILL".into(), "CAP_SETUID".into()];
+        });
+        let ops = plan(&c).unwrap();
+        let Op::CapBoundingDrop(caps, invert) = ops
+            .iter()
+            .find(|op| matches!(op, Op::CapBoundingDrop(..)))
+            .cloned()
+            .unwrap()
+        else {
+            panic!("expected CapBoundingDrop op");
+        };
+        assert_eq!(caps, vec![5, 7]);
+        assert!(!invert);
     }
 
     #[test]
@@ -2040,12 +2079,14 @@ mod tests {
         assert_eq!(prog[0].code, (BPF_LD | BPF_W | BPF_ABS) as u16);
         assert_eq!(prog[0].k, 4);
         // [1] JEQ native arch; jt=0 → arch match falls through to load nr ([2]),
-        // so the filter can actually match; jf → allow (index `ok` = 4+n): for
-        // n=1, ok=5, jf offset = 5-2 = 3.
+        // so the filter can actually match; jf → errno (index `den`=3+n): a
+        // foreign-arch process (32-bit compat etc.) uses syscalls not in the
+        // x86_64 table this policy encodes, so it must fail closed, never be
+        // allowed through. For n=1, den=4, jf offset = 4-2 = 2.
         assert_eq!(prog[1].code, (BPF_JMP | BPF_JEQ | BPF_K) as u16);
         assert_eq!(prog[1].k, AUDIT_ARCH_X86_64);
         assert_eq!(prog[1].jt, 0);
-        assert_eq!(prog[1].jf as usize, 4 + n - 2);
+        assert_eq!(prog[1].jf as usize, 3 + n - 2);
         // [2] loads nr from offset 0.
         assert_eq!(prog[2].k, 0);
         // [3] JEQ the blocked syscall (179) with jt to return-errno (`den`).
