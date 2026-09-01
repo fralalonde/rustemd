@@ -6,6 +6,58 @@ derived from Git tags via `build.rs` (never hardcoded).
 
 ## [Unreleased]
 
+### Added
+
+- **Release automation for package managers.** `release.sh` now calls
+  `scripts/bump-package-managers.sh --push` after tagging, which regenerates
+  and pushes the Homebrew `homebrew-rystemd` formula and the Scoop
+  `scoop-rystemd` bucket so `brew install` / `scoop install` see the new
+  version (previously a forgotten manual step that left package managers at an
+  older release). Asset hashes are fetched with bounded retry to wait out CI's
+  asynchronous asset upload.
+
+## [0.2.1] — 2026-08-31
+
+### Fixed
+
+- **Boot aggregation targets no longer leak into every manager.** `322b046`
+  made `sysinit.target`/`graphical.target`/`getty.target` unconditionally
+  preseeded builtins, which polluted plain user managers and the Windows build
+  and broke `cargo test --workspace` — and with it the v0.2.0 release pipeline.
+  They are now gated behind the `boot` feature (preseed, `is_builtin`,
+  `builtin_target` description), and the affected test's assert is
+  feature-conditional. (This was the fix carried in as v0.2.1.)
+
+## [0.2.0] — 2026-08-31
+
+### Added
+
+- **Real-root boot against a stock, downloadable OS disk.** rystemd running as
+  PID 1 in an initramfs can now discover, mount, and pivot into an actual
+  Fedora Cloud disk attached in qemu — no host root, no libguestfs, no disk
+  modification.
+  - `switch_root` handoff (`prepare_deployment` + `handoff`): bind/copy rystemd
+    into the deployment so the post-pivot re-exec is self-contained, resolve
+    the real ostree deployment under `/sysroot` (`find_deployment`), bind the
+    sysroot `/var` in for state.
+  - `--features boot` aggregation targets (`sysinit`/`graphical`/`getty`) so
+    Fedora's real target graph resolves instead of failing on
+    "unit not found".
+  - Deterministic console login by overriding the deployment's `default.target`
+    (slim `default → getty@ttyS0`), neutralizing Fedora's real `basic.target`.
+  - Optional root password injected at `/init` time (host-computed `$6$` hash,
+    verified against glibc `crypt`, `sed`-into the live shadow) so a stock
+    cloud image can be logged into.
+  - `scripts/{build-realroot-initramfs,boot-realroot-vm}.sh` + the rootless
+    recipe in the handbook.
+- **SELinux policy module** (`pol/rystemd.te`, `f.c`, `README.md`) — a starter
+  `rystemd_t` domain, compile/package-verified offline.
+- **Handbook published to its own repo** (`rystemd/rystemd.github.io`) and
+  `main` made code-only; scoop install switched to the dedicated
+  `scoop-rystemd` bucket; package-manager docs now rely on release artifacts.
+
+## [0.1.5] — 2026-08-27
+
 ### Fixed
 
 - **`OnUnitInactiveSec=`/`OnUnitActiveSec=` no longer fire units that were
@@ -56,12 +108,29 @@ derived from Git tags via `build.rs` (never hardcoded).
   manager degrades best-effort (warns, runs with `/dev` unsandboxed) because
   `mknod` is refused in an unprivileged user namespace; the privileged e2e test
   runs only under real root.
+- **`RestrictSUIDSGID=`** (Linux/x86_64) now enforces: it denies the file-mode
+  syscalls that could set an SUID/SGID bit or relabel ownership
+  (`chmod`/`fchmod`/`fchmodat`/`chown`/`fchown`/`lchown`/`fchownat`), with unit
+  tests and an e2e test (`restrict_suidsgid_blocks_chmod`).
+- **`RestrictAddressFamilies=`** (Linux/x86_64) now enforces: a seccomp gate on
+  `socket(2)`/`socketpair(2)` comparing the family argument against the
+  directive's list (`~`-prefixed lists deny the named families, an unprefixed
+  list allows only those), with unit tests on the BPF layout and an e2e test
+  (`restrict_address_families_allows_only_unix`).
+- **`MemoryDenyWriteExecute=`** (Linux/x86_64) now enforces: a seccomp arg-gate
+  on `mmap`/`mprotect`/`pkey_mprotect` (implies `NoNewPrivileges=` like the
+  other filter installs) that denies any request setting both `PROT_WRITE` and
+  `PROT_EXEC` — creating a mapping, or `mprotect`ing RW→RWX — with `EPERM`,
+  with unit tests on the BPF layout and an e2e test probing an RW→RWX
+  `mprotect` via `ctypes`.
 - **`CapabilityBoundingSet=` and `AmbientCapabilities=`** (Linux/x86_64,
   phase-2c) now enforce: `drop-from` or `~`-inverted bounding-set reduction via
   `prctl(PR_CAPBSET_DROP)`, and best-effort `PR_CAP_AMBIENT_RAISE` for the
   ambient set.
+- **Windows install options** — Scoop bucket (`scoop-rystemd`), an MSI, and a
+  NuGet native-tools package published per release.
 
-## [0.1.0] — Unreleased
+## [0.1.0] — Initial release
 
 Initial release of rystemd: a systemd / `systemctl` reimplementation in Rust.
 

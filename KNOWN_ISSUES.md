@@ -65,8 +65,6 @@ and its service sits in `START_PENDING`.
 
 ## Weaknesses
 
-- The release URLs still use the `fralalonde` org name until the repository is relocated; the Homebrew formula now lives in a dedicated `homebrew-rystemd` tap (`brew tap fralalonde/rystemd` resolves to `github.com/fralalonde/homebrew-rystemd`).
-
 ### D-Bus is a partial `systemd1` drop-in
 The `org.freedesktop.systemd1` surface (runtime-gated: only served when the
 well-known name is free, i.e. no real systemd on the bus) now has a per-unit
@@ -96,12 +94,12 @@ no field filters (`-u`, `-p`, `-S`), no boot/session disambiguation.
 
 ### `systemctl` CLI surface is incomplete
 Implemented: start/stop/restart/try-restart/reload/status/kill/is-active/is-failed/
-is-enabled/enable/disable/daemon-reload/list-units/list-unit-files/list-timers/
-cat/show/get-default/set-default/isolate/is-system-running/poweroff/journal.
-Missing for drop-in use: `mask`/`unmask`, `edit`, `list-dependencies`,
-`list-sockets`, `reset-failed`, `clean`, `preset`, `reenable`, `link`, `revert`,
-`cancel`, `list-machines`.
-`isolate` exists but its stop-others semantics are untested.
+is-enabled/enable/disable/mask/unmask/reset-failed/clean/reenable/daemon-reload/
+list-units/list-unit-files/list-timers/list-dependencies/list-sockets/cat/show/
+get-default/set-default/isolate/is-system-running/poweroff/journal (and a
+`journalctl`-named alias). Still stubbed (explicit "not implemented"): `edit`,
+`preset`, `link`, `revert`, `cancel`. `isolate` exists but its stop-others
+semantics are untested.
 
 ### No `Condition*`/`Assert*` directives
 None of `ConditionPathExists=`, `ConditionFileNotEmpty=`, `ConditionUser=`,
@@ -198,27 +196,29 @@ eBPF `BPF_CGROUP_DEVICE` program), `MemoryMin`/`MemoryLow`/`MemorySwapMax=`,
 `NotifyAccess=` enforcement are not wired.
 
 ### Test harness maturity gaps
-~115 tests pass on Linux (103 unit + 11 e2e + 2 CLI + 1 repo_dao + 5 repo +
-1 typed_dao), plus ~9 `#[cfg(windows)]` tests. Coverage is solid for the happy
-path — full lifecycle, kill/stop, daemonizing-orphan sweep, socket activation,
-mount lifecycle, timer firing, target `Wants=` pull-in, live demo units, device
-enumeration, journal persistence, and a real-CLI roundtrip — but thin where it
-matters for the stated goals:
+194 lib+integration tests pass on Linux (`--features boot`: 159 lib/unit +
+18 e2e + 6 seccomp + 3 privileged + 5 repo + 1 repo_dao + 1 typed_dao + 1
+dbus), plus `#[cfg(windows)]` tests in `tests/windows.rs`. Coverage is solid
+for the happy path — full lifecycle, kill/stop, daemonizing-orphan sweep,
+socket activation, mount lifecycle, timer firing, target `Wants=` pull-in,
+live demo units, device enumeration, journal persistence, and a real-CLI
+roundtrip — but thin where it matters for the stated goals:
 
 - **No e2e coverage for**: mount sandbox isolation (a `PrivateTmp`/`ProtectSystem`
   leak or a read-only write-denial is never asserted), cgroup limit enforcement,
   `enable`/`disable` symlink installation, template instantiation
-  (`getty@tty1`→`getty@.service`), restart/`on-failure` policy, or
-  timeout/`KillSignal` handling. (Seccomp `SystemCallFilter=` *does* have an
+  (`getty@tty1`→`getty@.service`, exercised only indirectly by the getty boot
+  tests and reserved for the boot VM), or timeout/`KillSignal` handling
+  (`Restart=`/`on-failure` *is* covered — `restart_on_failure_restarts_until_start_limit`).
+  (Seccomp `SystemCallFilter=` *does* have an
   e2e test — `rystemd/tests/seccomp.rs` — plus the privilege-requiring
   `PrivateTmp` and `PrivateDevices` cases in `rystemd/tests/privileged.rs`.)
-- **No CI on push/PR.** The only workflow (`release.yml`) runs `cargo test`
-  (Linux only, no clippy/fmt) *on tag pushes*. The `boot` (PID-1) path, the
-  `dbus` feature, and clippy/fmt are gated nowhere except the tag-triggered
-  Windows job's clippy — a broken default build can land on `main` silently.
-- **Boot/PID-1 scripts are manual** — `scripts/{vm-test,ns-boot-test,live-vm}.sh`
-  are not in CI, so the `boot` feature (early-boot, template units, poweroff)
-  has no automated regression net.
+- **No CI on push/PR, only on tag.** The only workflow (`release.yml`) runs
+  `cargo fmt --check` + clippy `-D warnings` + `cargo test` + a privileged
+  test (Linux) and clippy+test at MSRV (Windows) *on `v*` tag pushes*; the
+  Linux build compiles with `--features boot`. A broken default build can still
+  land on `main` silently if nobody tags — there's no per-PR gate.
+- **Boot/PID-1 scripts are manual** — `scripts/{vm-test,ns-boot-test,live-vm}.sh` are not in CI, so the `boot` feature's *runtime behavior* (early-boot, template units, poweroff) has no automated regression net beyond compiling with the feature enabled.
 - **No fuzzing** of the unit-file parser (a security-sensitive surface, given
   the upcoming inspection) and **no property tests** for the calendar/timespan
   grammars.

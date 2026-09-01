@@ -10,7 +10,7 @@ Version:        %{version}
 Release:        1
 Summary:        systemd init reimplementation: unit manager + systemctl-compatible CLI
 License:        MIT
-URL:            https://github.com/fralalonde/rystemd
+URL:            https://github.com/rystemd/rystemd
 
 %description
 rystemd is a systemd init reimplementation in Rust: a drop-in systemctl

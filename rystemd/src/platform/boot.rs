@@ -533,7 +533,7 @@ pub fn prepare_deployment(sysroot: &Path, deploy: &Path) -> Result<(), String> {
                     format!("copy {name} into deployment failed: {ce} (is /sysroot writable?)")
                 })?;
             }
-            eprintln!("rystemd prep: rystemd in place as {dst:?}");
+            eprintln!("rystemd prep: {name} in place as {dst:?}");
         }
     }
     // libs + linker: only bind our initramfs lib tree in if the deployment

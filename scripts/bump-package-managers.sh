@@ -69,6 +69,11 @@ commit_and_push() { # $1=repo, $2=msg, rest=paths
 if [ -d "$HOMEBREW_TAP/.git" ]; then
     # gen-brew-formula.sh lives inside the tap itself; run it in place.
     if [ -x "$HOMEBREW_TAP/scripts/gen-brew-formula.sh" ]; then
+        # A fresh tag's assets upload asynchronously after CI builds them, so
+        # wait for the Linux tarball (via sha256_of's retry) before running
+        # gen-brew-formula.sh — otherwise its curl -fsSL 404s and set -e
+        # aborts the whole script before Scoop is even reached.
+        sha256_of "$ASSET_BASE/rystemd-$VERSION-x86_64-unknown-linux-gnu.tar.gz" >/dev/null
         ( cd "$HOMEBREW_TAP" && git checkout -q main && git pull -q --ff-only 2>/dev/null || true
           bash scripts/gen-brew-formula.sh "$VERSION" )
         commit_and_push "$HOMEBREW_TAP" "brew: bump rystemd to v${VERSION}" Formula/rystemd.rb

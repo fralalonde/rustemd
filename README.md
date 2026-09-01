@@ -120,7 +120,7 @@ refresh · `q`/`Esc`/`Ctrl+Q` quit.
 - `ExecStart` (multiple, with `-`/`@`/`+` prefixes), `ExecStartPre`,
   `ExecStartPost`, `ExecStop`, `ExecReload`, `ExecStart=-…`
 - `Type=` — `simple`, `exec`, `forking`, `oneshot`, `notify`, `idle`
-- `Restart=` (`no`/`on-success`/`on-failure`/`always`), `RestartSec`
+- `Restart=` (`no`/`on-success`/`on-failure`/`on-abnormal`/`on-abort`/`on-watchdog`/`always`), `RestartSec`
 - `User=`, `Group=`, `WorkingDirectory=`, `Environment=`, `EnvironmentFile=`
 - `LimitNOFILE`/`LimitNPROC`/`LimitCORE`/`LimitAS` (rlimits), `Nice=`, `UMask=`
 - `StandardOutput=`/`StandardError=` (`journal`, `inherit`, `null`, `file:…`)
