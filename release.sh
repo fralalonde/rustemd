@@ -111,6 +111,18 @@ push_release() {
     git push origin "$branch"
     git push origin "$new_tag"
     echo "Pushed branch $branch and tag $new_tag"
+    # Regenerate + push the downstream package-manager repos (Homebrew tap,
+    # Scoop bucket) so brew/scoop install & update see the new version. Only
+    # once the tag is pushed (assets may be uploaded by CI asynchronously, so
+    # bumping here is best-effort; a re-run with scripts/bump-package-managers.sh
+    # handles a CI hiccup). Skips cleanly if either sibling repo is absent.
+    if [[ -x scripts/bump-package-managers.sh ]]; then
+        if scripts/bump-package-managers.sh "$new_version" --push; then
+            echo "Bumped Homebrew + Scoop for $new_tag"
+        else
+            echo "Warning: package-manager bump failed (check sibling repos)." >&2
+        fi
+    fi
 }
 
 if [[ "$push" -eq 1 ]]; then
