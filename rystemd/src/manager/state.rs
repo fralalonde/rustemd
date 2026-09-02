@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use crate::log::LogRing;
@@ -12,6 +13,8 @@ use crate::unit::SocketConfig;
 use crate::unit::{PathConfig, ServiceConfig, TimerConfig, UnitFile, UnitKind};
 
 pub type Pid = i32;
+
+static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -133,6 +136,10 @@ pub struct Unit {
     pub forked_main_pid: Option<Pid>,
     pub active_enter: Option<SystemTime>,
     pub inactive_enter: Option<SystemTime>,
+    /// Identifier for the current activation, exposed as `InvocationID`.
+    pub invocation_id: Option<String>,
+    /// Number of automatic restart attempts for this unit lifetime.
+    pub n_restarts: u64,
     /// When the current control command was spawned (for timeouts).
     pub control_start: Option<Instant>,
     pub stop_started: Option<Instant>,
@@ -176,6 +183,8 @@ impl Unit {
             forked_main_pid: None,
             active_enter: None,
             inactive_enter: Some(SystemTime::now()),
+            invocation_id: None,
+            n_restarts: 0,
             control_start: None,
             stop_started: None,
             last_exit_code: None,
@@ -253,7 +262,16 @@ impl Unit {
             self.result = result;
         }
         match state {
+            ActiveState::Activating => {
+                let seq = NEXT_INVOCATION_ID.fetch_add(1, Ordering::Relaxed);
+                self.invocation_id = Some(format!("{seq:016x}"));
+                self.restart_at = None;
+            }
             ActiveState::Active => {
+                if self.invocation_id.is_none() {
+                    let seq = NEXT_INVOCATION_ID.fetch_add(1, Ordering::Relaxed);
+                    self.invocation_id = Some(format!("{seq:016x}"));
+                }
                 self.active_enter = Some(now);
                 self.inactive_enter = None;
                 self.restart_at = None;

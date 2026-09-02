@@ -5,7 +5,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -33,22 +33,59 @@ pub struct Cli {
     /// Do not pipe output through a pager.
     #[arg(long, global = true)]
     pub no_pager: bool,
+    /// Suppress command output while retaining the command's exit status.
+    #[arg(long, global = true)]
+    pub quiet: bool,
+    /// Return after queuing a job. The native manager already behaves this way.
+    #[arg(long, global = true)]
+    pub no_block: bool,
+    /// Accept systemctl's transaction-display switch. The native manager
+    /// does not yet expose a transaction graph, so this is currently ignored.
+    #[arg(short = 'T', long = "show-transaction", global = true)]
+    pub show_transaction: bool,
 
     #[command(subcommand)]
     pub cmd: Command,
 }
 
+#[derive(Args, Clone, Default)]
+pub struct JobOptions {
+    /// Wait until the requested units' jobs finish.
+    #[arg(long)]
+    wait: bool,
+    /// Select systemd's job replacement mode. The native job engine currently
+    /// uses its fixed merge policy, so this is accepted but not applied.
+    #[arg(long, value_name = "MODE")]
+    job_mode: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Start (activate) one or more units.
-    Start { units: Vec<String> },
+    Start {
+        #[command(flatten)]
+        options: JobOptions,
+        units: Vec<String>,
+    },
     /// Stop (deactivate) one or more units.
-    Stop { units: Vec<String> },
+    Stop {
+        #[command(flatten)]
+        options: JobOptions,
+        units: Vec<String>,
+    },
     /// Restart one or more units.
-    Restart { units: Vec<String> },
+    Restart {
+        #[command(flatten)]
+        options: JobOptions,
+        units: Vec<String>,
+    },
     /// Try to restart units if they are active; otherwise start them.
     #[command(name = "try-restart")]
-    TryRestart { units: Vec<String> },
+    TryRestart {
+        #[command(flatten)]
+        options: JobOptions,
+        units: Vec<String>,
+    },
     /// Run a unit's ExecReload.
     Reload { units: Vec<String> },
     /// Stop and then start units; if not active, just start.
@@ -121,6 +158,15 @@ pub enum Command {
     /// Reload the manager's unit configuration from disk.
     #[command(name = "daemon-reload")]
     DaemonReload,
+    /// Re-exec the manager. Accepted as a compatibility no-op for now.
+    #[command(name = "daemon-reexec")]
+    DaemonReexec,
+    /// List jobs currently queued by the manager.
+    #[command(name = "list-jobs")]
+    ListJobs,
+    /// Query or set the manager log level.
+    #[command(name = "log-level")]
+    LogLevel { level: Option<String> },
     /// List units and their states.
     #[command(name = "list-units")]
     ListUnits {
@@ -153,7 +199,7 @@ pub enum Command {
     /// Show unit properties.
     Show {
         units: Vec<String>,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(short = 'P', long, value_delimiter = ',')]
         property: Vec<String>,
         #[arg(long)]
         value: bool,
@@ -274,10 +320,18 @@ fn paths(user: bool) -> Result<Paths, String> {
 fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
     match cmd {
         Command::Version => Ok(0),
-        Command::Start { units } => units_op(cli, "start", units).map(|_| 0),
-        Command::Stop { units } => units_op(cli, "stop", units).map(|_| 0),
-        Command::Restart { units } => units_op(cli, "restart", units).map(|_| 0),
-        Command::TryRestart { units } => units_op(cli, "try_restart", units).map(|_| 0),
+        Command::Start { options, units } => {
+            units_op_with_options(cli, "start", units, options).map(|_| 0)
+        }
+        Command::Stop { options, units } => {
+            units_op_with_options(cli, "stop", units, options).map(|_| 0)
+        }
+        Command::Restart { options, units } => {
+            units_op_with_options(cli, "restart", units, options).map(|_| 0)
+        }
+        Command::TryRestart { options, units } => {
+            units_op_with_options(cli, "try_restart", units, options).map(|_| 0)
+        }
         Command::RestartOrStart { units } => units_op(cli, "restart_or_start", units).map(|_| 0),
         Command::Reload { units } => units_op(cli, "reload", units).map(|_| 0),
         Command::Mask { units } => units_op(cli, "mask", units).map(|_| 0),
@@ -311,6 +365,12 @@ fn dispatch(cli: &Cli, cmd: &Command) -> Result<i32, String> {
             let client = Client::for_mode(cli.user)?;
             client.simple_op("daemon_reload").map(|_| 0)
         }
+        Command::DaemonReexec => {
+            let client = Client::for_mode(cli.user)?;
+            client.simple_op("daemon_reexec").map(|_| 0)
+        }
+        Command::ListJobs => cmd_list_jobs(cli),
+        Command::LogLevel { level } => cmd_log_level(cli, level.as_deref()),
         Command::ListUnits {
             type_,
             state,
@@ -447,11 +507,186 @@ fn client_for(cli: &Cli) -> Result<Client, String> {
     Client::for_mode(cli.user)
 }
 
-fn units_op(cli: &Cli, op: &str, units: &[String]) -> Result<(), String> {
+fn units_op(cli: &Cli, op: &str, units: &[String]) -> Result<Value, String> {
     let client = client_for(cli)?;
     let norm = normalize_units(units);
-    client.units_op(op, &norm)?;
+    client.units_op(op, &norm)
+}
+
+fn units_op_with_options(
+    cli: &Cli,
+    op: &str,
+    units: &[String],
+    options: &JobOptions,
+) -> Result<(), String> {
+    let should_wait = options.wait || (!cli.no_block && matches!(op, "start" | "stop"));
+    let mut job_ids = Vec::new();
+    if op == "start" && options.job_mode.as_deref() == Some("ignore-dependencies") {
+        let client = client_for(cli)?;
+        for unit in normalize_units(units) {
+            let value = client.op_with("start_ignore_dependencies", json!({"units": [unit]}))?;
+            job_ids.extend(job_ids_from(&value));
+        }
+    } else {
+        let client = client_for(cli)?;
+        let mut request = json!({"units": normalize_units(units)});
+        if let Some(mode) = options.job_mode.as_deref() {
+            request["job_mode"] = Value::String(mode.into());
+        }
+        let value = client.op_with(op, request)?;
+        job_ids = job_ids_from(&value);
+    }
+    if should_wait && !job_ids.is_empty() {
+        wait_for_jobs(cli, &job_ids)?;
+        if options.wait && op == "start" {
+            wait_for_terminating_units(cli, units)?;
+        }
+    } else if options.wait {
+        wait_for_units(cli, units)?;
+    }
     Ok(())
+}
+
+fn job_ids_from(value: &Value) -> Vec<u64> {
+    value
+        .get("jobs")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+fn wait_for_jobs(cli: &Cli, ids: &[u64]) -> Result<(), String> {
+    let client = client_for(cli)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let value = client.op_with("job_status", json!({"job_ids": ids}))?;
+        let rows = value.as_array().ok_or("invalid job status response")?;
+        if rows
+            .iter()
+            .any(|row| row.get("state").and_then(Value::as_str) == Some("pending"))
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for job completion".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.get("ok").and_then(Value::as_bool) == Some(false))
+        {
+            return Err(row
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("job canceled")
+                .into());
+        }
+        return Ok(());
+    }
+}
+
+fn wait_for_units(cli: &Cli, units: &[String]) -> Result<(), String> {
+    let client = client_for(cli)?;
+    let wanted = normalize_units(units);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let jobs = client.simple_op("list_jobs")?;
+        let pending = jobs
+            .as_array()
+            .map(|rows| {
+                rows.iter().any(|row| {
+                    row.get("unit")
+                        .and_then(Value::as_str)
+                        .map(|unit| wanted.iter().any(|name| name == unit))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !pending {
+            let states = client.op_with(
+                "show",
+                json!({"units": wanted, "properties": ["ActiveState"]}),
+            )?;
+            if states.as_array().is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.get("ActiveState").and_then(Value::as_str) == Some("failed"))
+            }) {
+                return Err("start job failed".into());
+            }
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for job completion".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn wait_for_terminating_units(cli: &Cli, units: &[String]) -> Result<(), String> {
+    let client = client_for(cli)?;
+    let wanted = normalize_units(units);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let states = client.op_with(
+            "show",
+            json!({"units": wanted, "properties": ["ActiveState", "SubState"]}),
+        )?;
+        let rows = states.as_array().ok_or("invalid unit state response")?;
+        if rows.iter().any(|row| {
+            matches!(
+                row.get("ActiveState").and_then(Value::as_str),
+                Some("activating" | "deactivating")
+            ) || (row.get("ActiveState").and_then(Value::as_str) == Some("active")
+                && row.get("SubState").and_then(Value::as_str) == Some("running"))
+        }) {
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for unit termination".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        if rows
+            .iter()
+            .any(|row| row.get("ActiveState").and_then(Value::as_str) == Some("failed"))
+        {
+            return Err("start job failed".into());
+        }
+        return Ok(());
+    }
+}
+
+fn cmd_list_jobs(cli: &Cli) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let rows = client.simple_op("list_jobs")?;
+    if !cli.quiet {
+        println!("JOB UNIT TYPE STATE");
+    }
+    for row in rows.as_array().into_iter().flatten() {
+        if !cli.quiet {
+            println!(
+                "{:<3} {:<36} {:<8} {}",
+                row["id"].as_u64().unwrap_or(0),
+                row["unit"].as_str().unwrap_or(""),
+                row["type"].as_str().unwrap_or(""),
+                row["state"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_log_level(cli: &Cli, level: Option<&str>) -> Result<i32, String> {
+    let client = client_for(cli)?;
+    let value = match level {
+        Some(level) => client.op_with("log_level", json!({"level": level}))?,
+        None => client.simple_op("log_level")?,
+    };
+    if !cli.quiet
+        && let Some(level) = value.as_str()
+    {
+        println!("{level}");
+    }
+    Ok(0)
 }
 
 // ---- command handlers ---------------------------------------------------------
@@ -473,8 +708,10 @@ fn cmd_is_active(cli: &Cli, units: &[String]) -> Result<i32, String> {
                 .collect()
         })
         .unwrap_or_default();
-    for (_, s) in &states {
-        println!("{s}");
+    if !cli.quiet {
+        for (_, s) in &states {
+            println!("{s}");
+        }
     }
     Ok(v.get("exit").and_then(Value::as_i64).unwrap_or(0) as i32)
 }
@@ -941,8 +1178,11 @@ fn cmd_show(
 ) -> Result<i32, String> {
     let client = client_for(cli)?;
     let norm = normalize_units(units);
-    let v = client.units_op("show", &norm)?;
+    let v = client.op_with("show", json!({"units": norm, "properties": property}))?;
     let rows = v.as_array().unwrap_or(&vec![]).clone();
+    // systemctl's -P/--value form is most commonly paired with a single
+    // -P property in compatibility scripts. Match that useful shorthand.
+    let value_only = value_only || !property.is_empty();
     for r in &rows {
         let obj = r.as_object().unwrap();
         for (k, val) in obj {

@@ -79,7 +79,7 @@ fn daemon_subprocess() {
     mgr.load_all();
     // Mirror the real daemon (daemon::run_daemon): enumerate kernel devices
     // into runtime `.device` units before serving requests.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "udev"))]
     mgr.udev_init();
     mgr.bind_ipc().unwrap();
     mgr.bind_notify().ok();
@@ -430,7 +430,7 @@ fn extended_systemctl_surface() {
 
     // reset-failed: a unit whose ExecStart fails goes failed; reset-failed
     // clears it back to inactive.
-    rystemctl(&["start", "boom.service"]);
+    rystemctl(&["start", "--no-block", "boom.service"]);
     let failed = wait_for(Duration::from_secs(5), || {
         is_active("boom.service") == "failed"
     });
@@ -469,6 +469,96 @@ fn extended_systemctl_surface() {
     assert!(
         cleaned.contains("Clean"),
         "clean should print a message: {cleaned}"
+    );
+
+    shutdown_daemon(daemon);
+}
+
+#[test]
+fn job_query_wait_and_observability_surface() {
+    let scratch = Scratch::new();
+    scratch.write_unit(
+        "wait.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nRestartRandomizedDelaySec=1s\nExecStart=/bin/sh -c 'sleep 1'\n",
+    );
+    let daemon = spawn_daemon();
+
+    assert_eq!(rystemctl(&["log-level"]), "info\n");
+    rystemctl(&["log-level", "debug"]);
+    assert_eq!(rystemctl(&["log-level"]), "debug\n");
+
+    rystemctl(&["start", "--no-block", "wait.service"]);
+    let listed = wait_for(Duration::from_secs(5), || {
+        let out = rystemctl_raw(&["list-jobs"]);
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("wait.service")
+    });
+    assert!(
+        listed,
+        "list-jobs should be queryable while the daemon runs"
+    );
+
+    rystemctl(&["start", "--wait", "wait.service"]);
+    let first_id = rystemctl(&["show", "-P", "InvocationID", "wait.service"]);
+    assert!(
+        !first_id.trim().is_empty(),
+        "InvocationID should be populated"
+    );
+    assert_eq!(
+        rystemctl(&["show", "-P", "NRestarts", "wait.service"]).trim(),
+        "0"
+    );
+    assert_eq!(
+        rystemctl(&["show", "-P", "RestartRandomizedDelayUSec", "wait.service"]).trim(),
+        "1s"
+    );
+
+    rystemctl(&["restart", "--wait", "wait.service"]);
+    let second_id = rystemctl(&["show", "-P", "InvocationID", "wait.service"]);
+    assert_ne!(
+        first_id, second_id,
+        "restart should create a new invocation"
+    );
+
+    rystemctl(&["daemon-reexec"]);
+    shutdown_daemon(daemon);
+}
+
+#[test]
+fn irreversible_stop_cannot_be_replaced_by_exec_stop_start() {
+    let scratch = Scratch::new();
+    let cli_path = env!("CARGO_BIN_EXE_rystemctl");
+    scratch.write_unit(
+        "unstoppable.service",
+        &format!(
+            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\nExecStop={cli_path} start --no-block unstoppable.service\n"
+        ),
+    );
+    let daemon = spawn_daemon();
+
+    rystemctl(&["start", "unstoppable.service"]);
+    assert_eq!(is_active("unstoppable.service"), "active");
+
+    let normal_stop = rystemctl_raw(&["stop", "unstoppable.service"]);
+    assert!(
+        !normal_stop.status.success(),
+        "a replaceable stop must be canceled by ExecStop's start: {}",
+        String::from_utf8_lossy(&normal_stop.stderr)
+    );
+    assert_eq!(
+        is_active("unstoppable.service"),
+        "active",
+        "the canceled stop must leave the service active"
+    );
+
+    rystemctl(&[
+        "stop",
+        "--job-mode=replace-irreversibly",
+        "unstoppable.service",
+    ]);
+    assert_eq!(
+        is_active("unstoppable.service"),
+        "inactive",
+        "an irreversible stop must defeat the nested start"
     );
 
     shutdown_daemon(daemon);

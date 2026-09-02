@@ -13,27 +13,29 @@
 #
 # The initramfs installs the friendly demo units from examples/live/ (one of
 # every unit type rystemd supports) and enables demo.target at boot. The demo
-# .mount unit needs /mnt/demo to exist; /init creates it.
+# .mount unit needs /mnt/demo to exist; /init creates it. The live default
+# disables udev and D-Bus so the VM stays small and deterministic; add them
+# explicitly with RYSTEMD_LIVE_FEATURES when testing those integrations.
 #
-# Requires: qemu-system-x86_64, a kernel image, busybox, cpio, gzip.
-# Usage: scripts/live-vm.sh [kernel]   (auto-discovers the kernel if omitted)
+# Requires: qemu-system-x86_64, curl, sha256sum, busybox, cpio, gzip.
+# Usage: scripts/live-vm.sh [kernel]   (fetches the pinned kernel if omitted)
 set -uo pipefail
 
-# Kernel discovery: prefer an explicit $1, then the conventional distro
-# locations — /boot/vmlinuz-* (Debian/Fedora with /boot mounted), then the
-# /(usr)/lib/modules/*/vmlinuz trees (Fedora toolbox/container, ostree hosts).
+# Kernel selection: an explicit $1 is useful for local kernel development;
+# otherwise fetch-kernel.sh downloads and verifies the pinned, versioned kernel
+# into target/kernel. Do not silently select the host kernel: that makes the
+# VM depend on the developer's machine and breaks reproducibility.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 KERNEL=${1:-}
 if [ -z "$KERNEL" ]; then
-  KERNEL=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
-fi
-if [ -z "$KERNEL" ]; then
-  KERNEL=$(ls -1 /lib/modules/*/vmlinuz /usr/lib/modules/*/vmlinuz 2>/dev/null | sort -V | tail -1)
+  KERNEL=$(bash "$ROOT/scripts/fetch-kernel.sh") || exit 2
 fi
 QEMU=${QEMU:-qemu-system-x86_64}
 BUSYBOX=${BUSYBOX:-$(command -v busybox || true)}
 BIN=${BIN:-./target/release/rystemd}
 INITRD=./target/initramfs-live.cpio.gz
 EXTRA_UNITS=${RYSTEMD_EXTRA_UNITS:-examples/live}
+FEATURES=${RYSTEMD_LIVE_FEATURES:-boot,socket}
 
 if [ -z "$KERNEL" ] || [ ! -r "$KERNEL" ]; then
   echo "error: no kernel found (pass one as \$1)" >&2; exit 2
@@ -42,14 +44,15 @@ command -v "$QEMU" >/dev/null || { echo "error: $QEMU not found" >&2; exit 2; }
 [ -n "$BUSYBOX" ] && [ -x "$BUSYBOX" ] || { echo "error: need busybox (set BUSYBOX=/path/to/busybox)" >&2; exit 2; }
 [ -d "$EXTRA_UNITS" ] || { echo "error: demo units dir $EXTRA_UNITS not found" >&2; exit 2; }
 
-# Always (re)build the PID-1 binary with the `boot` feature. Cargo is
+# Always (re)build the PID-1 binary with the selected boot features. Cargo is
 # incremental, so this is a fast no-op when up to date — but it guarantees a
-# stale default build (no `boot`) is never silently reused. The `boot`
-# feature mounts the API filesystems itself; our /init also does it, so the
-# initramfs is explicit. The `--features boot` at the workspace root applies
-# `boot` to rystemd and is ignored by rystemctl/rystemd-tui.
-echo "building $BIN (cargo build --release --features boot)..."
-cargo build --release --features boot
+# stale default build (no `boot`) is never silently reused. `--no-default-
+# features` is intentional: the default udev graph is too large for this
+# small, self-contained VM and is not needed by the demo.
+echo "building $BIN (cargo build --release -p rystemd --no-default-features --features $FEATURES)..."
+cargo build --release -p rystemd --no-default-features --features "$FEATURES"
+echo "building rystemctl/rystemd-tui clients..."
+cargo build --release -p rystemctl -p rystemd-tui
 
 # Build the live initramfs: demo units enabled at boot, no auto-poweroff.
 export BUSYBOX RYSTEMD_EXTRA_UNITS="$EXTRA_UNITS" RYSTEMD_NO_BOOTTEST=1

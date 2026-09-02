@@ -115,6 +115,7 @@ pub fn mount_api_filesystems() -> Result<(), String> {
         MS_NOSUID | MS_NODEV,
         Some("mode=0755"),
     ));
+    attempt(mkdir_p("/run/systemd/system"));
     attempt(mkdir_p("/tmp"));
     attempt(mount(Some("tmpfs"), "/tmp", "tmpfs", 0, Some("mode=1777")));
     attempt(mkdir_p("/sys/fs/cgroup"));

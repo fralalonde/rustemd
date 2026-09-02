@@ -258,6 +258,19 @@ impl Manager {
                         .unwrap_or_default()
                 ),
             );
+            map.insert(
+                "InvocationID".into(),
+                json!(u.invocation_id.clone().unwrap_or_default()),
+            );
+            map.insert("NRestarts".into(), json!(u.n_restarts));
+            map.insert(
+                "RestartRandomizedDelayUSec".into(),
+                json!(
+                    u.service_cfg()
+                        .map(|s| s.restart_randomized_delay_sec.to_string())
+                        .unwrap_or_else(|| "0".into())
+                ),
+            );
             let map: serde_json::Map<String, Value> = if props.is_empty() {
                 map
             } else {

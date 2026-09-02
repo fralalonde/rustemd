@@ -569,6 +569,8 @@ pub struct ServiceConfig {
     pub exec_reload: Vec<ExecCommand>,
     pub restart: RestartPolicy,
     pub restart_sec: TimeSpan,
+    /// Maximum random addition to `RestartSec=` before an automatic restart.
+    pub restart_randomized_delay_sec: TimeSpan,
     pub timeout_start_sec: TimeSpan,
     pub timeout_stop_sec: TimeSpan,
     pub environment: Vec<(String, String)>,
@@ -968,6 +970,9 @@ fn build_service(
     }
     if let Some(v) = unit_scalar(raw, "Service", "RestartSec") {
         cfg.restart_sec = TimeSpan::parse(&exp(v))?;
+    }
+    if let Some(v) = unit_scalar(raw, "Service", "RestartRandomizedDelaySec") {
+        cfg.restart_randomized_delay_sec = TimeSpan::parse(&exp(v))?;
     }
     if let Some(v) = unit_scalar(raw, "Service", "TimeoutStartSec") {
         cfg.timeout_start_sec = TimeSpan::parse(&exp(v))?;

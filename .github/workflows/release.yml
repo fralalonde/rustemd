@@ -64,6 +64,54 @@ jobs:
             dist/*.deb
             dist/*.rpm
 
+  alpine:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            alpine_arch: x86_64
+            clang_target: x86_64-linux-musl
+            linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            alpine_arch: aarch64
+            clang_target: aarch64-linux-musl
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build pinned Alpine musl sysroot
+        env:
+          RYSTEMD_ALPINE_ARCH: ${{ matrix.alpine_arch }}
+        run: bash scripts/build-alpine-sysroot.sh
+      - name: Build static musl binaries
+        env:
+          RYSTEMD_ALPINE_ARCH: ${{ matrix.alpine_arch }}
+          LINKER_ENV: ${{ matrix.linker_env }}
+          CLANG_TARGET: ${{ matrix.clang_target }}
+        run: |
+          set -euo pipefail
+          sysroot="$(bash scripts/build-alpine-sysroot.sh)"
+          export "$LINKER_ENV=clang"
+          export RUSTFLAGS="-C link-arg=--target=$CLANG_TARGET -C link-arg=--sysroot=$sysroot"
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p rystemd --no-default-features --features boot,socket \
+            -p rystemctl -p rystemd-tui
+      - run: bash scripts/package-alpine.sh "${{ matrix.target }}" "${VERSION#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alpine-${{ matrix.target }}
+          path: dist/*.apk
+
   windows:
     runs-on: windows-2022
     steps:
@@ -137,7 +185,7 @@ jobs:
   # pipes, SCM). If a real macOS port is ever wanted, it is a separate effort.
 
   release:
-    needs: [test, linux, windows]
+    needs: [test, linux, alpine, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

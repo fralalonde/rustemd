@@ -14,9 +14,9 @@
 
 use serde_json::{Value, json};
 
-use crate::manager::Manager;
 use crate::manager::ops::active_str;
 use crate::manager::state::ActiveState;
+use crate::manager::{JobMode, Manager};
 
 /// Dispatch one request line against the manager. Returns the response JSON.
 pub fn dispatch(mgr: &mut Manager, line: &str) -> Value {
@@ -46,23 +46,48 @@ fn req_str<'a>(req: &'a Value, key: &str) -> Option<&'a str> {
     req.get(key).and_then(Value::as_str)
 }
 
+fn req_job_mode(req: &Value) -> Result<JobMode, String> {
+    match req_str(req, "job_mode").unwrap_or("replace") {
+        "replace" => Ok(JobMode::Replace),
+        "replace-irreversibly" => Ok(JobMode::ReplaceIrreversibly),
+        mode => Err(format!("unsupported job mode `{mode}`")),
+    }
+}
+
 fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, String> {
     let op = op.ok_or("missing op")?;
     match op {
         "start" => {
+            let mode = req_job_mode(req)?;
+            let mut jobs = Vec::new();
             for u in req_units(req) {
                 if crate::enable::is_masked(&mgr.cfg.paths, &u) {
                     return Err(format!("Unit {u} is masked."));
                 }
-                mgr.start(&u)?;
+                if let Some(id) = mgr.start_with_mode(&u, mode)? {
+                    jobs.push(id);
+                }
+            }
+            Ok(json!({"jobs": jobs}))
+        }
+        "start_ignore_dependencies" => {
+            for u in req_units(req) {
+                if crate::enable::is_masked(&mgr.cfg.paths, &u) {
+                    return Err(format!("Unit {u} is masked."));
+                }
+                mgr.start_ignore_dependencies(&u)?;
             }
             Ok(Value::Null)
         }
         "stop" => {
+            let mode = req_job_mode(req)?;
+            let mut jobs = Vec::new();
             for u in req_units(req) {
-                mgr.stop(&u)?;
+                if let Some(id) = mgr.stop_with_mode(&u, mode)? {
+                    jobs.push(id);
+                }
             }
-            Ok(Value::Null)
+            Ok(json!({"jobs": jobs}))
         }
         "restart" => {
             for u in req_units(req) {
@@ -187,6 +212,27 @@ fn run_op(mgr: &mut Manager, op: Option<&str>, req: &Value) -> Result<Value, Str
             } else {
                 Err(errs.join("; "))
             }
+        }
+        "daemon_reexec" => {
+            // A true re-exec would replace PID 1 and must preserve the full
+            // runtime state. Keep this command harmless until that contract
+            // exists rather than restarting with an incomplete state transfer.
+            Ok(Value::Null)
+        }
+        "list_jobs" => Ok(json!(mgr.list_jobs())),
+        "job_status" => {
+            let ids = req
+                .get("job_ids")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Ok(json!(mgr.job_status(&ids)))
+        }
+        "log_level" => {
+            if let Some(level) = req_str(req, "level") {
+                mgr.set_log_level(level)?;
+            }
+            Ok(json!(mgr.log_level()))
         }
         "get_default" => Ok(json!(mgr.get_default())),
         "repo" => Ok(json!(mgr.repo_info())),

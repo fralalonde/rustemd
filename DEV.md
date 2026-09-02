@@ -1,153 +1,160 @@
-## Architecture
+# Development
 
-This is a Cargo **workspace** with three crates: `rystemd` (the library and
-the PID-1 `rystemd` daemon), `rystemctl` (the `systemctl`-compatible control
-CLI, which depends on the library), and `rystemd-tui` (the terminal client,
-which depends on the library's `Control` API).
+## Workspace
+
+Cargo workspace with three crates:
+
+| Crate | Role |
+| --- | --- |
+| `rystemd` | Library, manager, daemon, PID 1 entry point |
+| `rystemctl` | `systemctl`-compatible CLI and native client |
+| `rystemd-tui` | Terminal client using the control API |
+
+Core modules:
 
 | Module | Responsibility |
 | --- | --- |
-| `unit` | Unit-file parser + typed unit configuration |
-| `calendar` / `timespan` | systemd calendar expressions & time spans |
-| `manager` | The daemon: unit table, state machine, process supervision, timers, socket activation, mounts, udev devices |
-| `manager::ops` | Typed operations shared by IPC and the `Control` API |
-| `manager::deps` | Dependency graph (start/stop ordering) |
-| `manager::timer` | Cancelable timer wheel |
-| `platform` | OS-specific surface: process supervision, shutdown events, IPC, filesystem links, SCM hosting (Windows), mounts/udev (Linux) |
-| `dbus` | zbus bridge for the `org.rystemd.Manager1.Manager` interface (Linux, default-on `dbus` feature) |
-| `ipc` / `client` | JSON wire protocol + client |
-| `control` | The `Control` trait + in-process/remote implementations |
-| `daemon` | The PID-1 manager entry point (`rystemd daemon`) |
-| `enable` | `[Install]` symlink management |
-| `paths` | System vs. user filesystem layout |
+| `unit` | Unit-file parser and typed configuration |
+| `manager` | Unit state, jobs, supervision, timers, activation |
+| `manager::deps` | Dependency expansion and ordering |
+| `manager::ops` | Shared typed operations and status records |
+| `platform` | Unix and Windows process, IPC, signal, mount, and service seams |
+| `ipc` / `client` | JSON-line control protocol |
+| `control` | In-process and remote control APIs |
+| `daemon` | Manager process entry point |
+| `enable` / `paths` | Install links and filesystem layout |
 
-The `systemctl`-compatible CLI lives in the separate `rystemctl` crate (its
-`cli` module), which consumes the library's `client`/`paths`/`enable`/
-`cli_style`/`names` modules.
-
-**Portability.** Raw OS operations live under `platform/`: Unix uses `nix`,
-while Windows uses direct `windows-sys` bindings for named pipes, Job Objects,
-console controls, Winsock polling, and SCM hosting. The manager retains one
-state machine with platform-specific event-loop adapters.
-
----
-
-## Programmatic control API
-
-The library exposes a `Control` trait implemented two ways — an **in-process**
-[`Manager`] and a **remote** [`SocketClient`] — so callers can hold a
-`&mut dyn Control` without caring which one they have. This is the intended
-alternative to shelling out to `systemctl` or speaking D-Bus.
-
-```rust
-use rystemd::control::{Control, SocketClient};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Talk to a running daemon over the socket (like `systemctl` does).
-    let mut ctl = SocketClient::for_mode(false /* system */)?;
-
-    ctl.start(&["myapp.service"])?;
-    for status in ctl.status(&["myapp.service"])? {
-        println!("{}: {} ({})", status.name, status.active, status.sub);
-    }
-    ctl.stop(&["myapp.service"])?;
-    Ok(())
-}
-```
-
-An in-process manager implements the same trait:
-
-```rust
-use rystemd::control::Control;
-use rystemd::manager::{Manager, ManagerCfg};
-
-let mut mgr = Manager::new(ManagerCfg::for_mode(false)?)?;
-mgr.load_all();
-mgr.start(&["myapp.service"])?;      // Control::start
-```
-
-Typed request/response structs — [`UnitStatus`], [`UnitSummary`],
-[`TimerInfo`], [`UnitFileInfo`] — are `Serialize`/`Deserialize` and are the
-same types the wire protocol carries.
-
----
-
-## Testing
+## Local build
 
 ```sh
+cargo build --workspace
+cargo build -p rystemd --features boot
+cargo build -p rystemctl
+cargo build -p rystemd-tui
+```
+
+The default manager build is suitable for a normal user or service-manager
+process. The `boot` feature adds PID 1 filesystem setup, early boot handling,
+getty setup, and power control.
+
+## Test organization
+
+| Location | Coverage |
+| --- | --- |
+| `rystemd/src/**` unit tests | Parser, calendar, manager, sandbox, and protocol logic |
+| `rystemd/tests/e2e.rs` | Lifecycle and control API tests against scratch paths |
+| `rystemd/tests/seccomp.rs` | Linux seccomp behavior |
+| `rystemd/tests/privileged.rs` | Root-only namespace and device cases |
+| `rystemd/tests/dbus.rs` | Linux D-Bus surface when enabled |
+| `rystemctl/tests/cli.rs` | Real CLI and daemon subprocess round trips |
+| `scripts/ns-boot-test.sh` | Rootless namespace boot smoke test |
+| `scripts/vm-test.sh` | Automated QEMU boot test |
+| `scripts/live-vm.sh` | Interactive PID 1 VM |
+| `scripts/run-systemd-test.sh` | Alpine compatibility scenario runner |
+
+Standard gates:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+cargo test --workspace --all-features
 
-# From Windows, run the Linux suite too when WSL is available:
-wsl.exe -e bash -lc 'cd /mnt/d/path/to/rystemd && cargo test --workspace'
+git diff --check
 ```
 
-Integration tests boot the real manager and drive it over the socket —
-`rystemd/tests/e2e.rs` uses the programmatic `Control` API, and
-`rystemctl/tests/cli.rs` runs the compiled `rystemctl` binary against the
-daemon — both against a scratch filesystem via the `RYSTEMD_*` env hooks.
+Shell and workflow checks:
 
----
-
-## Live environment
-
-To drive rystemd interactively as a real PID-1 daemon in qemu (demo units for
-every unit type, getty shell, etc.), see **[DEMO.md](DEMO.md)** and
-`scripts/live-vm.sh`.
-
-## Known issues
-
-Categorized bugs / weaknesses / design holes live in
-**[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — the input for the upcoming security
-inspection.
-
-## Releasing
-
-```bash
-./release.sh <major|minor|patch> [--push]
+```sh
+bash -n scripts/*.sh release.sh
+python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/release.yml"))'
 ```
 
-- performs basic sanity checks 
-- bumps the semantic version
-- tags the repo with the new version
-- optionally pushes upstream to trigger a release build
+The privileged tests self-skip without the required privileges. A skip is not
+runtime coverage. Run the relevant test under a real root environment when
+validating namespace or device isolation.
 
-Git tags are the source of truth for versioning; the build files (`Cargo.toml`,
-`Cargo.lock`) are synced as a side effect of the release commit.
+## Live environments
 
-## CI
+Interactive live VM:
 
-GitHub Actions (`.github/workflows/release.yml`) builds and packages release
-artifacts on every `v*` tag push:
-
-| Target                       | Runner             | Packages      |
-|------------------------------|--------------------|---------------|
-| `x86_64-unknown-linux-gnu`   | `ubuntu-22.04`     | tar.gz, deb, rpm |
-| `aarch64-unknown-linux-gnu`  | `ubuntu-24.04-arm` | tar.gz, deb, rpm |
-| `x86_64-pc-windows-msvc`     | `windows-2022`     | tests, zip, msi |
-
-The package version comes from the git tag at build time (see
-`rystemd/build.rs`); `Cargo.toml`/`Cargo.lock` are kept in sync by `release.sh`
-at release time. Linux packaging lives in `scripts/package-linux.sh` +
-`packaging/`.
-
-
-## Windows development
-
-The Windows manager uses direct `windows-sys` bindings rather than a POSIX
-compatibility layer: Job Objects for process trees, named pipes for control
-IPC, Winsock polling for TCP socket triggers, console control handlers, and
-the Service Control Manager APIs.
-
-```powershell
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-
-# Also protect the Unix implementation from regressions:
-wsl.exe -e bash -lc 'cd /mnt/d/path/to/rystemd && cargo test --workspace'
+```sh
+scripts/live-vm.sh
 ```
 
-Use a separate `CARGO_TARGET_DIR` if a crashed Windows integration test still
-has an old test executable open; Windows will not relink over a running image.
+The script builds a reduced initramfs, fetches the pinned kernel when no kernel
+path is supplied, and boots rystemd as PID 1. It does not modify the host boot
+image. `DEMO.md` documents the guest commands.
+
+Alpine compatibility scenario:
+
+```sh
+scripts/run-systemd-test.sh TEST-03-JOBS
+```
+
+The runner builds pinned Alpine and musl inputs, boots a static manager and
+client, runs the adapted upstream scenario, and requires this guest marker:
+
+```text
+RYNTEST_DONE rc=0
+```
+
+A non-zero marker is a compatibility failure. Alpine userland and harness
+adapters do not establish Fedora systemd, D-Bus, journald, or `systemd-run`
+parity.
+
+## Cross-target checks
+
+Installed targets can be type-checked without a linker:
+
+```sh
+cargo check --workspace --locked --target x86_64-unknown-linux-musl
+cargo check --workspace --locked --target aarch64-unknown-linux-musl
+cargo check --workspace --locked --target x86_64-pc-windows-msvc
+```
+
+Musl release builds use the pinned Alpine sysroot scripts. GNU Linux builds
+serve Fedora and Debian package lanes. Windows runtime tests require Windows.
+
+## Release procedure
+
+Release automation is tag-driven. The tag is the version source for build
+metadata and release assets.
+
+Pre-release gates:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features
+scripts/run-systemd-test.sh TEST-03-JOBS
+```
+
+Create a local release tag:
+
+```sh
+./release.sh patch
+```
+
+The script runs `cargo check`, updates member crate versions, commits pending
+changes when approved by the release operator, and creates an annotated tag.
+Without `--push`, no remote branch or tag is pushed.
+
+Trigger the release workflow explicitly:
+
+```sh
+./release.sh patch --push
+```
+
+The workflow builds and packages:
+
+| Target | Release output |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | tar.gz, DEB, RPM |
+| `aarch64-unknown-linux-gnu` | tar.gz, DEB, RPM |
+| `x86_64-unknown-linux-musl` | Alpine APK |
+| `aarch64-unknown-linux-musl` | Alpine APK |
+| `x86_64-pc-windows-msvc` | ZIP, MSI, tests |
+
+Alpine APK generation is handled by `scripts/package-alpine.sh`. GNU package
+generation is handled by `scripts/package-linux.sh` and `packaging/`.

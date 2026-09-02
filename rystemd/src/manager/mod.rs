@@ -163,6 +163,12 @@ enum JobKind {
     Restart,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobMode {
+    Replace,
+    ReplaceIrreversibly,
+}
+
 #[derive(Debug, Clone)]
 struct WaitEntry {
     unit: String,
@@ -173,6 +179,7 @@ struct WaitEntry {
 struct Job {
     unit: Name,
     kind: JobKind,
+    mode: JobMode,
     waiting: Vec<WaitEntry>,
     started: bool,
     failed: bool,
@@ -184,6 +191,25 @@ struct Job {
     /// from a synchronously-failing spawn) starting the job before its
     /// dependencies are known.
     expanding: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobStatus {
+    pub id: u64,
+    pub unit: String,
+    pub state: String,
+    pub ok: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// A compact native-IPC representation of a queued manager job.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobSummary {
+    pub id: u64,
+    pub unit: String,
+    #[serde(rename = "type")]
+    pub job_type: String,
+    pub state: String,
 }
 
 // ---- manager ----------------------------------------------------------------
@@ -200,8 +226,10 @@ pub struct Manager {
     pub repo: Repo,
     pub units: HashMap<Name, Unit>,
     jobs: HashMap<u64, Job>,
+    completed_jobs: HashMap<u64, JobStatus>,
     unit_job: HashMap<Name, u64>,
     next_job: u64,
+    log_level: String,
     pub wheel: TimerWheel,
     pid_unit: HashMap<i32, Name>,
     /// Unix child-output pipes are polled directly. Windows reader threads
@@ -255,8 +283,10 @@ impl Manager {
             journal,
             units: HashMap::new(),
             jobs: HashMap::new(),
+            completed_jobs: HashMap::new(),
             unit_job: HashMap::new(),
             next_job: 0,
+            log_level: "info".into(),
             wheel: TimerWheel::default(),
             pid_unit: HashMap::new(),
             #[cfg(unix)]
@@ -712,60 +742,119 @@ impl Manager {
     // ---- public control entry points ----------------------------------------
 
     pub fn start(&mut self, name: &str) -> Result<(), String> {
+        self.start_with_mode(name, JobMode::Replace).map(|_| ())
+    }
+
+    fn ensure_unit_loaded(&mut self, name: &str) -> Result<(), String> {
+        if self.units.contains_key(name) {
+            return Ok(());
+        }
+        let Some(unit) = self.load_unit(name)? else {
+            return Err(format!("Unit {name} not found."));
+        };
+        self.units.insert(name.to_string(), unit);
+        Ok(())
+    }
+
+    pub fn start_with_mode(&mut self, name: &str, mode: JobMode) -> Result<Option<u64>, String> {
+        self.ensure_unit_loaded(name)?;
         // Once shutdown has begun, refuse new starts: a socket-activation
         // trigger (or any other edge) that fires mid-shutdown would otherwise
         // restart units faster than `shutdown()` stops them and prevent the
         // manager from ever reaching `idle()`.
         if self.shutting_down {
-            return Ok(());
+            return Ok(None);
         }
+        if !self.units.contains_key(name) {
+            return Err(format!("Unit {name} not found."));
+        }
+        if self.unit_active(name) {
+            return Ok(None);
+        }
+        if let Some(jid) = self.unit_job.get(name).copied()
+            && let Some(job) = self.jobs.get(&jid)
+            && job.kind == JobKind::Start
+        {
+            return Ok(Some(jid));
+        }
+        if let Some(jid) = self.unit_job.get(name).copied()
+            && let Some(job) = self.jobs.get(&jid)
+            && matches!(job.kind, JobKind::Stop | JobKind::Restart)
+        {
+            if job.mode == JobMode::ReplaceIrreversibly {
+                return Err(format!("Job for {name} is irreversible."));
+            }
+            self.cancel_job(jid, "Job canceled by a replacement start.");
+            self.units.get_mut(name).unwrap().set_active(
+                ActiveState::Active,
+                SubState::Exited,
+                UnitResult::Success,
+            );
+            return Ok(None);
+        }
+        let id = self.enqueue_start_job_mode(name, mode);
+        self.process_jobs();
+        Ok(Some(id))
+    }
+
+    /// Start a unit without expanding its dependency closure. This is the
+    /// useful subset of systemd's `--job-mode=ignore-dependencies` for the
+    /// native control socket.
+    pub fn start_ignore_dependencies(&mut self, name: &str) -> Result<(), String> {
         if !self.units.contains_key(name) {
             return Err(format!("Unit {name} not found."));
         }
         if self.unit_active(name) {
             return Ok(());
         }
-        if let Some(jid) = self.unit_job.get(name).copied()
-            && self
-                .jobs
-                .get(&jid)
-                .map(|j| j.kind == JobKind::Start)
-                .unwrap_or(false)
-        {
-            return Ok(());
+        if let Some(jid) = self.unit_job.remove(name) {
+            self.jobs.remove(&jid);
+            for job in self.jobs.values_mut() {
+                job.waiting.retain(|wait| wait.unit != name);
+            }
         }
-        self.enqueue_start_job(name);
+        let id = self.new_job(JobKind::Start, name, vec![], JobMode::Replace);
+        self.maybe_start_job(id);
         self.process_jobs();
         Ok(())
     }
 
     pub fn stop(&mut self, name: &str) -> Result<(), String> {
+        self.stop_with_mode(name, JobMode::Replace).map(|_| ())
+    }
+
+    pub fn stop_with_mode(&mut self, name: &str, mode: JobMode) -> Result<Option<u64>, String> {
         if !self.units.contains_key(name) {
             return Err(format!("Unit {name} not found."));
         }
         if !self.unit_operational(name) {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(jid) = self.unit_job.get(name).copied() {
             let kind = self.jobs.get(&jid).map(|j| j.kind);
             if kind == Some(JobKind::Stop) || kind == Some(JobKind::Restart) {
-                return Ok(());
+                if mode == JobMode::ReplaceIrreversibly {
+                    self.jobs.get_mut(&jid).unwrap().mode = mode;
+                }
+                return Ok(Some(jid));
             }
             if kind == Some(JobKind::Start) {
                 // Cancel the pending start and stop instead.
-                self.unit_job.remove(name);
-                self.jobs.remove(&jid);
+                self.cancel_job(jid, "Job canceled by a replacement stop.");
             }
         }
-        self.enqueue_stop_job(name);
+        let id = self.enqueue_stop_job_after_mode(name, None, mode);
         self.process_jobs();
-        Ok(())
+        Ok(Some(id))
     }
 
     pub fn restart(&mut self, name: &str) -> Result<(), String> {
         if !self.units.contains_key(name) {
             return Err(format!("Unit {name} not found."));
         }
+        #[cfg(feature = "socket")]
+        let activated_service = (self.units[name].kind == UnitKind::Socket)
+            .then(|| self.units[name].activated_service());
         if self.unit_operational(name) {
             if let Some(jid) = self.unit_job.get(name).copied() {
                 let kind = self.jobs.get(&jid).map(|j| j.kind);
@@ -777,15 +866,17 @@ impl Manager {
                     self.jobs.remove(&jid);
                 }
             }
-            self.enqueue_stop_job(name);
-            let stop_id = self.unit_job[name];
-            if let Some(j) = self.jobs.get_mut(&stop_id) {
-                j.start_after_stop = Some(name.to_string());
-            }
+            self.enqueue_stop_job_after(name, Some(name.to_string()));
         } else {
             return self.start(name);
         }
         self.process_jobs();
+        #[cfg(feature = "socket")]
+        if let Some(service) = activated_service
+            && self.unit_operational(&service)
+        {
+            self.restart(&service)?;
+        }
         Ok(())
     }
 
@@ -921,9 +1012,70 @@ impl Manager {
             }
     }
 
+    /// Return the jobs currently queued in the manager.
+    pub fn list_jobs(&self) -> Vec<JobSummary> {
+        let mut ids: Vec<u64> = self.jobs.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| {
+                let job = self.jobs.get(&id)?;
+                Some(JobSummary {
+                    id,
+                    unit: job.unit.clone(),
+                    job_type: job_kind_str(job.kind).to_string(),
+                    state: if job.waiting.is_empty() {
+                        "running".into()
+                    } else {
+                        "waiting".into()
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub fn job_status(&self, ids: &[u64]) -> Vec<JobStatus> {
+        ids.iter()
+            .filter_map(|id| {
+                if let Some(job) = self.jobs.get(id) {
+                    return Some(JobStatus {
+                        id: *id,
+                        unit: job.unit.clone(),
+                        state: "pending".into(),
+                        ok: None,
+                        error: None,
+                    });
+                }
+                self.completed_jobs.get(id).cloned()
+            })
+            .collect()
+    }
+
+    /// Query the selected manager log level. Dynamic filtering is not yet
+    /// implemented, but the control state is real and validated.
+    pub fn log_level(&self) -> &str {
+        &self.log_level
+    }
+
+    pub fn set_log_level(&mut self, level: &str) -> Result<(), String> {
+        let level = level.to_ascii_lowercase();
+        match level.as_str() {
+            "emerg" | "alert" | "crit" | "err" | "warning" | "notice" | "info" | "debug" => {
+                self.log_level = level;
+                Ok(())
+            }
+            _ => Err(format!("unknown log level `{level}`")),
+        }
+    }
+
     // ---- job engine ---------------------------------------------------------
 
-    fn new_job(&mut self, kind: JobKind, unit: &str, waiting: Vec<WaitEntry>) -> u64 {
+    fn new_job(
+        &mut self,
+        kind: JobKind,
+        unit: &str,
+        waiting: Vec<WaitEntry>,
+        mode: JobMode,
+    ) -> u64 {
         self.next_job += 1;
         let id = self.next_job;
         self.jobs.insert(
@@ -931,6 +1083,7 @@ impl Manager {
             Job {
                 unit: unit.to_string(),
                 kind,
+                mode,
                 waiting,
                 started: false,
                 failed: false,
@@ -943,9 +1096,14 @@ impl Manager {
         id
     }
 
-    fn enqueue_start_job(&mut self, name: &str) {
-        let id = self.new_job(JobKind::Start, name, vec![]);
+    fn enqueue_start_job(&mut self, name: &str) -> u64 {
+        self.enqueue_start_job_mode(name, JobMode::Replace)
+    }
+
+    fn enqueue_start_job_mode(&mut self, name: &str, mode: JobMode) -> u64 {
+        let id = self.new_job(JobKind::Start, name, vec![], mode);
         self.expand_start_job(id);
+        id
     }
 
     fn expand_start_job(&mut self, id: u64) {
@@ -1041,10 +1199,17 @@ impl Manager {
         // (silently ignored if missing) pull units into the transaction.
         // `After=` is deliberately *not* here — it only orders, never activates
         // (systemd semantics).
-        let needs_set: HashSet<String> = needs.into_iter().collect();
-        let mut open: HashSet<String> = HashSet::new();
-        open.extend(needs_set.iter().cloned());
-        open.extend(weak.iter().cloned());
+        let needs_set: HashSet<String> = needs.iter().cloned().collect();
+        // Keep the dependency closure's order. In particular, a target's
+        // `Wants=` list may contain a unit that another wanted unit orders
+        // after; putting the list in a HashSet can start the latter before
+        // the former has a job in the transaction, making `After=` invisible.
+        let mut open = Vec::new();
+        for d in needs.iter().chain(&weak) {
+            if !open.contains(d) {
+                open.push(d.clone());
+            }
+        }
         for d in open {
             if self.unit_active(&d) {
                 continue;
@@ -1096,6 +1261,37 @@ impl Manager {
             }
         }
 
+        // `Before=` is the inverse spelling of `After=`. If a pending unit
+        // declares `Before=name`, make this job wait for that pending start
+        // job as well. Without the reverse lookup, a target can pull in two
+        // units and let the later one run before the target's `After=` work
+        // has completed.
+        let before_names: Vec<String> = self
+            .units
+            .iter()
+            .filter(|(other, unit)| {
+                *other != &name
+                    && unit
+                        .file
+                        .as_ref()
+                        .is_some_and(|f| f.unit.before.iter().any(|b| b == &name))
+            })
+            .map(|(other, _)| other.clone())
+            .collect();
+        for before in before_names {
+            if self.unit_active(&before) || waiting.iter().any(|w| w.unit == before) {
+                continue;
+            }
+            if let Some(jid) = self.unit_job.get(&before)
+                && self.jobs[jid].kind == JobKind::Start
+            {
+                waiting.push(WaitEntry {
+                    unit: before,
+                    required: false,
+                });
+            }
+        }
+
         // Some dependencies resolve synchronously during the expansion above:
         // a `.mount` fails on mount(2) EPERM, a `.target` activates the instant
         // it starts, etc. Their job completes (and runs `on_job_completed`)
@@ -1128,8 +1324,26 @@ impl Manager {
         self.maybe_start_job(id);
     }
 
-    fn enqueue_stop_job(&mut self, name: &str) {
-        let id = self.new_job(JobKind::Stop, name, vec![]);
+    fn enqueue_stop_job(&mut self, name: &str) -> u64 {
+        self.enqueue_stop_job_after(name, None)
+    }
+
+    fn enqueue_stop_job_after(&mut self, name: &str, start_after_stop: Option<Name>) -> u64 {
+        self.enqueue_stop_job_after_mode(name, start_after_stop, JobMode::Replace)
+    }
+
+    fn enqueue_stop_job_after_mode(
+        &mut self,
+        name: &str,
+        start_after_stop: Option<Name>,
+        mode: JobMode,
+    ) -> u64 {
+        let id = self.new_job(JobKind::Stop, name, vec![], mode);
+        if let Some(next) = start_after_stop
+            && let Some(job) = self.jobs.get_mut(&id)
+        {
+            job.start_after_stop = Some(next);
+        }
         let dependents = D::stop_propagate(&self.units, name);
         for d in dependents {
             if self.unit_operational(&d) && !self.unit_job.contains_key(&d) {
@@ -1137,6 +1351,7 @@ impl Manager {
             }
         }
         self.maybe_stop_job(id);
+        id
     }
 
     fn unit_active(&self, name: &str) -> bool {
@@ -1276,6 +1491,34 @@ impl Manager {
         }
     }
 
+    fn record_job_result(&mut self, id: u64, ok: bool, error: Option<String>) {
+        let Some(job) = self.jobs.get(&id) else {
+            return;
+        };
+        self.completed_jobs.insert(
+            id,
+            JobStatus {
+                id,
+                unit: job.unit.clone(),
+                state: "done".into(),
+                ok: Some(ok),
+                error,
+            },
+        );
+    }
+
+    fn cancel_job(&mut self, id: u64, message: &str) {
+        let Some(job) = self.jobs.get(&id).cloned() else {
+            return;
+        };
+        self.record_job_result(id, false, Some(message.into()));
+        self.jobs.remove(&id);
+        if self.unit_job.get(&job.unit) == Some(&id) {
+            self.unit_job.remove(&job.unit);
+        }
+        self.on_job_completed(&job.unit, false);
+    }
+
     fn finish_job(&mut self, id: u64) {
         let Some(job) = self.jobs.get(&id).cloned() else {
             return;
@@ -1284,6 +1527,7 @@ impl Manager {
         if job.kind == JobKind::Stop
             && let Some(next) = job.start_after_stop.clone()
         {
+            self.record_job_result(id, true, None);
             self.jobs.remove(&id);
             if self.unit_job.get(&unit) == Some(&id) {
                 self.unit_job.remove(&unit);
@@ -1292,6 +1536,7 @@ impl Manager {
             self.enqueue_start_job(&next);
             return;
         }
+        self.record_job_result(id, true, None);
         self.jobs.remove(&id);
         if self.unit_job.get(&unit) == Some(&id) {
             self.unit_job.remove(&unit);
@@ -1307,6 +1552,7 @@ impl Manager {
         if let Some(msg) = &job.failed_msg {
             self.mgr(&unit, msg);
         }
+        self.record_job_result(id, false, job.failed_msg.clone());
         self.jobs.remove(&id);
         if self.unit_job.get(&unit) == Some(&id) {
             self.unit_job.remove(&unit);
@@ -1746,6 +1992,18 @@ impl Manager {
         self.units.get_mut(name).unwrap().group_pid = None;
         self.units.get_mut(name).unwrap().control_command = None;
 
+        if ccmd == Some(UnitControlCommand::Stop) {
+            let current_is_stop = self
+                .unit_job
+                .get(name)
+                .and_then(|id| self.jobs.get(id))
+                .map(|job| job.kind == JobKind::Stop)
+                .unwrap_or(false);
+            if !current_is_stop {
+                return;
+            }
+        }
+
         // A stop is in progress: the control command's death (however it was
         // signalled — e.g. shutdown SIGTERMing an in-flight oneshot ExecStart)
         // completes the stop. Route to `finalize_stop` instead of the
@@ -2024,6 +2282,7 @@ impl Manager {
                 SubState::AutoRestart,
                 UnitResult::Success,
             );
+            self.units.get_mut(name).unwrap().n_restarts += 1;
             self.wheel
                 .schedule(Instant::now() + restart_sec, TimerKind::RestartDelay, name);
         } else if exit_ok {
@@ -3462,8 +3721,7 @@ fn unit_kind_of(name: &str) -> UnitKind {
     UnitKind::from_unit_name(name).unwrap_or(UnitKind::Service)
 }
 
-/// The systemd1 wire string for a [`JobKind`] (`start`/`stop`/`restart`).
-#[cfg(all(target_os = "linux", feature = "dbus"))]
+/// The systemd wire string for a [`JobKind`] (`start`/`stop`/`restart`).
 fn job_kind_str(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Start => "start",

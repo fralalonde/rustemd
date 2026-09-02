@@ -13,6 +13,8 @@
 #                               listed in <dir>/enable into default.target.wants
 #   RYSTEMD_NO_BOOTTEST=1       omit the auto-poweroff boottest.service (used
 #                               by the interactive live env; see live-vm.sh)
+#   RYSTEMD_EXTRA_BINARIES=<paths>  copy extra dynamic binaries and their
+#                                  shared libraries into /usr/bin
 set -euo pipefail
 
 BIN=${1:-./target/release/rystemd}
@@ -32,7 +34,8 @@ mkdir -p "$STAGE"/{bin,sbin,usr/bin,dev,proc,sys,run,tmp,etc/rystemd,etc/systemd
 
 # --- busybox + applet symlinks ---
 cp "$BUSYBOX" "$STAGE/bin/busybox"
-for app in sh mount umount mkdir mknod modprobe ln cp cat echo sleep ls date nc grep head tail ps timeout stty ip; do
+for app in sh mount umount mkdir mknod modprobe ln cp cat echo sleep ls date nc grep head tail ps timeout stty ip \
+  basename dirname false true printf rm sed tee awk cut tr wc sort uniq touch test chmod kill sync poweroff; do
   ln -s /bin/busybox "$STAGE/bin/$app"
 done
 # getty@.service references /sbin/getty (busybox's applet; no agetty there).
@@ -44,7 +47,7 @@ ln -s /bin/busybox "$STAGE/sbin/getty"
 copy_binary() {
   local src=$1 name=$2
   cp "$src" "$STAGE/usr/bin/$name"
-  ldd "$src" 2>/dev/null | while read -r line; do
+  while read -r line; do
     case "$line" in
       *"=>"*)
         lib=$(echo "$line" | awk '{print $3}')
@@ -59,7 +62,7 @@ copy_binary() {
         fi
         ;;
     esac
-  done
+  done < <(ldd "$src" 2>/dev/null || true)
 }
 copy_binary "$BIN" rystemd
 # The systemctl-compatible control CLI (talks to the rystemd daemon over its
@@ -73,6 +76,16 @@ if [ -x "$TUI" ]; then
   copy_binary "$TUI" rystemd-tui
 else
   echo "note: $TUI not found — skipping rystemd-tui (build with: cargo build --release --features boot)" >&2
+fi
+
+# Optional tools used by compatibility scenarios (for example, Bash-based
+# systemd test scripts). Static binaries are also accepted; copy_binary's ldd
+# probe is deliberately best-effort for them.
+if [ -n "${RYSTEMD_EXTRA_BINARIES:-}" ]; then
+  for src in $RYSTEMD_EXTRA_BINARIES; do
+    [ -x "$src" ] || { echo "error: extra binary not executable: $src" >&2; exit 2; }
+    copy_binary "$src" "${src##*/}"
+  done
 fi
 
 # --- /init ---
@@ -183,6 +196,17 @@ fi
 
 # --- etc ---
 echo "rystemd" > "$STAGE/etc/hostname"
+
+# --- systemctl aliasing (compat tests) ---
+# RYSTEMD_SYSTEMCTL_ALIAS=1 symlinks `systemctl` to `rystemctl` so unmodified
+# system, systemd's own TEST-XX*.sh scripts that call `systemctl` work against
+# the rystemd manager near-verbatim. rystemctl is a systemctl-compatible CLI,
+# so the compatibility layer is the CLI itself — no re-authored assertions.
+if [ -n "${RYSTEMD_SYSTEMCTL_ALIAS:-}" ]; then
+  ln -sf /usr/bin/rystemctl "$STAGE/usr/bin/systemctl"
+  ln -sf /usr/bin/rystemctl "$STAGE/usr/sbin/systemctl" 2>/dev/null || true
+  echo "systemctl -> rystemctl alias installed"
+fi
 
 # --- pack into a gzip'd newc cpio ---
 ( cd "$STAGE" && find . -print0 | cpio --null -o -H newc 2>/dev/null ) | gzip -9 > "$OUT"

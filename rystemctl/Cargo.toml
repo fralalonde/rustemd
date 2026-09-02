@@ -8,8 +8,12 @@ repository = "https://github.com/rystemd/rystemd"
 homepage = "https://github.com/rystemd/rystemd"
 rust-version = "1.89"
 
+[features]
+default = []
+udev = ["rystemd/udev"]
+
 [dependencies]
-rystemd = { path = "../rystemd" }
+rystemd = { path = "../rystemd", default-features = false }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_complete_nushell = "4.6.2"
