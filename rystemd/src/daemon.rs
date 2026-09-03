@@ -49,7 +49,7 @@ pub enum ServiceCommand {
         #[arg(long, default_value = "rystemd")]
         name: String,
     },
-    /// Register rystemd as a Windows service. Requires an elevated terminal.
+    /// Register rystemd as a Windows service, requesting elevation when needed.
     Install {
         #[arg(long, default_value = "rystemd")]
         name: String,

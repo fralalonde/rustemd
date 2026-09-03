@@ -8,7 +8,10 @@ use std::sync::{
     atomic::{AtomicPtr, Ordering},
 };
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, WAIT_FAILED};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+};
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
@@ -19,6 +22,11 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     SetServiceStatus, StartServiceCtrlDispatcherW,
 };
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
+};
+use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 static SERVICE_NAME: OnceLock<String> = OnceLock::new();
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -33,6 +41,9 @@ fn service_image_path_for(executable: &Path, name: &str) -> String {
 
 pub fn install(name: &str, display_name: &str, manual: bool) -> Result<(), String> {
     validate_name(name)?;
+    if !is_elevated()? {
+        return elevate_install(name, display_name, manual);
+    }
     let paths = crate::paths::Paths::system();
     for directory in paths
         .unit_path
@@ -91,6 +102,120 @@ pub fn install(name: &str, display_name: &str, manual: bool) -> Result<(), Strin
         CloseServiceHandle(service);
     }
     Ok(())
+}
+
+fn is_elevated() -> Result<bool, String> {
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error("OpenProcessToken"));
+    }
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0;
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    let error = (queried == 0).then(|| last_error("GetTokenInformation"));
+    unsafe {
+        CloseHandle(token);
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(elevation.TokenIsElevated != 0),
+    }
+}
+
+fn elevate_install(name: &str, display_name: &str, manual: bool) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable_w = wide(&executable);
+    let verb_w = wide("runas");
+    let parameters_w = wide(elevated_install_parameters(name, display_name, manual));
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: verb_w.as_ptr(),
+        lpFile: executable_w.as_ptr(),
+        lpParameters: parameters_w.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    if unsafe { ShellExecuteExW(&mut execute) } == 0 {
+        return Err(last_error("request administrator privileges"));
+    }
+    if execute.hProcess.is_null() {
+        return Err("elevated service installer did not return a process handle".into());
+    }
+
+    let wait = unsafe { WaitForSingleObject(execute.hProcess, INFINITE) };
+    if wait == WAIT_FAILED {
+        let error = last_error("wait for elevated service installer");
+        unsafe {
+            CloseHandle(execute.hProcess);
+        }
+        return Err(error);
+    }
+    let mut exit_code = 0;
+    let got_exit_code = unsafe { GetExitCodeProcess(execute.hProcess, &mut exit_code) };
+    let error = (got_exit_code == 0).then(|| last_error("read elevated installer exit code"));
+    unsafe {
+        CloseHandle(execute.hProcess);
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    if exit_code != 0 {
+        return Err(format!(
+            "elevated service installer exited with code {exit_code}"
+        ));
+    }
+    Ok(())
+}
+
+fn elevated_install_parameters(name: &str, display_name: &str, manual: bool) -> String {
+    let mut parameters = format!(
+        "service install --name {} --display-name {}",
+        quote_windows_argument(name),
+        quote_windows_argument(display_name)
+    );
+    if manual {
+        parameters.push_str(" --manual");
+    }
+    parameters
+}
+
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| character.is_whitespace() || character == '"')
+    {
+        return argument.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+        } else if character == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            quoted.push(character);
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 pub fn uninstall(name: &str) -> Result<(), String> {
@@ -226,4 +351,25 @@ fn last_error(operation: &str) -> String {
         "{operation} failed: {} (win32 error {code})",
         std::io::Error::from_raw_os_error(code as i32)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevated_install_parameters_preserve_install_options() {
+        assert_eq!(
+            elevated_install_parameters("rystemd-test", "Rystemd Test Service", true),
+            r#"service install --name rystemd-test --display-name "Rystemd Test Service" --manual"#
+        );
+    }
+
+    #[test]
+    fn windows_argument_quoting_escapes_quotes_and_trailing_backslashes() {
+        assert_eq!(
+            quote_windows_argument(r#"A "quoted" path\"#),
+            r#""A \"quoted\" path\\""#
+        );
+    }
 }
