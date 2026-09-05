@@ -133,5 +133,19 @@ fn systemd1_manager_surface_is_live_over_bus() {
         "hello.service should be listed by systemd1 ListUnits"
     );
 
+    // A mutating call from the same-UID client over the private bus must be
+    // authorized (the manager checks the caller's bus UnixUserID). Proves the
+    // native surface and the authorize path work over a real bus.
+    let native = zbus::blocking::Proxy::new(
+        &conn,
+        "org.rystemd.Manager1",
+        "/org/rystemd/Manager1",
+        "org.rystemd.Manager1.Manager",
+    )
+    .unwrap();
+    native
+        .call::<_, _, ()>("StartUnit", &"hello.service")
+        .unwrap();
+
     drop(daemon);
 }

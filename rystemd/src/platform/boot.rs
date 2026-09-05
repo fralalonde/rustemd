@@ -156,6 +156,21 @@ pub fn early_boot() {
         eprintln!("rystemd boot[fstab]: {e}");
     }
 }
+/// API filesystems a real PID 1 cannot supervise services without. `/proc`
+/// backs reaping and per-process inspection; `/dev` backs every service's
+/// stdin override (`/dev/null`). Their absence after the mount attempt is a
+/// hard boot failure, not a silent partial boot. `/run`, `/sys`, `/tmp` and
+/// the rest stay tolerant so unprivileged namespaces can boot partially.
+pub fn missing_pid1_api_mounts() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !std::path::Path::new("/proc/self").exists() {
+        missing.push("/proc");
+    }
+    if !std::path::Path::new("/dev/null").exists() {
+        missing.push("/dev");
+    }
+    missing
+}
 
 fn set_hostname() -> Result<(), String> {
     let name = match fs::read_to_string("/etc/hostname") {
@@ -634,6 +649,24 @@ pub fn handoff(deploy: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_pid1_api_mounts_are_high_signal() {
+        // On a healthy host the essentials are present: the check must be a
+        // no-op, never a spurious abort.
+        if std::path::Path::new("/proc/self").exists() && std::path::Path::new("/dev/null").exists()
+        {
+            assert!(missing_pid1_api_mounts().is_empty());
+        }
+        // Anything it does report is confined to the service-supervision
+        // essentials, so unrelated partial-boot states cannot abort a boot.
+        for m in missing_pid1_api_mounts() {
+            assert!(
+                m == "/proc" || m == "/dev",
+                "unexpected mandatory mount {m}"
+            );
+        }
+    }
 
     #[test]
     fn detects_initramfs_rootfs() {

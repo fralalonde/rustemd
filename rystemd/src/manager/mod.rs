@@ -3606,7 +3606,7 @@ impl Manager {
         if self.dbus.is_some() {
             return Ok(());
         }
-        self.dbus = Some(crate::dbus::spawn(self.cfg.user));
+        self.dbus = Some(crate::dbus::spawn(self.cfg.user, self.cfg.uid));
         Ok(())
     }
 

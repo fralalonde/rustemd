@@ -159,6 +159,16 @@ pub(crate) fn run_daemon_with_ready(
         if let Err(e) = crate::platform::boot::mount_api_filesystems() {
             eprintln!("rystemd: mount API filesystems failed: {e}");
         }
+        let missing = crate::platform::boot::missing_pid1_api_mounts();
+        if !missing.is_empty() {
+            // A real PID 1 cannot supervise services without /proc and /dev.
+            // Fail visibly instead of booting units against a hollow system.
+            eprintln!(
+                "rystemd: BOOT ABORTED: essential API filesystem(s) missing: {}; cannot supervise services without them",
+                missing.join(", ")
+            );
+            return 1;
+        }
         crate::platform::boot::early_boot();
     }
 

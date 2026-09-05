@@ -113,7 +113,7 @@ pub fn unit_dbus_path(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbOp, DbReply, DbRequest, bridge_call, unit_dbus_path};
+    use super::{DbOp, DbReply, DbRequest, bridge_call, uid_allowed, unit_dbus_path};
     use std::sync::mpsc;
 
     #[test]
@@ -134,6 +134,19 @@ mod tests {
             unit_dbus_path("session-1.scope"),
             "/org/freedesktop/systemd1/unit/session_2d1_2escope"
         );
+    }
+
+    #[test]
+    fn mutating_calls_are_limited_to_the_manager_owner_or_root() {
+        // The manager's own UID can drive it.
+        assert!(uid_allowed(1000, 1000));
+        // Root can drive any manager.
+        assert!(uid_allowed(0, 1000));
+        assert!(uid_allowed(0, 0));
+        // Any other uid is refused.
+        assert!(!uid_allowed(1001, 1000));
+        assert!(!uid_allowed(1000, 1001));
+        assert!(!uid_allowed(999, 1000));
     }
 
     /// `bridge_call` forwards an op over the manager channel and returns the
@@ -237,14 +250,14 @@ pub struct DbusHandle {
 /// unreachable the thread logs a warning and exits, leaving the manager fully
 /// functional without D-Bus (a `Type=dbus` unit then times out, matching
 /// systemd's behaviour when the bus is absent).
-pub fn spawn(user: bool) -> DbusHandle {
+pub fn spawn(user: bool, manager_uid: u32) -> DbusHandle {
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (watch_tx, watch_rx) = mpsc::channel();
     let (unit_tx, unit_rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("rystemd-dbus".into())
-        .spawn(move || run_thread(user, event_tx, cmd_tx, watch_rx, unit_rx))
+        .spawn(move || run_thread(user, event_tx, cmd_tx, watch_rx, unit_rx, manager_uid))
         .ok();
     DbusHandle {
         events: event_rx,
@@ -260,6 +273,51 @@ pub fn spawn(user: bool) -> DbusHandle {
 /// threads; each one bridges to the manager and blocks for its reply.
 struct ManagerIface {
     cmd_tx: Sender<DbRequest>,
+    /// The manager's own UID, used to authorize mutating calls.
+    manager_uid: u32,
+}
+
+/// Pure policy: may a caller with `caller_uid` issue a mutating manager call
+/// on a manager owned by `manager_uid`? The manager's owner, or root.
+fn uid_allowed(caller_uid: u32, manager_uid: u32) -> bool {
+    caller_uid == manager_uid || caller_uid == 0
+}
+
+/// Authorize a mutating call from the caller identified by `sender` on `conn`.
+/// Identity comes from the bus (`UnixUserID`), never from the request body. An
+/// unknown or non-matching caller gets `AccessDenied`.
+async fn authorize(
+    conn: &zbus::Connection,
+    sender: Option<&zbus::names::UniqueName<'_>>,
+    manager_uid: u32,
+) -> zbus::fdo::Result<()> {
+    let sender = sender
+        .map(|u| u.as_str())
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied("no sender identity".into()))?;
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionCredentials",
+            &(sender),
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("caller credential lookup failed: {e}")))?;
+    let creds: zbus::fdo::ConnectionCredentials = reply
+        .body()
+        .deserialize()
+        .map_err(|e| zbus::fdo::Error::Failed(format!("bad credentials reply: {e}")))?;
+    let caller = creds
+        .unix_user_id()
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied("no unix identity".into()))?;
+    if uid_allowed(caller, manager_uid) {
+        Ok(())
+    } else {
+        Err(zbus::fdo::Error::AccessDenied(
+            "caller not authorized".into(),
+        ))
+    }
 }
 
 #[interface(name = "org.rystemd.Manager1.Manager")]
@@ -286,8 +344,14 @@ impl ManagerIface {
         }
     }
 
-    /// Start a unit.
-    fn start_unit(&self, name: String) -> zbus::fdo::Result<()> {
+    /// Start a unit. Mutating: only the manager's owner (or root) may call.
+    async fn start_unit(
+        &self,
+        name: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        authorize(conn, header.sender(), self.manager_uid).await?;
         match self.call(DbOp::StartUnit(name)) {
             Ok(DbReply::UnitStarted) => Ok(()),
             Ok(DbReply::Error(e)) => Err(zbus::fdo::Error::Failed(e)),
@@ -296,8 +360,14 @@ impl ManagerIface {
         }
     }
 
-    /// Stop a unit.
-    fn stop_unit(&self, name: String) -> zbus::fdo::Result<()> {
+    /// Stop a unit. Mutating: only the manager's owner (or root) may call.
+    async fn stop_unit(
+        &self,
+        name: String,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        authorize(conn, header.sender(), self.manager_uid).await?;
         match self.call(DbOp::StopUnit(name)) {
             Ok(DbReply::UnitStopped) => Ok(()),
             Ok(DbReply::Error(e)) => Err(zbus::fdo::Error::Failed(e)),
@@ -543,6 +613,7 @@ fn run_thread(
     cmd_tx: Sender<DbRequest>,
     watch_rx: Receiver<DbWatch>,
     unit_rx: Receiver<DbUnitEvent>,
+    manager_uid: u32,
 ) {
     let bus = if user { "session" } else { "system" };
     let conn = match if user {
@@ -561,6 +632,7 @@ fn run_thread(
         OBJECT_PATH,
         ManagerIface {
             cmd_tx: cmd_tx.clone(),
+            manager_uid,
         },
     ) {
         mgr_log(&format!("D-Bus: failed to register manager interface: {e}"));

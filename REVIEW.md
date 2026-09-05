@@ -22,17 +22,25 @@ API use, recovery, and repeatable tests.
 - Linux PID 1 and Windows service-manager claims are evaluated separately.
 - Unsupported behavior must fail explicitly or be documented.
 - Release history remains in Git and `CHANGELOG.md`.
+- Only global objectives (verdict, blockers, gates) carry between review runs;
+  per-run detail stays in the run's own history and is not re-derived.
+- A weakness that recurs across runs gets a permanent entry under
+  `Recurring weaknesses`, with the surfaces it has hit and their status.
 
 ## Verdict
 
-Not ready to be the PID 1 base of a general desktop distribution. The core
-supervisor and event loop have become materially safer this session, but four
-trust boundaries remain open. Suitable today as a controlled VM and
-initramfs experiment base and as a user-level manager.
+Not yet the PID 1 base of a general desktop distribution. This run closed the
+Linux authorization surfaces (native socket, D-Bus), boot fail-open for real
+PID 1, and pre-exec/signal async-signal-safety. Remaining trust work:
+recovery-mode polish, resource/performance stress, fuzz coverage, and the
+Windows control pipe (needs a Windows runner). Suitable today as a controlled
+VM and initramfs experiment base and as a user-level manager.
 
 ## Evidence
 
-- `cargo test --workspace --all-features --locked` passes (201 tests).
+- `cargo test --workspace --all-features --locked` passes (205+ tests; exact
+  count depends on feature set — `dbus` live test self-skips when the host has
+  no `dbus-daemon`).
 - One full-feature run exposed a large-response truncation regression from an
   earlier one-shot write; fixed by poll-driven response delivery and re-run.
 - clippy `-D warnings`, rustfmt, MSRV 1.89 build/test, Windows
@@ -103,59 +111,85 @@ Regression: `unit_lookup_rejects_path_traversal`,
 `journal::{read,append,exists}_rejects_unit_path_traversal`,
 `plain_unit_names_cannot_escape_their_directory` (red then green).
 
+### D-Bus mutating methods require the caller's bus identity (critical, verified)
+
+`StartUnit` and `StopUnit` forwarded to the manager with no sender check; any
+process able to reach the system bus could start a root unit. The systemd1
+surface here is read/load-only (no start/stop) and carries no start/stop jacks,
+so the native `org.rystemd.Manager1` surface was the escalation point.
+
+Fix: both mutators now read the caller's `UnixUserID` from the bus
+(`GetConnectionCredentials`) and require it to be the manager's own UID, or
+root. Identity comes from the bus, never from the request body. `manager_uid`
+is threaded from `ManagerCfg` into the D-Bus interface.
+
+Regression: `mutating_calls_are_limited_to_the_manager_owner_or_root`
+(pure policy). A live same-UID `StartUnit` over a private bus is asserted in
+`tests/dbus.rs`; it self-skips when `dbus-daemon` is absent, so it runs in CI
+but not on this host. Cross-UID denial is by the `uid_allowed` rule plus
+inspection (setuid needs root).
+
+### Real PID 1 refuses to boot without /proc and /dev (high, verified)
+
+`daemon.rs` logged mount failures and carried on. `mount_api_filesystems` stays
+best-effort for unprivileged namespaces, but a real PID 1 now verifies the two
+mounts supervision cannot do without — `/proc` (reaping, per-process
+inspection) and `/dev` (every service's `/dev/null` stdin) — and aborts with a
+loud message instead of starting units against a hollow system. `/run`, `/sys`,
+`/tmp` stay tolerant.
+
+Regression: `missing_pid1_api_mounts_are_high_signal`. A full interactive
+emergency/recovery target remains an open gate.
+
+### pre-exec env and signal setup are now async-signal-safe (high, verified)
+
+`setenv()` is not async-signal-safe, yet `pre_exec` used it for `LISTEN_FDS`
+and `LISTEN_PID`; a multithreaded fork could deadlock the child on libc locks.
+`LISTEN_FDS` is now set via `Command::env` in the parent. `LISTEN_PID` (the
+child's pid, known only between fork and exec) is written into a pre-seeded
+fixed-width `environ` slot in place — async-signal-safe memory writes with no
+allocation.
+
+`SignalSource::new` now installs `SIGPIPE` first, and on signalfd-creation
+failure unblocks the managed set before returning `None`, so SIGTERM/SIGINT/
+SIGHUP are never left blocked with no consumer.
+
+## Recurring weaknesses
+
+### Fail-open authorization on every control surface
+
+Mutating control is reachable by callers the manager has never authorized:
+
+- Native unix socket: fixed. Owner-only `0600` plus a `SO_PEERCRED` UID gate
+  in `accept_connections`.
+- D-Bus `org.rystemd.Manager1`: closed. `StartUnit`/`StopUnit` check the
+  caller's `UnixUserID` against the manager UID (or root).
+- Windows control pipe: open. Created with a `NULL` security descriptor and no
+  per-caller check; blocked on Windows runtime verification (contract below).
+
+Check every future control surface against this pattern before adding it.
+
 ## Open findings (blockers unless closed)
-
-### Critical: D-Bus control methods carry no authorization
-
-`rystemd/src/dbus.rs` `StartUnit`, `StopUnit`, identity methods forward to the
-manager without sender-credential checks or policy. A process that can reach
-the system bus can start root services, stop units, load units, and query
-process data.
-
-Requirement: authorize every mutating method from the sender credentials with a
-documented policy; restrict read methods. Regression: unprivileged caller gets
-an authorization error.
-
-### High: boot and early setup are fail-open
-
-`rystemd/src/daemon.rs` and `rystemd/src/platform/boot.rs` log-and-continue
-when API filesystem mounts (`/proc`, `/dev`, `/run`, `/sys/fs/cgroup`) or
-early boot steps fail. A real PID 1 can proceed without them.
-
-Requirement: distinguish recovery-capable failures from hard ones. A missing
-`/proc` or `/dev` must enter a bounded emergency/rescue state, not nominal
-boot. Rootless user-manager boot stays best-effort.
-
-### High: `setenv` in the fork-to-exec hook is not async-signal-safe
-
-`rystemd/src/platform/process.rs` sets `LISTEN_FDS` / `LISTEN_PID` with
-`libc::setenv` inside a `pre_exec` closure. After `fork` in a process with
-other threads this can deadlock the child on libc internals.
-
-Requirement: pass `LISTEN_FDS` through `Command::env`; carry the child's PID
-another way (e.g. an exec wrapper). Add a multithreaded fork stress test.
-
-### High: failed signal-source setup leaves signals blocked with no consumer
-
-`rystemd/src/platform/signals.rs` blocks signals before the signalfd is
-created; if creation fails, `setup_signals` stores `None`, so SIGTERM/SIGINT/
-SIGHUP are blocked and never consumed.
-
-Requirement: on signalfd creation failure, either restore the signal masks or
-install fallback handlers; never leave the signals blocked.
 
 ### Medium: start/stop timeout entries keyed only by unit
 
 A stale deadline for one activation can affect a later one. Key deadlines by
 job/activation generation. Still open.
 
-### Medium: Windows control pipe has no explicit security descriptor
+### Medium: Windows control pipe has no explicit security descriptor (blocked)
 
 `rystemd/src/platform/windows/net.rs` uses `lpSecurityAttributes = NULL`, so
 the pipe inherits the default DACL and dispatches mutating operations without
-caller checks or impersonation. Requirement: explicit SYSTEM/Administrators
-ACL for the system pipe, owning-user ACL for the user pipe, and per-caller
-authorization. Windows runtime tests still run zero tests on Linux.
+caller checks or impersonation.
+
+Blocked on a Windows runtime/CI runner. This host cannot execute Windows
+code, and a correct fix cannot be safely shipped untested: the policy is
+SYSTEM + Administrators for the system pipe, the owning user for the user
+pipe (a naive same-SID-as-server check would break the elevated admin CLI).
+Contract once a runner exists: explicit per-mode DACL (or per-caller
+`CheckTokenMembership` against the owning user / BUILTIN\\Administrators),
+mutating ops authorized per caller, and Windows tests that connect as allowed
+and denied SIDs and assert every mutating op. Not half-built here by design.
 
 ### Note: bare dependency names are not a defect
 
@@ -185,16 +219,18 @@ mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
 
 ## Required gates for distribution use
 
-1. Native control authorization with unprivileged-denial regression. Closed:
-   socket owner-only `0600` and peer-UID gate. D-Bus authorization remains
-   open.
-2. Boot failure policy: missing or unmountable API filesystems enter a
-   bounded recovery state, not nominal boot.
-3. Signal-setup and pre-exec async-signal-safety fixes with stress tests.
+1. Native control and D-Bus authorization with unprivileged-denial. Closed:
+   socket owner-only `0600`, peer-UID gate, and D-Bus `StartUnit`/`StopUnit`
+   bus-identity check.
+2. Boot failure policy: real PID 1 aborts without `/proc`/`/dev`. Open: a full
+   interactive emergency/recovery target.
+3. Signal-setup and pre-exec async-signal-safety. Closed in code; a
+   multithreaded fork stress test is still worth adding.
 4. Reboot/poweroff reliability and watchdog/readiness under unit stress.
 5. Recovering from a hung or non-reading control client stays non-blocking;
    concurrent-control-client cap exercised.
-6. Windows control pipe explicit ACL and per-caller authorization.
+6. Windows control pipe explicit ACL and per-caller authorization. Blocked on
+   a Windows runner; contract specified.
 7. Fuzz or property coverage for unit parsing, timespans/calendars, JSON/IPC,
    and seccomp directives.
 8. Real-root desktop boot evidence (display manager, session, suspend/resume,
@@ -202,9 +238,10 @@ mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
 
 ## Next
 
-- Close control-socket ownership and peer check with a regression.
-- Add D-Bus authorization.
-- Convert boot failures to a bounded emergency state.
-- Fix signal setup and pre-exec safety.
-- Windows control pipe explicit ACL and per-caller authorization.
-- Fuzz/property coverage and boot recovery evidence.
+- Add a multithreaded fork stress test for the socket-activation env path.
+- Implement and verify the Windows control-pipe ACL once a Windows runner
+  exists (contract above).
+- Fuzz/property coverage for unit parsing, timespans/calendars, JSON/IPC, and
+  seccomp directives.
+- Reboot/poweroff and watchdog/readiness under unit stress; real-root desktop
+  boot evidence (display manager, session, suspend/resume, shutdown).

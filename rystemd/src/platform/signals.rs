@@ -32,19 +32,31 @@ impl SignalSource {
                 set.add(signal);
             }
         }
-        signal::sigprocmask(signal::SigmaskHow::SIG_BLOCK, Some(&set), None).ok()?;
         // SAFETY: installing SIG_IGN for SIGPIPE is a process-global but
         // idempotent disposition change done exactly once at startup.
-        unsafe {
+        if unsafe {
             signal::signal(
                 nix::sys::signal::Signal::SIGPIPE,
                 signal::SigHandler::SigIgn,
             )
-            .ok()?;
         }
+        .is_err()
+        {
+            return None; // nothing blocked yet; safe to give up
+        }
+        signal::sigprocmask(signal::SigmaskHow::SIG_BLOCK, Some(&set), None).ok()?;
         // Non-blocking so `read()` below drains pending signals without
-        // stalling the event loop on a second read.
-        let fd = SignalFd::with_flags(&set, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC).ok()?;
+        // stalling the event loop on a second read. A signalfd only receives
+        // signals that are blocked, but if it cannot be created the manager
+        // must not be left deaf to SIGTERM/SIGINT — unblock and fail cleanly.
+        let fd = match SignalFd::with_flags(&set, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // SAFETY: restoring the mask we just set; async-signal-safe.
+                let _ = signal::sigprocmask(signal::SigmaskHow::SIG_UNBLOCK, Some(&set), None);
+                return None;
+            }
+        };
         Some(SignalSource(fd))
     }
 

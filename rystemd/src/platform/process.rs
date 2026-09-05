@@ -111,6 +111,59 @@ fn itoa_cstr(buf: &mut [u8], mut v: i32) -> *const libc::c_char {
     buf[i..].as_ptr().cast()
 }
 
+/// Length of a NUL-terminated byte string. Async-signal-safe (reads until the
+/// terminator; no allocation).
+fn cstr_len(p: *const u8) -> usize {
+    let mut n = 0;
+    // SAFETY: `p` points into a valid, NUL-terminated C string owned elsewhere
+    // (the caller guarantees a live buffer with a terminator).
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Overwrite the value of an existing `NAME=value` entry in the child's
+/// `environ` in place. Async-signal-safe: only reads `environ` and writes the
+/// caller's `value` bytes plus a terminator into the fixed-size `=value` slot
+/// that the parent pre-seeded. Returns false (silently) if the key is absent
+/// or the value would overflow the slot. Used to set `LISTEN_PID` between fork
+/// and exec without the non-async-signal-safe `setenv(3)`.
+fn overwrite_env_in_place(key: &[u8], value: &[u8]) -> bool {
+    // SAFETY: the child's `environ` is exposed by the C runtime and in scope
+    // across the fork/exec performed by std::process::Command. Only reads
+    // existing entries and writes `value` plus a terminator into the fixed
+    // `=value` slot the parent pre-seeded; no allocation.
+    unsafe {
+        // The child's environment, guaranteed live across the fork/exec.
+        unsafe extern "C" {
+            static mut environ: *mut *mut libc::c_char;
+        }
+        const SLOT_CAP: usize = 10; // matches the parent's "0000000000" pre-seed
+        if value.len() > SLOT_CAP {
+            return false;
+        }
+        let mut p = environ;
+        while !(*p).is_null() {
+            let entry = *p as *const u8;
+            let mut j = 0;
+            while j < key.len() && *entry.add(j) == key[j] {
+                j += 1;
+            }
+            if j == key.len() {
+                let slot = entry.add(key.len()) as *mut u8;
+                for (k, &b) in value.iter().enumerate() {
+                    *slot.add(k) = b;
+                }
+                *slot.add(value.len()) = 0;
+                return true;
+            }
+            p = p.add(1);
+        }
+        false
+    }
+}
+
 /// Spawn `argv` as a new process-group leader with the given environment and
 /// process attributes. The returned pid is the group leader; kill with
 /// [`kill_group`].
@@ -131,6 +184,15 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
         ));
     }
     cmd.envs(env);
+    // Socket activation: the listener fds are dup2'd onto 3..3+n in pre_exec
+    // (see below). Advertise them via LISTEN_FDS/LISTEN_PID (sd_listen_fds(3)).
+    // LISTEN_FDS is set here in the parent (safe). LISTEN_PID is the child's
+    // pid, only known between fork and exec; pre-seed a fixed-width slot that
+    // pre_exec overwrites in place, because setenv() is not async-signal-safe.
+    if !opts.listen_fds.is_empty() {
+        cmd.env("LISTEN_FDS", opts.listen_fds.len().to_string());
+        cmd.env("LISTEN_PID", "0000000000");
+    }
 
     let (stdout, stderr) = setup_stdio(&opts.stdout_target, &opts.stderr_target);
     if let Some(s) = stdout {
@@ -196,12 +258,17 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
                 }
             }
             if !listen_fds.is_empty() {
-                let mut fds_buf = [0u8; 16];
-                let fds_ptr = itoa_cstr(&mut fds_buf, listen_fds.len() as i32);
-                libc::setenv(c"LISTEN_FDS".as_ptr(), fds_ptr, 1);
+                // LISTEN_FDS was set by the parent via Command::env. LISTEN_PID
+                // is the child's pid (known only here); overwrite its pre-seeded
+                // "0000000000" slot in place — async-signal-safe memory writes,
+                // unlike the setenv() calls this replaces.
                 let mut pid_buf = [0u8; 16];
                 let pid_ptr = itoa_cstr(&mut pid_buf, libc::getpid());
-                libc::setenv(c"LISTEN_PID".as_ptr(), pid_ptr, 1);
+                let pid_len = cstr_len(pid_ptr.cast());
+                overwrite_env_in_place(
+                    b"LISTEN_PID=",
+                    std::slice::from_raw_parts(pid_ptr.cast(), pid_len),
+                );
             }
             // Move this (still pre-exec) process into its cgroup by writing
             // our own pid to `cgroup.procs`. Doing it here — before exec —
