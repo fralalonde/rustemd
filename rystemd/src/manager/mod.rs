@@ -3452,6 +3452,15 @@ impl Manager {
             if at_cap || stream.set_nonblocking(true).is_err() {
                 continue;
             }
+            // Only the manager's own UID may issue control requests. This is
+            // the authoritative gate; the owner-only socket mode is defense
+            // in depth. A system manager (root) accepts only root; a user
+            // manager accepts only its owner.
+            if let Some(uid) = crate::platform::net::peer_uid(&stream)
+                && uid != self.cfg.uid
+            {
+                continue;
+            }
             let fd = stream.as_raw_fd();
             self.control_clients.insert(
                 fd,

@@ -17,6 +17,11 @@ pub fn bind_control(path: &Path) -> Result<UnixListener, String> {
     let _ = std::fs::remove_file(path);
     let l = UnixListener::bind(path).map_err(|e| e.to_string())?;
     l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    // Owner-only regardless of umask. Peer access to control is further gated
+    // by the manager's UID check; the restrictive mode keeps unprivileged
+    // connect attempts from even reaching it.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
     Ok(l)
 }
 
@@ -57,5 +62,75 @@ pub fn request(socket: &Path, req: &Value) -> Result<Value, String> {
             .and_then(Value::as_str)
             .unwrap_or("unknown error")
             .to_string())
+    }
+}
+
+/// UID of the peer on the other end of `stream`. Linux `SO_PEERCRED`.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 { Some(cred.uid) } else { None }
+}
+
+/// Non-Linux unix has no uniform `SO_PEERCRED`; defer to the caller.
+#[cfg(not(target_os = "linux"))]
+pub fn peer_uid(_stream: &UnixStream) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_socket_mode_is_independent_of_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        // Hostile umask: without an explicit permission the socket would be
+        // created world-writable.
+        unsafe {
+            libc::umask(0);
+        }
+        let listener = bind_control(&sock).unwrap();
+        unsafe {
+            libc::umask(0o022);
+        }
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "control socket must be owner-only regardless of umask"
+        );
+        drop(listener);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_uid_reports_the_connecting_process_identity() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("peer.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let connector = UnixStream::connect(&sock).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        assert_eq!(peer_uid(&accepted), Some(unsafe { libc::geteuid() }));
+        // The connecting end reports the same peer.
+        assert_eq!(peer_uid(&connector), Some(unsafe { libc::geteuid() }));
     }
 }

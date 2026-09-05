@@ -62,6 +62,24 @@ then green). A caught secondary regression: `list-units` responses exceed the
 unix socket buffer; the poll-driven flush fixed truncated JSON
 (`cli_drives_daemon_roundtrip`).
 
+### Control socket is owner-only and peer-gated (critical, verified)
+
+`bind_control` relied on the process umask for the socket mode (`022` gave a
+`0755` socket), and accepts never checked who connected. Both are now closed.
+
+Fix: `bind_control` sets the socket mode `0600` explicitly, independent of
+umask, so an unprivileged connect attempt is denied at the socket layer. On
+accept the manager reads `SO_PEERCRED` and drops any peer whose UID is not the
+manager's own (`cfg.uid`); the mode is defense in depth behind that gate. A
+system manager (root) accepts only root; a user manager accepts only its
+owner.
+
+Regression: `control_socket_mode_is_independent_of_umask` (red: `0777` under
+umask 000, then `0600`), `peer_uid_reports_the_connecting_process_identity`.
+Cross-UID rejection is by the `uid != cfg.uid` rule plus inspection; a
+setuid-child test needs root and is not runnable in the unprivileged local
+environment.
+
 ### Invalid `User=` / `Group=` fails the start before spawn (critical, verified)
 
 `rystemd/src/manager/mod.rs:1782` resolved the user and group with
@@ -86,20 +104,6 @@ Regression: `unit_lookup_rejects_path_traversal`,
 `plain_unit_names_cannot_escape_their_directory` (red then green).
 
 ## Open findings (blockers unless closed)
-
-### Critical: native control socket has no explicit ownership or peer identity
-
-`rystemd/src/platform/net.rs:13-20`, `manager/mod.rs` dispatch. `bind_control`
-removes and binds `/run/rystemd/control` but never sets mode, owner, or a
-`SO_PEERCRED` check. Default umask `022` gives a `0755` socket, which normally
-denies unprivileged connects, but confinement depends on environment umask
-rather than declared intent. Any operator that can reach the socket can start
-or stop arbitrary units.
-
-Requirement: bind the system socket explicitly root-owned, mode `0660` or
-`0600`, and reject peers that are not the manager's UID (or a documented
-admin). User-manager sockets must stay accessible to the owning UID. Regression
-callers must prove an unauthorized UID gets `EPERM`.
 
 ### Critical: D-Bus control methods carry no authorization
 
@@ -181,7 +185,9 @@ mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
 
 ## Required gates for distribution use
 
-1. Control and D-Bus authorization with unprivileged-denial regressions.
+1. Native control authorization with unprivileged-denial regression. Closed:
+   socket owner-only `0600` and peer-UID gate. D-Bus authorization remains
+   open.
 2. Boot failure policy: missing or unmountable API filesystems enter a
    bounded recovery state, not nominal boot.
 3. Signal-setup and pre-exec async-signal-safety fixes with stress tests.
@@ -200,3 +206,5 @@ mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
 - Add D-Bus authorization.
 - Convert boot failures to a bounded emergency state.
 - Fix signal setup and pre-exec safety.
+- Windows control pipe explicit ACL and per-caller authorization.
+- Fuzz/property coverage and boot recovery evidence.
