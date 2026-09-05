@@ -74,6 +74,9 @@ impl Journal {
     /// the size cap. Best-effort — disk errors drop the line rather than take
     /// down the manager.
     pub fn append(&mut self, unit: &str, unix_secs: u64, text: &str) {
+        if !crate::names::is_plain_unit_name(unit) {
+            return;
+        }
         if !self.dir.is_dir() && fs::create_dir_all(&self.dir).is_err() {
             return;
         }
@@ -94,6 +97,9 @@ impl Journal {
     /// Read records for `unit` (all segments, oldest first), optionally
     /// filtered to `since_unix` or later.
     pub fn read(&self, unit: &str, since_unix: Option<u64>) -> Vec<JournalRecord> {
+        if !crate::names::is_plain_unit_name(unit) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for path in self.segment_paths(unit) {
             let Ok(f) = File::open(&path) else {
@@ -124,7 +130,7 @@ impl Journal {
 
     /// Whether the active file for `unit` exists (used to gate `-f`).
     pub fn exists(&self, unit: &str) -> bool {
-        self.dir.join(unit).exists()
+        crate::names::is_plain_unit_name(unit) && self.dir.join(unit).exists()
     }
 
     /// Unit names that have journal data (active or rotated). A file ending in
@@ -195,6 +201,50 @@ mod tests {
         assert_eq!(all[0].text, "hello");
         assert_eq!(all[1].unit, "u");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_rejects_unit_path_traversal() {
+        let root = tmpdir("read-traversal");
+        let dir = root.join("journal");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            root.join("outside.service"),
+            "1000\toutside.service\tescaped\n",
+        )
+        .unwrap();
+        let j = Journal::new(dir, 10_000, 4);
+
+        assert!(j.read("../outside.service", None).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_rejects_unit_path_traversal() {
+        let root = tmpdir("append-traversal");
+        let dir = root.join("journal");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let mut j = Journal::new(dir, 10_000, 4);
+
+        j.append("../outside.service", 1000, "escaped");
+
+        assert!(!root.join("outside.service").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exists_rejects_unit_path_traversal() {
+        let root = tmpdir("exists-traversal");
+        let dir = root.join("journal");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(root.join("outside.service"), "x").unwrap();
+        let j = Journal::new(dir, 10_000, 4);
+
+        assert!(!j.exists("../outside.service"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -179,6 +179,9 @@ impl Paths {
 
     /// Find the highest-precedence unit file for `name`, if any.
     pub fn find_unit(&self, name: &str) -> Option<PathBuf> {
+        if !crate::names::is_plain_unit_name(name) {
+            return None;
+        }
         for dir in &self.unit_path {
             let p = dir.join(name);
             if p.is_file() {
@@ -328,6 +331,22 @@ mod tests {
             etc.join("systemd/system/foo.service")
         );
         assert!(paths.find_unit("nope.service").is_none());
+    }
+
+    #[test]
+    fn unit_lookup_rejects_path_traversal() {
+        let d = tempfile::tempdir().unwrap();
+        let units = d.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(d.path().join("outside.service"), "x").unwrap();
+        let paths = Paths {
+            user: false,
+            unit_path: vec![units.clone()],
+            config_dir: units,
+            runtime_dir: d.path().to_path_buf(),
+        };
+
+        assert!(paths.find_unit("../outside.service").is_none());
     }
 
     #[test]

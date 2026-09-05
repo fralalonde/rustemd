@@ -168,6 +168,81 @@ fn stop_terminates_running_service() {
     );
 }
 
+#[test]
+fn unresolved_service_identity_fails_before_exec() {
+    let scratch = Scratch::new();
+    let marker = scratch.dir.path().join("identity-fail-ran");
+    scratch.write_unit(
+        "identity-fail.service",
+        &format!(
+            "[Service]\nType=oneshot\nUser=rystemd-user-that-must-not-exist\nExecStart=/bin/sh -c 'touch {}'\n",
+            marker.display()
+        ),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || daemon.socket.exists()));
+    let mut ctl = daemon.client();
+    ctl.start(&["identity-fail.service"]).unwrap();
+
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["identity-fail.service"])
+            .ok()
+            .and_then(|states| states.first().map(|state| state.active == "failed"))
+            .unwrap_or(false)
+    }));
+    assert!(!marker.exists(), "ExecStart ran with the manager identity");
+}
+
+#[test]
+fn unresolved_service_group_fails_before_exec() {
+    let scratch = Scratch::new();
+    let marker = scratch.dir.path().join("group-fail-ran");
+    scratch.write_unit(
+        "group-fail.service",
+        &format!(
+            "[Service]\nType=oneshot\nGroup=rystemd-group-that-must-not-exist\nExecStart=/bin/sh -c 'touch {}'\n",
+            marker.display()
+        ),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || daemon.socket.exists()));
+    let mut ctl = daemon.client();
+    ctl.start(&["group-fail.service"]).unwrap();
+
+    assert!(wait_for(Duration::from_secs(3), || {
+        ctl.status(&["group-fail.service"])
+            .ok()
+            .and_then(|states| states.first().map(|state| state.active == "failed"))
+            .unwrap_or(false)
+    }));
+    assert!(!marker.exists(), "ExecStart ran with the manager group");
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_control_request_does_not_block_other_clients() {
+    let _scratch = Scratch::new();
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(2), || daemon.socket.exists()));
+    let stalled = std::os::unix::net::UnixStream::connect(&daemon.socket).unwrap();
+    let socket = daemon.socket.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result =
+            rystemd::client::request_json(&socket, &serde_json::json!({ "op": "list_units" }));
+        let _ = tx.send(result);
+    });
+
+    let result = rx.recv_timeout(Duration::from_millis(500));
+    drop(stalled);
+    if result.is_err() {
+        let _ = rx.recv_timeout(Duration::from_secs(2));
+    }
+    assert!(result.is_ok(), "an incomplete request blocked the manager");
+}
+
 /// `Restart=on-failure` auto-restarts a service that exits non-zero (up to the
 /// start-limit burst). This is the mechanism most real services lean on to
 /// survive crashes, and it had zero coverage before this test.

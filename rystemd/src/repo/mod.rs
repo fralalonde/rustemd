@@ -99,7 +99,7 @@ impl Repo {
     }
 }
 fn validate_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+    if !crate::names::is_plain_unit_name(name) {
         return Err(Error::InvalidName(format!(
             "unit name `{name}` is not a plain unit file name"
         )));

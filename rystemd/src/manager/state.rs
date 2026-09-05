@@ -85,6 +85,8 @@ pub enum UnitResult {
     Protocol,
     Watchdog,
     Exec,
+    User,
+    Group,
     Unknown,
 }
 

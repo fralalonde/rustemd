@@ -214,6 +214,19 @@ pub struct JobSummary {
 
 // ---- manager ----------------------------------------------------------------
 
+/// One accepted control connection being read non-blockingly across poll
+/// iterations. The control protocol is one request per connection, so a single
+/// bounded buffer suffices; the stream is dropped once the request is
+/// dispatched and answered.
+#[cfg(unix)]
+struct PendingClient {
+    stream: UnixStream,
+    buffer: Vec<u8>,
+    /// Remaining response bytes to send. `Some` puts the client in write mode
+    /// (drained via `POLLOUT`); `None` leaves it in read mode.
+    out: Option<Vec<u8>>,
+}
+
 pub struct Manager {
     pub cfg: ManagerCfg,
     /// Persistent per-unit journal (disk store). Appended wherever child
@@ -238,6 +251,8 @@ pub struct Manager {
     pub out_fds: HashMap<RawFd, Name>,
     #[cfg(unix)]
     pub owned_fds: HashMap<RawFd, OwnedFd>,
+    #[cfg(unix)]
+    control_clients: HashMap<RawFd, PendingClient>,
     #[cfg(feature = "socket")]
     pub socket_listeners: HashMap<SocketId, SocketListener>,
     #[cfg(feature = "socket")]
@@ -293,6 +308,8 @@ impl Manager {
             out_fds: HashMap::new(),
             #[cfg(unix)]
             owned_fds: HashMap::new(),
+            #[cfg(unix)]
+            control_clients: HashMap::new(),
             #[cfg(feature = "socket")]
             socket_listeners: HashMap::new(),
             #[cfg(feature = "socket")]
@@ -725,18 +742,118 @@ impl Manager {
     }
 
     #[cfg(unix)]
-    fn handle_connection(&mut self, stream: UnixStream) {
-        use std::io::{BufRead, BufReader, BufWriter, Write};
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+    fn drain_control_client(&mut self, fd: RawFd) {
+        use std::io::Read;
+        // This client may already be draining a response (`POLLOUT` also woke
+        // us). Flush it instead of treating it as a new request.
+        if self
+            .control_clients
+            .get(&fd)
+            .map(|c| c.out.is_some())
+            .unwrap_or(false)
+        {
+            self.flush_control_response(fd);
             return;
         }
+        // Bound a single client's buffered request so a slow or abusive writer
+        // cannot grow manager memory without limit.
+        const MAX_REQUEST: usize = 16 * 1024;
+
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = match self
+                .control_clients
+                .get_mut(&fd)
+                .map(|c| c.stream.read(&mut tmp))
+            {
+                Some(Ok(0)) => {
+                    // Peer closed without a complete request.
+                    self.control_clients.remove(&fd);
+                    return;
+                }
+                Some(Ok(n)) => n,
+                Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Some(Err(_)) => {
+                    self.control_clients.remove(&fd);
+                    return;
+                }
+                None => return,
+            };
+            if let Some(c) = self.control_clients.get_mut(&fd) {
+                c.buffer.extend_from_slice(&tmp[..n]);
+            }
+        }
+
+        let Some(newline) = self
+            .control_clients
+            .get(&fd)
+            .and_then(|c| c.buffer.iter().position(|&b| b == b'\n'))
+        else {
+            // No complete request yet. Drop an overlong partial line rather
+            // than buffer it forever.
+            if self
+                .control_clients
+                .get(&fd)
+                .map(|c| c.buffer.len() >= MAX_REQUEST)
+                .unwrap_or(false)
+            {
+                self.control_clients.remove(&fd);
+            }
+            return;
+        };
+
+        let Some(client) = self.control_clients.remove(&fd) else {
+            return;
+        };
+        let line = String::from_utf8_lossy(&client.buffer[..newline]).into_owned();
         let resp = crate::ipc::dispatch(self, &line);
         let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
         out.push('\n');
-        let mut writer = BufWriter::new(reader.into_inner());
-        let _ = Write::write_all(&mut writer, out.as_bytes());
+
+        // Re-register the client in write mode and deliver the response via
+        // `POLLOUT`, so a slow or non-reading peer never blocks the loop.
+        self.control_clients.insert(
+            fd,
+            PendingClient {
+                stream: client.stream,
+                buffer: Vec::new(),
+                out: Some(out.into_bytes()),
+            },
+        );
+        self.flush_control_response(fd);
+    }
+
+    #[cfg(unix)]
+    fn flush_control_response(&mut self, fd: RawFd) {
+        use std::io::Write;
+        let mut remove = false;
+        while let Some(pending) = self.control_clients.get_mut(&fd) {
+            let out = match pending.out.as_mut() {
+                Some(o) => o,
+                None => return,
+            };
+            match pending.stream.write(out) {
+                Ok(0) => {
+                    remove = true;
+                    break;
+                }
+                Ok(n) => {
+                    out.drain(..n);
+                    if out.is_empty() {
+                        remove = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    remove = true;
+                    break;
+                }
+            }
+        }
+        if remove {
+            self.control_clients.remove(&fd);
+        }
     }
 
     // ---- public control entry points ----------------------------------------
@@ -1780,16 +1897,30 @@ impl Manager {
         let argv = spawn::expand_env_argv(&exec.argv, &env);
 
         // Resolve user/group before the (async-signal-safe) pre_exec.
-        let uid = sc
-            .user
-            .clone()
-            .and_then(|u| spawn::resolve_user(&u).map(|t| t.0));
-        let gid = sc.group.clone().and_then(|g| spawn::resolve_group(&g));
-        let groups = sc
-            .user
-            .clone()
-            .and_then(|u| spawn::resolve_user(&u).map(|t| t.2))
-            .unwrap_or_default();
+        let resolved_user = match sc.user.as_deref() {
+            Some(user) => match spawn::resolve_user(user) {
+                Some(identity) => Some(identity),
+                None => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::User;
+                    self.fail_unit(name, format!("User={user} could not be resolved"));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let uid = resolved_user.as_ref().map(|identity| identity.0);
+        let gid = match sc.group.as_deref() {
+            Some(group) => match spawn::resolve_group(group) {
+                Some(gid) => Some(gid),
+                None => {
+                    self.units.get_mut(name).unwrap().result = UnitResult::Group;
+                    self.fail_unit(name, format!("Group={group} could not be resolved"));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let groups = resolved_user.map(|identity| identity.2).unwrap_or_default();
 
         // Create/own the unit's `*Directory=` directories before the process
         // turns up (on the Start command, which is the process spawn).
@@ -3032,6 +3163,7 @@ impl Manager {
             #[cfg(all(target_os = "linux", feature = "udev"))]
             let has_udev = self.udev.is_some();
             let out_ids: Vec<RawFd> = self.out_fds.keys().copied().collect();
+            let control_ids: Vec<RawFd> = self.control_clients.keys().copied().collect();
             // Socket activation: poll a listener only while its target service
             // is Inactive, so a connection triggers the service once (and a
             // running/failed service keeps the fd out of the poll set).
@@ -3078,6 +3210,12 @@ impl Manager {
                 pfds.push(nix::poll::PollFd::new(
                     borrowed_fd(fd),
                     nix::poll::PollFlags::POLLIN,
+                ));
+            }
+            for &fd in &control_ids {
+                pfds.push(nix::poll::PollFd::new(
+                    borrowed_fd(fd),
+                    nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLOUT,
                 ));
             }
             #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -3147,6 +3285,18 @@ impl Manager {
                     (*fd, r)
                 })
                 .collect();
+            let control_ready: Vec<(RawFd, bool, bool)> = control_ids
+                .iter()
+                .map(|fd| {
+                    let rev = pfds[idx].revents().unwrap_or(nix::poll::PollFlags::empty());
+                    idx += 1;
+                    (
+                        *fd,
+                        rev.contains(nix::poll::PollFlags::POLLIN),
+                        rev.contains(nix::poll::PollFlags::POLLOUT),
+                    )
+                })
+                .collect();
             #[cfg(all(target_os = "linux", feature = "udev"))]
             let udev_ready = if has_udev {
                 pfds[idx]
@@ -3179,6 +3329,14 @@ impl Manager {
             for (fd, ready) in out_ready {
                 if ready {
                     self.read_stdout(fd);
+                }
+            }
+            for (fd, read_ready, write_ready) in control_ready {
+                if read_ready {
+                    self.drain_control_client(fd);
+                }
+                if write_ready {
+                    self.flush_control_response(fd);
                 }
             }
             #[cfg(all(target_os = "linux", feature = "udev"))]
@@ -3280,17 +3438,29 @@ impl Manager {
 
     #[cfg(unix)]
     fn accept_connections(&mut self) {
-        let accepted: Vec<UnixStream> = if let Some(listener) = &self.listener {
-            let mut v = Vec::new();
-            while let Ok((stream, _)) = listener.accept() {
-                v.push(stream);
-            }
-            v
-        } else {
-            Vec::new()
+        let Some(listener) = &self.listener else {
+            return;
         };
-        for s in accepted {
-            self.handle_connection(s);
+        // Bound concurrent clients so slow or stalled peers cannot exhaust
+        // manager file descriptors or memory. Excess accepts are dropped.
+        const MAX_CONCURRENT_CLIENTS: usize = 1024;
+        let at_cap = self.control_clients.len() >= MAX_CONCURRENT_CLIENTS;
+        while let Ok((stream, _)) = listener.accept() {
+            // Never read a control request inline: a peer that connects and
+            // sends nothing must not stall the event loop. Register the socket
+            // non-blockingly and drain it on future poll iterations.
+            if at_cap || stream.set_nonblocking(true).is_err() {
+                continue;
+            }
+            let fd = stream.as_raw_fd();
+            self.control_clients.insert(
+                fd,
+                PendingClient {
+                    stream,
+                    buffer: Vec::new(),
+                    out: None,
+                },
+            );
         }
     }
 
